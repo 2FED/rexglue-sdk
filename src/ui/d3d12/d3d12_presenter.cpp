@@ -331,8 +331,12 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   }
   // Unmapping will be done implicitly when the resource goes out of scope and
   // gets destroyed.
-  REXLOG_INFO("D3D12 guest capture: success sequence={} dimensions={}x{}",
-              guest_output_properties.sequence, image_out.width, image_out.height);
+  const uint64_t last_presented_guest_output_sequence =
+      last_presented_guest_output_sequence_.load(std::memory_order_acquire);
+  REXLOG_INFO(
+      "D3D12 guest capture: success sequence={} last_presented_sequence={} dimensions={}x{}",
+      guest_output_properties.sequence, last_presented_guest_output_sequence, image_out.width,
+      image_out.height);
   return true;
 }
 
@@ -1173,8 +1177,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
   if (SUCCEEDED(present_result)) {
-    if (guest_output_drawn_sequence > last_presented_guest_output_sequence_) {
-      last_presented_guest_output_sequence_ = guest_output_drawn_sequence;
+    uint64_t last_presented_guest_output_sequence =
+        last_presented_guest_output_sequence_.load(std::memory_order_relaxed);
+    if (guest_output_drawn_sequence > last_presented_guest_output_sequence) {
+      last_presented_guest_output_sequence_.store(guest_output_drawn_sequence,
+                                                  std::memory_order_release);
       ++successful_guest_output_present_count_;
       if (successful_guest_output_present_count_ == 1) {
         REXLOG_INFO(

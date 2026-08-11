@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <utility>
 
@@ -312,11 +313,13 @@ class D3D12Presenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
 
-  // Main-target painting is serialized by Presenter paint ownership. Count a
-  // successful OS presentation only once for each monotonically increasing
-  // active guest-output mailbox sequence; UI-only paints and repaints of an
-  // already presented sequence don't advance this telemetry.
-  uint64_t last_presented_guest_output_sequence_ = 0;
+  // Main-target painting is serialized by Presenter paint ownership. Publish
+  // a sequence with release ordering only after a successful OS presentation
+  // so CaptureGuestOutput can safely observe it with acquire ordering. Count a
+  // successful presentation only once for each monotonically increasing active
+  // guest-output mailbox sequence; UI-only paints and same-sequence repaints
+  // don't advance this telemetry.
+  std::atomic<uint64_t> last_presented_guest_output_sequence_{0};
   uint64_t successful_guest_output_present_count_ = 0;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
