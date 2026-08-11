@@ -594,8 +594,10 @@ void ReXApp::OnDestroy() {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
   }
-  window_.reset();
+  // Input drivers retain the attached window and detach in their destructors.
+  // Tear down Runtime (and therefore InputSystem) while the window is alive.
   runtime_.reset();
+  window_.reset();
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
