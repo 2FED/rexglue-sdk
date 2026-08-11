@@ -1327,7 +1327,8 @@ bool build_vpkd3d128(BuilderContext& ctx) {
       // Pack 4 elements into 64 bits (4 x 16-bit floats)
       // Guest element 0 goes to highest 16-bit position, element 3 to lowest
       // Output u16 index = (3-i) + 2*shift for element i
-      if (ctx.insn.operands[3] != 2 || ctx.insn.operands[4] > 2)
+      if ((ctx.insn.operands[3] != 2 && ctx.insn.operands[3] != 3) ||
+          ctx.insn.operands[4] > 2)
         REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X}", ctx.base);
 
       for (size_t i = 0; i < 4; i++) {
