@@ -133,12 +133,31 @@ bool Entry::Delete() {
 }
 
 X_STATUS Entry::Rename(const std::filesystem::path& file_path) {
+  if (is_read_only()) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+
   // Store the string so split path string_views remain valid.
   const std::string path_str = rex::path_to_utf8(file_path);
   std::vector<std::string_view> path_parts = rex::string::utf8_split_path(path_str);
   if (!path_parts.empty()) {
     // Drop root path (for example, "game:").
     path_parts.erase(path_parts.begin());
+  }
+
+  size_t depth = 0;
+  for (const auto part : path_parts) {
+    if (part == "." || part.empty()) {
+      continue;
+    }
+    if (part == "..") {
+      if (depth == 0) {
+        return X_STATUS_ACCESS_DENIED;
+      }
+      --depth;
+      continue;
+    }
+    ++depth;
   }
 
   X_STATUS status = RenameEntryInternal(path_parts);

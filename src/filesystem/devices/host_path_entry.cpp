@@ -68,6 +68,10 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
 
 std::unique_ptr<memory::MappedMemory> HostPathEntry::OpenMapped(memory::MappedMemory::Mode mode,
                                                                 size_t offset, size_t length) {
+  if (is_read_only() && mode == memory::MappedMemory::Mode::kReadWrite) {
+    REXFS_ERROR("Attempting to map file for write access on read-only device");
+    return nullptr;
+  }
   return memory::MappedMemory::Open(host_path_, mode, offset, length);
 }
 

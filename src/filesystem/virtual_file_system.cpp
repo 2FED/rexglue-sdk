@@ -22,6 +22,28 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
 
 namespace rex::filesystem {
 
+namespace {
+
+bool PathEscapesDeviceRoot(const std::string_view relative_path) {
+  size_t depth = 0;
+  for (const auto part : rex::string::utf8_split_path(relative_path)) {
+    if (part == "." || part.empty()) {
+      continue;
+    }
+    if (part == "..") {
+      if (depth == 0) {
+        return true;
+      }
+      --depth;
+      continue;
+    }
+    ++depth;
+  }
+  return false;
+}
+
+}  // namespace
+
 VirtualFileSystem::VirtualFileSystem() {}
 
 VirtualFileSystem::~VirtualFileSystem() {
@@ -105,8 +127,10 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
-  // Resolve relative paths
-  auto normalized_path(rex::string::utf8_canonicalize_guest_path(path));
+  // Normalize separators without removing traversal components. Containment
+  // must be checked against the resolved device root before canonicalization.
+  auto normalized_path =
+      rex::string::utf8_fix_path_separators(path, rex::string::kUtf8GuestPathSeparator);
 
   // Resolve symlinks.
   std::string resolved_path;
@@ -131,6 +155,13 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
 
   const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
+  if (PathEscapesDeviceRoot(relative_path)) {
+    REXFS_ERROR("ResolvePath({}) rejected - path escapes device root", path);
+    return nullptr;
+  }
+
+  normalized_path = rex::string::utf8_canonicalize_guest_path(normalized_path);
+  relative_path = normalized_path.substr(device->mount_path().size());
   auto* entry = device->ResolvePath(relative_path);
 
   if (entry) {
@@ -274,9 +305,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       desired_access & FileAccess::kFileWriteData || desired_access & FileAccess::kFileAppendData;
   if (wants_write &&
       ((parent_entry && parent_entry->is_read_only()) || (entry && entry->is_read_only()))) {
-    // Match Xenia behavior: downgrade to read access instead of failing.
     REXFS_WARN("Attempted to open read-only file/dir for write: {}", path);
-    desired_access = FileAccess::kGenericRead | FileAccess::kFileReadData;
+    return X_STATUS_ACCESS_DENIED;
   }
 
   bool created = false;
