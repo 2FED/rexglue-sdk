@@ -205,17 +205,23 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
   GuestOutputProperties guest_output_properties;
-  {
-    uint32_t guest_output_mailbox_index;
-    std::unique_lock<std::mutex> guest_output_consumer_lock(
-        ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties, nullptr));
-    if (guest_output_mailbox_index != UINT32_MAX) {
-      guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
-    }
-    // Incremented the reference count of the guest output resource - safe to
-    // leave the consumer critical section now.
+  uint32_t guest_output_mailbox_index;
+  std::unique_lock<std::mutex> guest_output_consumer_lock(
+      ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties, nullptr));
+  if (guest_output_mailbox_index != UINT32_MAX) {
+    guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
   }
   if (!guest_output_resource) {
+    return false;
+  }
+
+  // Keep the mailbox consumer lock for the entire capture. A ComPtr keeps the
+  // resource alive, but it does not keep the acquired mailbox slot away from
+  // the producer, which may otherwise reuse it while the copy is in flight.
+  const uint64_t capture_presented_watermark =
+      last_presented_guest_output_sequence_.load(std::memory_order_acquire);
+  if (!guest_output_properties.sequence ||
+      guest_output_properties.sequence > capture_presented_watermark) {
     return false;
   }
 
@@ -331,11 +337,9 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   }
   // Unmapping will be done implicitly when the resource goes out of scope and
   // gets destroyed.
-  const uint64_t last_presented_guest_output_sequence =
-      last_presented_guest_output_sequence_.load(std::memory_order_acquire);
   REXLOG_INFO(
       "D3D12 guest capture: success sequence={} last_presented_sequence={} dimensions={}x{}",
-      guest_output_properties.sequence, last_presented_guest_output_sequence, image_out.width,
+      guest_output_properties.sequence, capture_presented_watermark, image_out.width,
       image_out.height);
   return true;
 }
@@ -1180,22 +1184,25 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     uint64_t last_presented_guest_output_sequence =
         last_presented_guest_output_sequence_.load(std::memory_order_relaxed);
     if (guest_output_drawn_sequence > last_presented_guest_output_sequence) {
-      last_presented_guest_output_sequence_.store(guest_output_drawn_sequence,
-                                                  std::memory_order_release);
       ++successful_guest_output_present_count_;
+      const uint32_t present_hresult = static_cast<uint32_t>(present_result);
       if (successful_guest_output_present_count_ == 1) {
         REXLOG_INFO(
             "D3D12 guest present: successful sequence count=1 sequence={} source={}x{} "
-            "swapchain={}x{}",
+            "swapchain={}x{} HRESULT=0x{:08X}",
             guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
-            paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+            paint_context_.swap_chain_width, paint_context_.swap_chain_height, present_hresult);
       } else if (successful_guest_output_present_count_ == 3) {
         REXLOG_INFO(
             "D3D12 guest present: successful sequence count=3 sequence={} source={}x{} "
-            "swapchain={}x{}",
+            "swapchain={}x{} HRESULT=0x{:08X}",
             guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
-            paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+            paint_context_.swap_chain_width, paint_context_.swap_chain_height, present_hresult);
       }
+      // Publish only after the bounded marker has been emitted so a successful
+      // capture of this sequence cannot overtake that marker in the log.
+      last_presented_guest_output_sequence_.store(guest_output_drawn_sequence,
+                                                  std::memory_order_release);
     }
     return PaintResult::kPresented;
   }
