@@ -398,6 +398,10 @@ class Presenter {
   static constexpr uint32_t kGuestOutputMailboxSize = 3;
 
   struct GuestOutputProperties {
+    // Monotonically increasing identity assigned only after an active guest
+    // output refresh has completed successfully and immediately before the
+    // image is published to the mailbox. Zero means inactive / unpublished.
+    uint64_t sequence;
     // At least any value being 0 here means the guest output is disabled for
     // this frame.
     uint32_t frontbuffer_width;
@@ -416,6 +420,7 @@ class Presenter {
     }
 
     void SetToInactive() {
+      sequence = 0;
       frontbuffer_width = 0;
       frontbuffer_height = 0;
       display_aspect_ratio_x = 0;
@@ -973,6 +978,10 @@ class Presenter {
   std::mutex guest_output_mailbox_consumer_mutex_;
 
   std::array<GuestOutputProperties, kGuestOutputMailboxSize> guest_output_properties_;
+  // Single-producer sequence for successfully refreshed active guest output.
+  // Publication through guest_output_mailbox_acquired_and_ready_ releases the
+  // corresponding GuestOutputProperties copy to consumers.
+  uint64_t guest_output_sequence_ = 0;
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;

@@ -312,6 +312,13 @@ class D3D12Presenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
 
+  // Main-target painting is serialized by Presenter paint ownership. Count a
+  // successful OS presentation only once for each monotonically increasing
+  // active guest-output mailbox sequence; UI-only paints and repaints of an
+  // already presented sequence don't advance this telemetry.
+  uint64_t last_presented_guest_output_sequence_ = 0;
+  uint64_t successful_guest_output_present_count_ = 0;
+
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;
   uint32_t temporal_upscaler_max_render_width_ = 0;

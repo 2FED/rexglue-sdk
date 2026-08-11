@@ -557,6 +557,7 @@ bool Presenter::RefreshGuestOutput(
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
+  writable_properties.sequence = 0;
   bool is_active = writable_properties.IsActive();
   if (is_active) {
     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
@@ -566,6 +567,12 @@ bool Presenter::RefreshGuestOutput(
       // output either though because the failure may be something transient.
       return false;
     }
+    if (guest_output_sequence_ == UINT64_MAX) {
+      REXLOG_ERROR("Presenter: Active guest output sequence exhausted");
+      return false;
+    }
+    writable_properties.sequence = ++guest_output_sequence_;
+    assert_not_zero(writable_properties.sequence);
     guest_output_active_last_refresh_ = true;
   } else {
     // Request presenting a blank image if there was a true image previously,

@@ -204,10 +204,11 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
 
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  GuestOutputProperties guest_output_properties;
   {
     uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(
-        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+        ConsumeGuestOutput(guest_output_mailbox_index, &guest_output_properties, nullptr));
     if (guest_output_mailbox_index != UINT32_MAX) {
       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
     }
@@ -330,6 +331,8 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   }
   // Unmapping will be done implicitly when the resource goes out of scope and
   // gets destroyed.
+  REXLOG_INFO("D3D12 guest capture: success sequence={} dimensions={}x{}",
+              guest_output_properties.sequence, image_out.width, image_out.height);
   return true;
 }
 
@@ -581,6 +584,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   bool back_buffer_acquired = false;
   bool back_buffer_bound = false;
   bool back_buffer_clear_needed = true;
+  uint64_t guest_output_drawn_sequence = 0;
+  uint32_t guest_output_drawn_width = 0;
+  uint32_t guest_output_drawn_height = 0;
   const float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
 
   // Draw the guest output.
@@ -1018,6 +1024,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
                   letterbox_clear_d3d12_rectangles);
             }
             back_buffer_clear_needed = false;
+            guest_output_drawn_sequence = guest_output_properties.sequence;
+            guest_output_drawn_width = guest_output_properties.frontbuffer_width;
+            guest_output_drawn_height = guest_output_properties.frontbuffer_height;
+            assert_not_zero(guest_output_drawn_sequence);
           }
         } else {
           D3D12_RESOURCE_BARRIER barriers[2];
@@ -1162,13 +1172,56 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
   paint_context_.present_submission_tracker.NextSubmission();
+  if (SUCCEEDED(present_result)) {
+    if (guest_output_drawn_sequence > last_presented_guest_output_sequence_) {
+      last_presented_guest_output_sequence_ = guest_output_drawn_sequence;
+      ++successful_guest_output_present_count_;
+      if (successful_guest_output_present_count_ == 1) {
+        REXLOG_INFO(
+            "D3D12 guest present: successful sequence count=1 sequence={} source={}x{} "
+            "swapchain={}x{}",
+            guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
+            paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+      } else if (successful_guest_output_present_count_ == 3) {
+        REXLOG_INFO(
+            "D3D12 guest present: successful sequence count=3 sequence={} source={}x{} "
+            "swapchain={}x{}",
+            guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
+            paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+      }
+    }
+    return PaintResult::kPresented;
+  }
+
+  if (guest_output_drawn_sequence) {
+    const uint32_t present_hresult = static_cast<uint32_t>(present_result);
+    if (present_result == DXGI_ERROR_DEVICE_REMOVED) {
+      REXLOG_ERROR(
+          "D3D12 guest present: device removed sequence={} source={}x{} swapchain={}x{} "
+          "HRESULT=0x{:08X}",
+          guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
+          paint_context_.swap_chain_width, paint_context_.swap_chain_height, present_hresult);
+    } else if (present_result == DXGI_ERROR_DEVICE_RESET) {
+      REXLOG_ERROR(
+          "D3D12 guest present: device reset sequence={} source={}x{} swapchain={}x{} "
+          "HRESULT=0x{:08X}",
+          guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
+          paint_context_.swap_chain_width, paint_context_.swap_chain_height, present_hresult);
+    } else {
+      REXLOG_ERROR(
+          "D3D12 guest present: failed sequence={} source={}x{} swapchain={}x{} "
+          "HRESULT=0x{:08X}",
+          guest_output_drawn_sequence, guest_output_drawn_width, guest_output_drawn_height,
+          paint_context_.swap_chain_width, paint_context_.swap_chain_height, present_hresult);
+    }
+  }
   switch (present_result) {
     case DXGI_ERROR_DEVICE_REMOVED:
       return PaintResult::kGpuLostExternally;
     case DXGI_ERROR_DEVICE_RESET:
       return PaintResult::kGpuLostResponsible;
     default:
-      return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
+      return PaintResult::kNotPresented;
   }
 }
 

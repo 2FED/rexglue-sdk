@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -2009,7 +2010,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool guest_output_refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -2274,6 +2275,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         EndSubmission(true);
         return true;
       });
+
+  if (guest_output_refreshed) {
+    static std::atomic_flag first_active_refresh_logged = ATOMIC_FLAG_INIT;
+    if (!first_active_refresh_logged.test_and_set(std::memory_order_relaxed)) {
+      REXGPU_INFO("D3D12 IssueSwap: first active guest output refresh succeeded source={}x{}",
+                  guest_output_width, guest_output_height);
+    }
+  } else {
+    REXGPU_ERROR("IssueSwap: RefreshGuestOutput failed for active {}x{} guest output",
+                 guest_output_width, guest_output_height);
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
