@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <cstring>
+#include <mutex>
 
 #include <rex/chrono/clock.h>
 #include <rex/kernel/xam/module.h>
@@ -558,6 +559,53 @@ u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32
   return X_ERROR_FUNCTION_FAILED;
 }
 
+constexpr u32 kWsaNetworkUnreachable = 0x2743;
+constexpr u32 kXNetConnectStatusLost = 3;
+
+u32 NetDll_XNetServerToInAddrOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN(
+        "[OFFLINE] NetDll_XNetServerToInAddr unavailable - returning WSAENETUNREACH ({:#x})",
+        kWsaNetworkUnreachable);
+  });
+  return kWsaNetworkUnreachable;
+}
+
+u32 NetDll_XNetUnregisterInAddrOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] NetDll_XNetUnregisterInAddr cleanup accepted as a no-op");
+  });
+  return 0;
+}
+
+u32 NetDll_XNetConnectOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] NetDll_XNetConnect unavailable - returning WSAENETUNREACH ({:#x})",
+                 kWsaNetworkUnreachable);
+  });
+  return kWsaNetworkUnreachable;
+}
+
+u32 NetDll_XNetGetConnectStatusOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] NetDll_XNetGetConnectStatus unavailable - returning LOST ({})",
+                 kXNetConnectStatusLost);
+  });
+  return kXNetConnectStatusLost;
+}
+
+u32 NetDll_XNetQosLookupOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] NetDll_XNetQosLookup unavailable - returning X_ERROR_FUNCTION_FAILED");
+  });
+  return X_ERROR_FUNCTION_FAILED;
+}
+
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
   if (!addr_ptr) {
     return -1;
@@ -1026,24 +1074,27 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
+REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnectOffline_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
+REX_EXPORT(__imp__NetDll_XNetGetConnectStatus,
+           rex::kernel::xam::NetDll_XNetGetConnectStatusOffline_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
+REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookupOffline_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
+REX_EXPORT(__imp__NetDll_XNetServerToInAddr,
+           rex::kernel::xam::NetDll_XNetServerToInAddrOffline_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr,
+           rex::kernel::xam::NetDll_XNetUnregisterInAddrOffline_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);

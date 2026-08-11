@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <mutex>
+
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -41,6 +43,10 @@ u32 XamVoiceClose_entry(mapped_void voice_ptr) {
 }
 
 u32 XamVoiceHeadsetPresent_entry(mapped_void voice_ptr) {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] XamVoiceHeadsetPresent returning false; XHV voice is unavailable");
+  });
   return 0;
 }
 

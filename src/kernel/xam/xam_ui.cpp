@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -550,6 +552,31 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
 
+u32 XamShowFriendsUIOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] XamShowFriendsUI unavailable - returning X_ERROR_NOT_LOGGED_ON");
+  });
+  return X_ERROR_NOT_LOGGED_ON;
+}
+
+u32 XamShowGamerCardUIForXUIDOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN(
+        "[OFFLINE] XamShowGamerCardUIForXUID unavailable - returning X_ERROR_NOT_LOGGED_ON");
+  });
+  return X_ERROR_NOT_LOGGED_ON;
+}
+
+u32 XamShowPlayerReviewUIOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] XamShowPlayerReviewUI unavailable - returning X_ERROR_NOT_LOGGED_ON");
+  });
+  return X_ERROR_NOT_LOGGED_ON;
+}
+
 uint32_t XamShowMessageBoxUIEx_entry() {
   // TODO(tomc): implement properly
   static bool warned = false;
@@ -609,12 +636,13 @@ REX_EXPORT_STUB(__imp__XamShowFitnessWarnAboutTimeUI);
 REX_EXPORT_STUB(__imp__XamShowFofUI);
 REX_EXPORT_STUB(__imp__XamShowForcedNameChangeUI);
 REX_EXPORT_STUB(__imp__XamShowFriendRequestUI);
-REX_EXPORT_STUB(__imp__XamShowFriendsUI);
+REX_EXPORT(__imp__XamShowFriendsUI, rex::kernel::xam::XamShowFriendsUIOffline_entry)
 REX_EXPORT_STUB(__imp__XamShowFriendsUIp);
 REX_EXPORT_STUB(__imp__XamShowGameInviteUI);
 REX_EXPORT_STUB(__imp__XamShowGameVoiceChannelUI);
 REX_EXPORT_STUB(__imp__XamShowGamerCardUI);
-REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUID);
+REX_EXPORT(__imp__XamShowGamerCardUIForXUID,
+           rex::kernel::xam::XamShowGamerCardUIForXUIDOffline_entry)
 REX_EXPORT_STUB(__imp__XamShowGamerCardUIForXUIDp);
 REX_EXPORT_STUB(__imp__XamShowGamesUI);
 REX_EXPORT_STUB(__imp__XamShowGenericOnlineAppUI);
@@ -671,7 +699,7 @@ REX_EXPORT_STUB(__imp__XamShowPasscodeVerifyUI);
 REX_EXPORT_STUB(__imp__XamShowPasscodeVerifyUIEx);
 REX_EXPORT_STUB(__imp__XamShowPaymentOptionsUI);
 REX_EXPORT_STUB(__imp__XamShowPersonalizationUI);
-REX_EXPORT_STUB(__imp__XamShowPlayerReviewUI);
+REX_EXPORT(__imp__XamShowPlayerReviewUI, rex::kernel::xam::XamShowPlayerReviewUIOffline_entry)
 REX_EXPORT_STUB(__imp__XamShowPlayersUI);
 REX_EXPORT_STUB(__imp__XamShowPrivateChatInviteUI);
 REX_EXPORT_STUB(__imp__XamShowQuickChatUI);

@@ -8,9 +8,23 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <mutex>
+
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+
+namespace rex::kernel::xam {
+
+u32 XNetLogonGetTitleIDOffline_entry() {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] XNetLogonGetTitleID unavailable - returning invalid title id 0");
+  });
+  return 0;
+}
+
+}  // namespace rex::kernel::xam
 
 // kinda gross but oh well
 REX_EXPORT_STUB(__imp__CancelWaitableTimer);
@@ -243,7 +257,7 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleIDOffline_entry)
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
