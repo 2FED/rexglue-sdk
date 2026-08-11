@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 
 #include <rex/platform/fpscr.h>
 #include <rex/types.h>
@@ -306,6 +307,12 @@ struct alignas(0x40) PPCContext {
    */
   uint32_t last_indirect_target = 0;
 
+  // Privacy-safe crash breadcrumbs. These contain guest addresses and a static
+  // import name only; no guest stack, registers, or memory bytes are retained.
+  uint32_t guest_pc = 0;
+  uint32_t current_function = 0;
+  const char* last_import = nullptr;
+
   PPCRegister f0;
   PPCRegister f1;
   PPCRegister f2;
@@ -495,3 +502,43 @@ struct alignas(0x40) PPCContext {
     std::memcpy(&v64, src, 64 * sizeof(PPCVRegister));
   }
 };
+
+namespace rex::ppc {
+
+class GuestFunctionScope {
+ public:
+  GuestFunctionScope(PPCContext& context, uint32_t function_address)
+      : context_(context),
+        previous_pc_(context.guest_pc),
+        previous_function_(context.current_function),
+        uncaught_exceptions_(std::uncaught_exceptions()) {
+    context_.guest_pc = function_address;
+    context_.current_function = function_address;
+  }
+
+  ~GuestFunctionScope() {
+    if (std::uncaught_exceptions() == uncaught_exceptions_) {
+      context_.guest_pc = previous_pc_;
+      context_.current_function = previous_function_;
+    }
+  }
+
+  GuestFunctionScope(const GuestFunctionScope&) = delete;
+  GuestFunctionScope& operator=(const GuestFunctionScope&) = delete;
+
+ private:
+  PPCContext& context_;
+  uint32_t previous_pc_;
+  uint32_t previous_function_;
+  int uncaught_exceptions_;
+};
+
+inline void SetGuestProgramCounter(PPCContext& context, uint32_t guest_pc) {
+  context.guest_pc = guest_pc;
+}
+
+inline void RecordGuestImport(PPCContext& context, const char* import_name) {
+  context.last_import = import_name;
+}
+
+}  // namespace rex::ppc

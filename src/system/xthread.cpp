@@ -18,19 +18,20 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
-#include <rex/perf/counter.h>
+#include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/literals.h>
 #include <rex/logging.h>
 #include <rex/math.h>
-#include <rex/ppc/context.h>
+#include <rex/perf/counter.h>
 #include <rex/platform/exceptions.h>
+#include <rex/ppc/context.h>
 #include <rex/runtime.h>
 #include <rex/stream.h>
-#include <rex/system/kernel_state.h>
+#include <rex/system/crash_report.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/kernel_state.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
-#include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
@@ -445,10 +446,23 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();
 
-    // Execute user code.
+    // Execute user code. Guest-generated C++ failures are converted into a
+    // bounded metadata-only report before the host thread exits.
     current_xthread_tls_ = this;
     running_ = true;
-    Execute();
+    try {
+      Execute();
+    } catch (const std::exception& error) {
+      const auto report =
+          diagnostics::CaptureGuestCrashReport(error.what(), thread_state_.get(), 1);
+      REXSYS_CRITICAL("{}", diagnostics::FormatGuestCrashReport(report));
+      FlushLogging();
+    } catch (...) {
+      const auto report =
+          diagnostics::CaptureGuestCrashReport("unknown guest exception", thread_state_.get(), 1);
+      REXSYS_CRITICAL("{}", diagnostics::FormatGuestCrashReport(report));
+      FlushLogging();
+    }
     running_ = false;
     current_xthread_tls_ = nullptr;
 

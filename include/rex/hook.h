@@ -36,34 +36,47 @@
 #define REX_HOOK(subroutine, function)                  \
   extern "C" REX_FUNC(subroutine) {                     \
     ZoneNamedN(___tracy_hook_zone, #subroutine, true);  \
+    rex::ppc::RecordGuestImport(ctx, #subroutine);      \
     rex::ppc::HostToGuestFunction<function>(ctx, base); \
   }
 #else
 #define REX_HOOK(subroutine, function)                  \
   extern "C" REX_FUNC(subroutine) {                     \
+    rex::ppc::RecordGuestImport(ctx, #subroutine);      \
     rex::ppc::HostToGuestFunction<function>(ctx, base); \
   }
 #endif
 
-// Define a raw hook with direct ctx/base access.
-#define REX_HOOK_RAW(name) extern "C" REX_FUNC(name)
+// Define a raw hook with direct ctx/base access while preserving the same
+// import breadcrumb recorded by typed hooks. The helper keeps the existing
+// `REX_HOOK_RAW(name) { ... }` authoring syntax intact.
+#define REX_HOOK_RAW(name)                   \
+  static REX_FUNC(name##_raw_impl);          \
+  extern "C" REX_FUNC(name) {                \
+    rex::ppc::RecordGuestImport(ctx, #name); \
+    name##_raw_impl(ctx, base);              \
+  }                                          \
+  static REX_FUNC(name##_raw_impl)
 
 // Stub: logs a warning when called.
-#define REX_STUB(subroutine)              \
-  extern "C" REX_FUNC(subroutine) {       \
-    (void)base;                           \
-    REXKRNL_WARN("{} STUB", #subroutine); \
+#define REX_STUB(subroutine)                       \
+  extern "C" REX_FUNC(subroutine) {                \
+    (void)base;                                    \
+    rex::ppc::RecordGuestImport(ctx, #subroutine); \
+    REXKRNL_WARN("{} STUB", #subroutine);          \
   }
 
 #define REX_STUB_LOG(subroutine, msg)               \
   extern "C" REX_FUNC(subroutine) {                 \
     (void)base;                                     \
+    rex::ppc::RecordGuestImport(ctx, #subroutine);  \
     REXKRNL_WARN("{} STUB - {}", #subroutine, msg); \
   }
 
 #define REX_STUB_RETURN(subroutine, value)                                                \
   extern "C" REX_FUNC(subroutine) {                                                       \
     (void)base;                                                                           \
+    rex::ppc::RecordGuestImport(ctx, #subroutine);                                        \
     REXKRNL_WARN("{} STUB - returning {:#x}", #subroutine, static_cast<uint32_t>(value)); \
     ctx.r3.u64 = (value);                                                                 \
   }

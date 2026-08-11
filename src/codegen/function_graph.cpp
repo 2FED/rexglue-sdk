@@ -368,7 +368,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
     emit_println(out, "// STUB: Function at 0x{:08X} has no discovered code blocks", base());
     emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
-    emit_println(out, "\tREX_FUNC_PROLOGUE();");
+    emit_println(out, "\tREX_FUNC_PROLOGUE(0x{:08X});", base());
     emit_println(out, "}}\n");
     return out;
   }
@@ -480,7 +480,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   // Function signature with weak/alias pattern
   emit_println(out, "DEFINE_REX_FUNC({}) {{", name);
-  emit_println(out, "\tREX_FUNC_PROLOGUE();");
+  emit_println(out, "\tREX_FUNC_PROLOGUE(0x{:08X});", base());
 
   // --- Second pass: emit instruction code ---
   const JumpTable* activeJt = nullptr;
@@ -511,6 +511,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       // Only emit each label once
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
+        emit_println(body, "\trex::ppc::SetGuestProgramCounter(ctx, 0x{:08X});", blockBase);
         csrState = CSRState::Unknown;
       }
 

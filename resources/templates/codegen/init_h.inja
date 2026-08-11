@@ -68,33 +68,43 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Function Prologue
 //=============================================================================
 
+#define REX_GUEST_FUNCTION_SCOPE(...) \
+  rex::ppc::GuestFunctionScope rex_guest_function_scope_(ctx, 0 __VA_OPT__(+__VA_ARGS__))
+
 #if defined(REXGLUE_PROFILE_GUEST_FUNCTIONS) && defined(REXGLUE_ENABLE_PROFILING)
 #include <tracy/Tracy.hpp>
 #if defined(__clang__)
-#define REX_FUNC_PROLOGUE()                     \
+#define REX_FUNC_PROLOGUE(...)                  \
+  REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__);        \
   __builtin_assume(((size_t)base & 0x1F) == 0); \
   ZoneNamedN(___tracy_guest_zone, __func__, true)
 #elif defined(__GNUC__)
-#define REX_FUNC_PROLOGUE()         \
+#define REX_FUNC_PROLOGUE(...)      \
+  REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__); \
   do {                              \
     if (((size_t)base & 0x1F) != 0) \
       __builtin_unreachable();      \
   } while (0);                      \
   ZoneNamedN(___tracy_guest_zone, __func__, true)
 #else
-#define REX_FUNC_PROLOGUE() ZoneNamedN(___tracy_guest_zone, __func__, true)
+#define REX_FUNC_PROLOGUE(...) \
+  REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__); \
+  ZoneNamedN(___tracy_guest_zone, __func__, true)
 #endif
 #else
 #if defined(__clang__)
-#define REX_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+#define REX_FUNC_PROLOGUE(...) \
+  REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__); \
+  __builtin_assume(((size_t)base & 0x1F) == 0)
 #elif defined(__GNUC__)
-#define REX_FUNC_PROLOGUE()         \
+#define REX_FUNC_PROLOGUE(...)      \
+  REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__); \
   do {                              \
     if (((size_t)base & 0x1F) != 0) \
       __builtin_unreachable();      \
   } while (0)
 #else
-#define REX_FUNC_PROLOGUE() ((void)0)
+#define REX_FUNC_PROLOGUE(...) REX_GUEST_FUNCTION_SCOPE(__VA_ARGS__)
 #endif
 #endif
 
@@ -235,8 +245,11 @@ extern PPCFuncMapping PPCFuncMappings[];
 // Misc
 //=============================================================================
 
-#define REX_UNIMPLEMENTED(addr, opcode) \
-  throw std::runtime_error("Unimplemented PPC instruction: " opcode)
+#define REX_UNIMPLEMENTED(addr, opcode)            \
+  do {                                             \
+    rex::ppc::SetGuestProgramCounter(ctx, addr);   \
+    throw std::runtime_error("Unimplemented PPC instruction: " opcode); \
+  } while (0)
 
 #define REX_QUERY_TIMEBASE() rex::chrono::Clock::QueryGuestTickCount()
 
