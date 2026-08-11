@@ -10,8 +10,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <string>
 
@@ -302,6 +305,17 @@ class XThread : public XObject {
     uint32_t creation_flags;
     uint32_t guest_process;
   };
+
+  struct StartPlan {
+    uint32_t address;
+    std::array<uint64_t, 2> arguments;
+    size_t argument_count;
+    bool use_return_value_as_exit_code;
+  };
+
+  static constexpr std::chrono::milliseconds kGuestThreadStartupDelay{10};
+
+  static StartPlan BuildStartPlan(const CreationParams& params);
 
   XThread(KernelState* kernel_state);
   XThread(KernelState* kernel_state, uint32_t stack_size, uint32_t xapi_thread_startup,

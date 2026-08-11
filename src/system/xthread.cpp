@@ -568,6 +568,24 @@ X_STATUS XThread::Terminate(int exit_code) {
   return X_STATUS_SUCCESS;
 }
 
+XThread::StartPlan XThread::BuildStartPlan(const CreationParams& params) {
+  if (params.xapi_thread_startup) {
+    return {
+        params.xapi_thread_startup,
+        {params.start_address, params.start_context},
+        2,
+        false,
+    };
+  }
+
+  return {
+      params.start_address,
+      {params.start_context, 0},
+      1,
+      true,
+  };
+}
+
 void XThread::Execute() {
   REXSYS_NOISY_DEBUG("Execute thid {} (handle={:08X}, '{}', native={:08X})", thread_id_, handle(),
                      thread_name_, thread_->system_id());
@@ -575,27 +593,16 @@ void XThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // Match Xenia's compatibility startup grace period. Some titles finish initializing
+  // shared state immediately after ExCreateThread returns and depend on thread
+  // creation not racing ahead of the creator.
+  rex::thread::Sleep(kGuestThreadStartupDelay);
+
   // Dispatch any APCs that were queued before the thread was created first.
   DeliverAPCs();
 
-  uint32_t address;
-  std::vector<uint64_t> args;
-  bool want_exit_code;
   int exit_code = 0;
-
-  // If a XapiThreadStartup value is present, we use that as a trampoline.
-  // Otherwise, we are a raw thread.
-  if (creation_params_.xapi_thread_startup) {
-    address = creation_params_.xapi_thread_startup;
-    args.push_back(creation_params_.start_address);
-    args.push_back(creation_params_.start_context);
-    want_exit_code = false;
-  } else {
-    // Run user code.
-    address = creation_params_.start_address;
-    args.push_back(creation_params_.start_context);
-    want_exit_code = true;
-  }
+  const StartPlan start_plan = BuildStartPlan(creation_params_);
 
   // NOTE(tomc): JIT execution replaced with direct function calls
   // In rexglue, guest code is compiled ahead of time and called directly.
@@ -609,9 +616,9 @@ void XThread::Execute() {
 
   auto* dispatcher = runtime->function_dispatcher();
   auto* memory = runtime->memory();
-  PPCFunc* func = dispatcher->GetFunction(address);
+  PPCFunc* func = dispatcher->GetFunction(start_plan.address);
   if (!func) {
-    REXSYS_ERROR("XThread::Execute - No function registered at {:08X}", address);
+    REXSYS_ERROR("XThread::Execute - No function registered at {:08X}", start_plan.address);
     return;
   }
 
@@ -619,22 +626,10 @@ void XThread::Execute() {
   uint8_t* base = memory->virtual_membase();
 
   // Pass arguments in r3, r4, ... per PPC calling convention
-  if (args.size() > 0)
-    ctx->r3.u64 = args[0];
-  if (args.size() > 1)
-    ctx->r4.u64 = args[1];
-  if (args.size() > 2)
-    ctx->r5.u64 = args[2];
-  if (args.size() > 3)
-    ctx->r6.u64 = args[3];
-  if (args.size() > 4)
-    ctx->r7.u64 = args[4];
-  if (args.size() > 5)
-    ctx->r8.u64 = args[5];
-  if (args.size() > 6)
-    ctx->r9.u64 = args[6];
-  if (args.size() > 7)
-    ctx->r10.u64 = args[7];
+  ctx->r3.u64 = start_plan.arguments[0];
+  if (start_plan.argument_count > 1) {
+    ctx->r4.u64 = start_plan.arguments[1];
+  }
 
   ctx->fpscr.InitHost();
 
@@ -644,14 +639,14 @@ void XThread::Execute() {
   main_fiber_ = rex::thread::Fiber::ConvertCurrentThread();
 
   // Execute the function
-  REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
+  REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", start_plan.address);
   func(*ctx, base);
 
   exit_code = static_cast<int>(ctx->r3.u32);
 
   // If we got here it means the execute completed without an exit being called.
   // Treat the return code as an implicit exit code (if desired).
-  Exit(!want_exit_code ? 0 : exit_code);
+  Exit(start_plan.use_return_value_as_exit_code ? exit_code : 0);
 }
 
 void XThread::EnterCriticalRegion() {

@@ -12,12 +12,32 @@
 
 #include <chrono>
 #include <cstdint>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/chrono/chrono.h>
+#include <rex/chrono/clock.h>
 
 using rex::chrono::WinSystemClock;
+
+TEST_CASE("Guest timebase is monotonic at the Xbox 360 50 MHz frequency", "[chrono][timebase]") {
+  constexpr uint64_t kGuestTickFrequency = 50'000'000;
+  rex::chrono::Clock::set_guest_tick_frequency(kGuestTickFrequency);
+  rex::chrono::Clock::set_guest_time_scalar(1.0);
+
+  CHECK(rex::chrono::Clock::guest_tick_frequency() == kGuestTickFrequency);
+
+  const auto ratio = rex::chrono::Clock::guest_tick_ratio();
+  const uint64_t host_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  CHECK(ratio.first * host_frequency == ratio.second * kGuestTickFrequency);
+
+  const uint64_t first = rex::chrono::Clock::QueryGuestTickCount();
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  const uint64_t second = rex::chrono::Clock::QueryGuestTickCount();
+  CHECK(second > first);
+  CHECK(second - first < kGuestTickFrequency);
+}
 
 // =============================================================================
 // Known FILETIME constants
