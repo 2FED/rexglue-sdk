@@ -12,13 +12,18 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <array>
 #include <cstring>
+#include <mutex>
+#include <string>
 
 #include <rex/cvar.h>
+#include <rex/kernel/xam/profile_audit.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/hook.h>
+#include <rex/thread.h>
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -29,6 +34,9 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DEFINE_BOOL(xam_profile_audit, false, "XAM",
+                    "Emit bounded privacy-safe XAM user/profile audit markers")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace kernel {
@@ -36,10 +44,410 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+namespace {
+
+constexpr std::array<uint32_t, 3> kMclaProfileSettingIds = {0x1004000C, 0x1004000D, 0x1004000E};
+constexpr uint32_t kMclaProfileBufferSize =
+    sizeof(uint32_t) * 2 + sizeof(X_USER_PROFILE_SETTING) * kMclaProfileSettingIds.size();
+
+class XamProfileAudit {
+ public:
+  static XamProfileAudit& Get() {
+    static XamProfileAudit audit;
+    return audit;
+  }
+
+  void RecordSigninState(uint32_t user_index, uint32_t state) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++signin_state_calls_;
+    const bool slot0_success = user_index == 0 && state == 1;
+    const bool other_success = user_index > 0 && user_index < 4 && state == 0;
+    const bool success = slot0_success || other_success;
+    if (slot0_success) {
+      ++signin_state_slot0_local_;
+      saw_signin_state_ = true;
+    } else if (other_success) {
+      ++signin_state_other_;
+      signin_state_other_mask_ |= uint32_t(1) << user_index;
+    }
+    bool& recorded =
+        slot0_success ? signin_state_success_recorded_ : signin_state_failure_recorded_;
+    if (other_success) {
+      const uint32_t slot_bit = uint32_t(1) << user_index;
+      if (!(signin_state_other_record_mask_ & slot_bit)) {
+        signin_state_other_record_mask_ |= slot_bit;
+        REXKRNL_INFO("XAM_PROFILE_AUDIT_SIGNIN_STATE v=1 class=absent user={} state=0", user_index);
+      }
+      return;
+    }
+    if (!recorded) {
+      recorded = true;
+      if (success) {
+        REXKRNL_INFO("XAM_PROFILE_AUDIT_SIGNIN_STATE v=1 class=success user={} state={}",
+                     user_index, state);
+      } else {
+        REXKRNL_ERROR("XAM_PROFILE_AUDIT_SIGNIN_STATE v=1 class=failure user={} state={}",
+                      user_index, state);
+      }
+    }
+  }
+
+  void RecordXuid(uint32_t user_index, uint32_t mask, uint32_t result, bool nonzero) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++xuid_calls_;
+    const bool success = user_index == 0 && mask == 7 && result == X_E_SUCCESS && nonzero;
+    if (success) {
+      ++xuid_success_;
+      ++xuid_nonzero_;
+      saw_xuid_ = true;
+    }
+    bool& recorded = success ? xuid_success_recorded_ : xuid_failure_recorded_;
+    if (!recorded) {
+      recorded = true;
+      if (success) {
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_XUID v=1 class=success user={} mask={} result={:08X} "
+            "nonzero={}",
+            user_index, mask, result, nonzero ? 1 : 0);
+      } else {
+        REXKRNL_ERROR(
+            "XAM_PROFILE_AUDIT_XUID v=1 class=failure user={} mask={} result={:08X} "
+            "nonzero={}",
+            user_index, mask, result, nonzero ? 1 : 0);
+      }
+    }
+  }
+
+  void RecordProfileRead(uint32_t title_id, uint32_t user_index, uint32_t xuid_count,
+                         uint32_t setting_count, const be<uint32_t>* setting_ids,
+                         uint32_t buffer_size_in, uint32_t buffer_size_out, bool has_buffer,
+                         uint32_t result, bool overlapped, uint32_t completed_result) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++profile_read_calls_;
+    const bool exact_ids = HasExactMclaSettingIds(setting_count, setting_ids);
+    const bool exact_title = title_id == 0xFFFE07D1;
+    const bool is_size = exact_title && exact_ids && user_index == 0xFF && xuid_count == 0 &&
+                         !has_buffer && buffer_size_in == 0 &&
+                         result == X_ERROR_INSUFFICIENT_BUFFER &&
+                         buffer_size_out == kMclaProfileBufferSize;
+    const bool semantic_success =
+        result == X_ERROR_SUCCESS ||
+        (overlapped && result == X_ERROR_IO_PENDING && completed_result == X_ERROR_SUCCESS);
+    const bool is_fill = exact_title && exact_ids && user_index == 0 && xuid_count == 0 &&
+                         has_buffer && buffer_size_in == kMclaProfileBufferSize &&
+                         buffer_size_out == kMclaProfileBufferSize && semantic_success;
+    const char* class_name = nullptr;
+    bool* recorded = nullptr;
+    if (is_size) {
+      class_name = "size";
+      recorded = &profile_read_size_recorded_;
+      ++profile_read_size_;
+      saw_profile_size_ = true;
+    } else if (is_fill) {
+      class_name = "fill";
+      recorded = &profile_read_fill_recorded_;
+      ++profile_read_fill_;
+      saw_profile_fill_ = true;
+    } else {
+      ++profile_read_failure_;
+      class_name = "failure";
+      recorded = &profile_read_failure_recorded_;
+    }
+    if (recorded && !*recorded) {
+      *recorded = true;
+      const std::string ids = FormatSettingIds(setting_count, setting_ids);
+      if (is_size || is_fill) {
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_PROFILE_READ v=1 class={} title=profile user={} xuid_count={} "
+            "setting_count={} setting_ids={} buffer_size_in={} buffer_size_out={} "
+            "result={:08X} overlapped={} completed={:08X}",
+            class_name, user_index, xuid_count, setting_count, ids, buffer_size_in, buffer_size_out,
+            result, overlapped ? 1 : 0, completed_result);
+      } else {
+        REXKRNL_ERROR(
+            "XAM_PROFILE_AUDIT_PROFILE_READ v=1 class=failure title={} user={} xuid_count={} "
+            "setting_count={} setting_ids={} buffer_size_in={} buffer_size_out={} "
+            "result={:08X} overlapped={} completed={:08X}",
+            exact_title ? "profile" : "other", user_index, xuid_count, setting_count, ids,
+            buffer_size_in, buffer_size_out, result, overlapped ? 1 : 0, completed_result);
+      }
+    }
+  }
+
+  void RecordPrivilege(uint32_t user_index, uint32_t mask, uint32_t result, bool allowed) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++privilege_calls_;
+    const bool expected_mask = mask == 251 || mask == 252;
+    const bool success = user_index == 0 && expected_mask && result == X_ERROR_SUCCESS && !allowed;
+    bool* recorded = &privilege_failure_recorded_;
+    if (success) {
+      ++privilege_success_;
+      if (mask == 251) {
+        ++privilege_251_false_;
+        saw_privilege_251_ = true;
+        recorded = &privilege_251_recorded_;
+      } else if (mask == 252) {
+        ++privilege_252_false_;
+        saw_privilege_252_ = true;
+        recorded = &privilege_252_recorded_;
+      }
+    }
+    if (allowed)
+      ++privilege_allowed_;
+    if (!*recorded) {
+      *recorded = true;
+      if (success) {
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_PRIVILEGE v=1 class=success user={} mask={} result={:08X} "
+            "allowed={}",
+            user_index, mask, result, allowed ? 1 : 0);
+      } else {
+        REXKRNL_ERROR(
+            "XAM_PROFILE_AUDIT_PRIVILEGE v=1 class=failure user={} mask={} result={:08X} "
+            "allowed={}",
+            user_index, mask, result, allowed ? 1 : 0);
+      }
+    }
+  }
+
+  void RecordName(uint32_t user_index, uint32_t result, bool profile_match) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++name_calls_;
+    const bool success = user_index == 0 && result == X_ERROR_SUCCESS && profile_match;
+    if (success)
+      ++name_match_;
+    bool& recorded = success ? name_success_recorded_ : name_failure_recorded_;
+    if (!recorded) {
+      recorded = true;
+      if (success) {
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_NAME v=1 class=success user={} result={:08X} profile_match=1",
+            user_index, result);
+      } else {
+        REXKRNL_ERROR(
+            "XAM_PROFILE_AUDIT_NAME v=1 class=failure user={} result={:08X} "
+            "profile_match={}",
+            user_index, result, profile_match ? 1 : 0);
+      }
+    }
+  }
+
+  void RecordSigninInfo(uint32_t user_index, uint32_t result, bool state_match, bool xuid_match,
+                        bool name_match) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++signin_info_calls_;
+    const bool success =
+        user_index == 0 && result == X_E_SUCCESS && state_match && xuid_match && name_match;
+    const bool absent = user_index > 0 && user_index < 4 && result == X_E_NO_SUCH_USER;
+    if (success)
+      ++signin_info_consistent_;
+    if (absent)
+      ++signin_info_absent_;
+    if (absent)
+      signin_info_absent_mask_ |= uint32_t(1) << user_index;
+    const uint32_t absent_bit = absent ? uint32_t(1) << user_index : 0;
+    bool should_record = false;
+    if (success) {
+      should_record = !signin_info_success_recorded_;
+    } else if (absent) {
+      should_record = !(signin_info_absent_record_mask_ & absent_bit);
+    } else {
+      should_record = !signin_info_failure_recorded_;
+    }
+    if (should_record) {
+      if (success) {
+        signin_info_success_recorded_ = true;
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_SIGNIN_INFO v=1 class=success user={} result={:08X} "
+            "state_match=1 xuid_match=1 name_match=1",
+            user_index, result);
+      } else if (absent) {
+        signin_info_absent_record_mask_ |= absent_bit;
+        REXKRNL_INFO(
+            "XAM_PROFILE_AUDIT_SIGNIN_INFO v=1 class=absent user={} result={:08X} "
+            "state_match=0 xuid_match=0 name_match=0",
+            user_index, result);
+      } else {
+        signin_info_failure_recorded_ = true;
+        REXKRNL_ERROR(
+            "XAM_PROFILE_AUDIT_SIGNIN_INFO v=1 class=failure user={} result={:08X} "
+            "state_match={} xuid_match={} name_match={}",
+            user_index, result, state_match ? 1 : 0, xuid_match ? 1 : 0, name_match ? 1 : 0);
+      }
+    }
+  }
+
+  void RecordSigninUi() {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    ++signin_ui_calls_;
+    ++signin_ui_ordered_;
+    if (!signin_ui_recorded_) {
+      signin_ui_recorded_ = true;
+      REXKRNL_INFO(
+          "XAM_PROFILE_AUDIT_SIGNIN_UI v=1 class=success signin_changed_seq=1 "
+          "ui_off_seq=2 ordered=1 result=00000000");
+    }
+  }
+
+  void EmitSummary(const char* phase) {
+    if (!Enabled())
+      return;
+    std::lock_guard lock(mutex_);
+    EnsureConfig();
+    if (summary_emitted_)
+      return;
+    summary_emitted_ = true;
+    const bool checkpoint = phase && std::strcmp(phase, "checkpoint") == 0;
+    const bool profile_contract =
+        profile_read_calls_ == 0 || (saw_profile_size_ && saw_profile_fill_);
+    const bool privilege_contract =
+        privilege_calls_ == 0 || (saw_privilege_251_ && saw_privilege_252_);
+    const bool pass =
+        checkpoint && saw_signin_state_ && signin_state_other_mask_ == 0xE && saw_xuid_ &&
+        xuid_success_ > 0 && xuid_nonzero_ > 0 && name_match_ > 0 && signin_info_consistent_ > 0 &&
+        signin_info_absent_mask_ == 0xE && profile_contract && privilege_contract &&
+        profile_read_failure_ == 0 && !signin_state_failure_recorded_ && !xuid_failure_recorded_ &&
+        !privilege_failure_recorded_ && !name_failure_recorded_ && !signin_info_failure_recorded_ &&
+        privilege_allowed_ == 0 && (!signin_ui_calls_ || signin_ui_calls_ == signin_ui_ordered_);
+    REXKRNL_INFO(
+        "XAM_PROFILE_AUDIT_SUMMARY v=1 phase={} status={} signin_state_calls={} "
+        "signin_state_slot0_local={} signin_state_other={} signin_state_other_mask={:X} "
+        "xuid_calls={} xuid_success={} "
+        "xuid_nonzero={} profile_read_calls={} profile_read_size={} profile_read_fill={} "
+        "profile_read_failure={} privilege_calls={} privilege_success={} privilege_allowed={} "
+        "privilege_251_false={} privilege_252_false={} name_calls={} name_match={} "
+        "signin_info_calls={} signin_info_consistent={} signin_info_absent={} "
+        "signin_info_absent_mask={:X} signin_ui_calls={} "
+        "signin_ui_ordered={} dropped_records={}",
+        phase ? phase : "invalid", pass ? "PASS" : "FAIL", signin_state_calls_,
+        signin_state_slot0_local_, signin_state_other_, signin_state_other_mask_, xuid_calls_,
+        xuid_success_, xuid_nonzero_, profile_read_calls_, profile_read_size_, profile_read_fill_,
+        profile_read_failure_, privilege_calls_, privilege_success_, privilege_allowed_,
+        privilege_251_false_, privilege_252_false_, name_calls_, name_match_, signin_info_calls_,
+        signin_info_consistent_, signin_info_absent_, signin_info_absent_mask_, signin_ui_calls_,
+        signin_ui_ordered_, dropped_records_);
+  }
+
+ private:
+  bool Enabled() const { return REXCVAR_GET(xam_profile_audit); }
+
+  void EnsureConfig() {
+    if (!config_emitted_) {
+      config_emitted_ = true;
+      REXKRNL_INFO("XAM_PROFILE_AUDIT_CONFIG v=1 enabled=1 slot=0");
+    }
+  }
+
+  static bool HasExactMclaSettingIds(uint32_t count, const be<uint32_t>* setting_ids) {
+    if (count != kMclaProfileSettingIds.size() || !setting_ids)
+      return false;
+    for (size_t i = 0; i < kMclaProfileSettingIds.size(); ++i) {
+      if (static_cast<uint32_t>(setting_ids[i]) != kMclaProfileSettingIds[i])
+        return false;
+    }
+    return true;
+  }
+
+  static std::string FormatSettingIds(uint32_t count, const be<uint32_t>* setting_ids) {
+    if (!setting_ids || !count)
+      return "none";
+    std::string result;
+    const uint32_t bounded_count = std::min(count, uint32_t(32));
+    for (uint32_t i = 0; i < bounded_count; ++i) {
+      if (i)
+        result.push_back(',');
+      result += fmt::format("{:08X}", static_cast<uint32_t>(setting_ids[i]));
+    }
+    return result;
+  }
+
+  std::mutex mutex_;
+  bool config_emitted_ = false;
+  bool summary_emitted_ = false;
+  bool signin_state_success_recorded_ = false;
+  bool signin_state_failure_recorded_ = false;
+  uint32_t signin_state_other_record_mask_ = 0;
+  bool xuid_success_recorded_ = false;
+  bool xuid_failure_recorded_ = false;
+  bool profile_read_size_recorded_ = false;
+  bool profile_read_fill_recorded_ = false;
+  bool profile_read_failure_recorded_ = false;
+  bool privilege_251_recorded_ = false;
+  bool privilege_252_recorded_ = false;
+  bool privilege_failure_recorded_ = false;
+  bool name_success_recorded_ = false;
+  bool name_failure_recorded_ = false;
+  bool signin_info_success_recorded_ = false;
+  bool signin_info_failure_recorded_ = false;
+  uint32_t signin_info_absent_record_mask_ = 0;
+  bool signin_ui_recorded_ = false;
+  bool saw_signin_state_ = false;
+  bool saw_xuid_ = false;
+  bool saw_profile_size_ = false;
+  bool saw_profile_fill_ = false;
+  bool saw_privilege_251_ = false;
+  bool saw_privilege_252_ = false;
+  uint64_t signin_state_calls_ = 0;
+  uint64_t signin_state_slot0_local_ = 0;
+  uint64_t signin_state_other_ = 0;
+  uint32_t signin_state_other_mask_ = 0;
+  uint64_t xuid_calls_ = 0;
+  uint64_t xuid_success_ = 0;
+  uint64_t xuid_nonzero_ = 0;
+  uint64_t profile_read_calls_ = 0;
+  uint64_t profile_read_size_ = 0;
+  uint64_t profile_read_fill_ = 0;
+  uint64_t profile_read_failure_ = 0;
+  uint64_t privilege_calls_ = 0;
+  uint64_t privilege_success_ = 0;
+  uint64_t privilege_allowed_ = 0;
+  uint64_t privilege_251_false_ = 0;
+  uint64_t privilege_252_false_ = 0;
+  uint64_t name_calls_ = 0;
+  uint64_t name_match_ = 0;
+  uint64_t signin_info_calls_ = 0;
+  uint64_t signin_info_consistent_ = 0;
+  uint64_t signin_info_absent_ = 0;
+  uint32_t signin_info_absent_mask_ = 0;
+  uint64_t signin_ui_calls_ = 0;
+  uint64_t signin_ui_ordered_ = 0;
+  uint64_t dropped_records_ = 0;
+};
+
+}  // namespace
+
+void EmitXamProfileAuditSummary(const char* phase) {
+  XamProfileAudit::Get().EmitSummary(phase);
+}
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
-  assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
-              type_mask == 7);
+  if (type_mask != 1 && type_mask != 2 && type_mask != 3 && type_mask != 4 && type_mask != 7) {
+    XamProfileAudit::Get().RecordXuid(user_index, type_mask, X_E_INVALIDARG, false);
+    return X_E_INVALIDARG;
+  }
   if (!xuid_ptr) {
+    XamProfileAudit::Get().RecordXuid(user_index, type_mask, X_E_INVALIDARG, false);
     return X_E_INVALIDARG;
   }
   uint32_t result = X_E_NO_SUCH_USER;
@@ -62,10 +470,14 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
     result = X_E_INVALIDARG;
   }
   *xuid_ptr = xuid;
+  XamProfileAudit::Get().RecordXuid(user_index, type_mask, result, xuid != 0);
   return result;
 }
 
 u32 XamUserGetSigninState_entry(u32 user_index) {
+  // This import is polled at high frequency by some titles. Match Xenia's
+  // cooperative scheduling behavior instead of monopolizing a host worker.
+  rex::thread::MaybeYield();
   uint32_t signin_state = 0;
   if (user_index < 4) {
     if (user_index == 0) {
@@ -73,6 +485,7 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
       signin_state = user_profile->signin_state();
     }
   }
+  XamProfileAudit::Get().RecordSigninState(user_index, signin_state);
   return signin_state;
 }
 
@@ -88,11 +501,13 @@ static_assert_size(X_USER_SIGNIN_INFO, 40);
 
 i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNIN_INFO> info) {
   if (!info) {
+    XamProfileAudit::Get().RecordSigninInfo(user_index, X_E_INVALIDARG, false, false, false);
     return X_E_INVALIDARG;
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
   if (user_index) {
+    XamProfileAudit::Get().RecordSigninInfo(user_index, X_E_NO_SUCH_USER, false, false, false);
     return X_E_NO_SUCH_USER;
   }
 
@@ -100,21 +515,33 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   info->xuid = user_profile->xuid();
   info->signin_state = user_profile->signin_state();
   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+  XamProfileAudit::Get().RecordSigninInfo(
+      user_index, X_E_SUCCESS,
+      static_cast<uint32_t>(info->signin_state) == user_profile->signin_state(),
+      static_cast<uint64_t>(info->xuid) == user_profile->xuid(),
+      std::string_view(info->name) == user_profile->name());
   return X_E_SUCCESS;
 }
 
 u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
+  if (!buffer || !buffer_len) {
+    XamProfileAudit::Get().RecordName(user_index, X_E_INVALIDARG, false);
+    return X_E_INVALIDARG;
+  }
   if (user_index >= 4) {
+    XamProfileAudit::Get().RecordName(user_index, X_E_INVALIDARG, false);
     return X_E_INVALIDARG;
   }
 
   if (user_index) {
+    XamProfileAudit::Get().RecordName(user_index, X_E_NO_SUCH_USER, false);
     return X_E_NO_SUCH_USER;
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
   const auto& user_name = user_profile->name();
   rex::string::copy_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
+  XamProfileAudit::Get().RecordName(user_index, X_E_SUCCESS, buffer.value() == user_name);
   return X_E_SUCCESS;
 }
 
@@ -149,34 +576,46 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                       be<uint32_t>* setting_ids, uint32_t unk,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
-  if (!xuid_count) {
-    assert_null(xuids);
-  } else {
-    assert_true(xuid_count == 1);
-    assert_not_null(xuids);
+  const uint32_t buffer_size_in = buffer_size_ptr ? static_cast<uint32_t>(*buffer_size_ptr) : 0;
+  auto finish = [&](uint32_t result) {
+    const uint32_t buffer_size_out = buffer_size_ptr ? static_cast<uint32_t>(*buffer_size_ptr) : 0;
+    const uint32_t completed_result = overlapped && result == X_ERROR_IO_PENDING
+                                          ? static_cast<uint32_t>(overlapped->result)
+                                          : result;
+    XamProfileAudit::Get().RecordProfileRead(title_id, user_index, xuid_count, setting_count,
+                                             setting_count <= 32 ? setting_ids : nullptr,
+                                             buffer_size_in, buffer_size_out, buffer != nullptr,
+                                             result, overlapped != nullptr, completed_result);
+    return result;
+  };
+  if ((!xuid_count && xuids) || (xuid_count && (!xuids || xuid_count != 1)) || unk != 0 ||
+      (setting_count && !setting_ids)) {
+    return finish(X_ERROR_INVALID_PARAMETER);
+  }
+  if (xuid_count) {
     // TODO(gibbed): allow proper lookup of arbitrary XUIDs
     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+    if (static_cast<uint64_t>(xuids[0]) != user_profile->xuid()) {
+      return finish(X_ERROR_INVALID_PARAMETER);
+    }
     // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
     // until it's implemented for release builds...
     xuid_count = 1;
   }
-  assert_zero(unk);  // probably flags
-
   // must have at least 1 to 32 settings
   if (setting_count < 1 || setting_count > 32) {
-    return X_ERROR_INVALID_PARAMETER;
+    return finish(X_ERROR_INVALID_PARAMETER);
   }
 
   // buffer size pointer must be valid
   if (!buffer_size_ptr) {
-    return X_ERROR_INVALID_PARAMETER;
+    return finish(X_ERROR_INVALID_PARAMETER);
   }
 
   // if buffer size is non-zero, buffer pointer must be valid
   auto buffer_size = static_cast<uint32_t>(*buffer_size_ptr);
   if (buffer_size && !buffer) {
-    return X_ERROR_INVALID_PARAMETER;
+    return finish(X_ERROR_INVALID_PARAMETER);
   }
 
   uint32_t needed_header_size = 0;
@@ -205,7 +644,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     if (!buffer_size) {
       *buffer_size_ptr = needed_size;
     }
-    return X_ERROR_INSUFFICIENT_BUFFER;
+    return finish(X_ERROR_INSUFFICIENT_BUFFER);
   }
 
   // Title ID = 0 means us.
@@ -216,9 +655,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_NO_SUCH_USER);
-      return X_ERROR_IO_PENDING;
+      return finish(X_ERROR_IO_PENDING);
     }
-    return X_ERROR_NO_SUCH_USER;
+    return finish(X_ERROR_NO_SUCH_USER);
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
@@ -245,9 +684,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
           REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_INVALID_PARAMETER);
-      return X_ERROR_IO_PENDING;
+      return finish(X_ERROR_IO_PENDING);
     }
-    return X_ERROR_INVALID_PARAMETER;
+    return finish(X_ERROR_INVALID_PARAMETER);
   }
 
   auto out_header = reinterpret_cast<X_USER_READ_PROFILE_SETTINGS*>(buffer);
@@ -279,9 +718,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
   if (overlapped) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(
         REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
-    return X_ERROR_IO_PENDING;
+    return finish(X_ERROR_IO_PENDING);
   }
-  return X_ERROR_SUCCESS;
+  return finish(X_ERROR_SUCCESS);
 }
 
 u32 XamUserReadProfileSettings_entry(u32 title_id, u32 user_index, u32 xuid_count, mapped_u64 xuids,
@@ -371,19 +810,26 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
 }
 
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {
+  if (!out_value) {
+    XamProfileAudit::Get().RecordPrivilege(user_index, mask, X_ERROR_INVALID_PARAMETER, false);
+    return X_ERROR_INVALID_PARAMETER;
+  }
   // checking all users?
   if (user_index != 0xFF) {
     if (user_index >= 4) {
+      XamProfileAudit::Get().RecordPrivilege(user_index, mask, X_ERROR_INVALID_PARAMETER, false);
       return X_ERROR_INVALID_PARAMETER;
     }
 
     if (user_index) {
+      XamProfileAudit::Get().RecordPrivilege(user_index, mask, X_ERROR_NO_SUCH_USER, false);
       return X_ERROR_NO_SUCH_USER;
     }
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
   *out_value = 0;
+  XamProfileAudit::Get().RecordPrivilege(user_index, mask, X_ERROR_SUCCESS, false);
   return X_ERROR_SUCCESS;
 }
 
@@ -485,6 +931,7 @@ u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
   // Games seem to sit and loop until we trigger this notification:
   // XN_SYS_UI (off)
   REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);
+  XamProfileAudit::Get().RecordSigninUi();
   return X_ERROR_SUCCESS;
 }
 

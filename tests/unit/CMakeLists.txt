@@ -4,6 +4,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
+    kernel/xam_user_profile_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp
