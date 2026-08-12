@@ -27,6 +27,7 @@ class D3D12GraphicsSystem : public GraphicsSystem {
   static bool IsAvailable();
 
   std::string name() const override;
+  void RequestRenderAuditCheckpoint() override;
 
  protected:
   void CreateProvider(bool with_presentation) override;

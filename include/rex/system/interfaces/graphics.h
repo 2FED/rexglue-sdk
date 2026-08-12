@@ -79,6 +79,10 @@ class IGraphicsSystem {
     (void)blocking;
   }
 
+  // Requests a backend-specific, privacy-safe rendering audit checkpoint.
+  // Backends without render audit support leave this as a no-op.
+  virtual void RequestRenderAuditCheckpoint() {}
+
   // One-shot convenience for callers that don't care about the split.
   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                  ui::WindowedAppContext* app_context, bool with_presentation) {

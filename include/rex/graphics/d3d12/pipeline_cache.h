@@ -54,6 +54,7 @@ class PipelineCache {
 
   bool Initialize();
   void Shutdown();
+  void EmitRenderAuditSummary(const char* phase);
   // No ClearCache because it's undesirable with the persistent shader storage
   // (if the storage is reloaded, effectively nothing is cleared, while the call
   // takes a long time, and if it's not, there will be heavy stuttering for the
@@ -95,6 +96,15 @@ class PipelineCache {
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
+  }
+  enum class PipelineAuditStatus { kPending, kReady, kFailed };
+  PipelineAuditStatus GetPipelineAuditStatus(void* handle) const {
+    const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
+    if (!pipeline->creation_complete.load(std::memory_order_acquire)) {
+      return PipelineAuditStatus::kPending;
+    }
+    return pipeline->state.load(std::memory_order_acquire) ? PipelineAuditStatus::kReady
+                                                           : PipelineAuditStatus::kFailed;
   }
 
  private:
@@ -299,6 +309,20 @@ class PipelineCache {
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
 
+  static constexpr uint64_t kRenderAuditShaderRecordLimit = 256;
+  static constexpr uint64_t kRenderAuditPsoRecordLimit = 512;
+  std::mutex render_audit_mutex_;
+  std::atomic<bool> render_audit_enabled_{false};
+  std::atomic<bool> render_audit_summary_emitted_{false};
+  std::atomic<uint64_t> render_audit_translate_vs_ok_{0};
+  std::atomic<uint64_t> render_audit_translate_ps_ok_{0};
+  std::atomic<uint64_t> render_audit_translate_fail_{0};
+  std::atomic<uint64_t> render_audit_pso_attempt_{0};
+  std::atomic<uint64_t> render_audit_pso_ok_{0};
+  std::atomic<uint64_t> render_audit_pso_fail_{0};
+  std::atomic<uint64_t> render_audit_shader_record_claims_{0};
+  std::atomic<uint64_t> render_audit_pso_record_claims_{0};
+
   // Temporary storage for AnalyzeUcode calls on the processor thread.
   string::StringBuffer ucode_disasm_buffer_;
   // Reusable shader translator for the processor thread.
@@ -345,6 +369,7 @@ class PipelineCache {
   struct Pipeline {
     // nullptr if creation has failed.
     std::atomic<ID3D12PipelineState*> state{nullptr};
+    std::atomic<bool> creation_complete{false};
     std::atomic<ID3D12RootSignature*> root_signature{nullptr};
     PipelineRuntimeDescription description;
     D3D12Shader::D3D12Translation* pending_vertex_shader = nullptr;

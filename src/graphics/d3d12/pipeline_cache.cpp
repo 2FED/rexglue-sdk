@@ -111,6 +111,7 @@ PipelineCache::~PipelineCache() {
 }
 
 bool PipelineCache::Initialize() {
+  render_audit_enabled_ = REXCVAR_GET(gpu_render_audit);
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
 
   // Initialize the command processor thread DXIL objects.
@@ -168,6 +169,35 @@ bool PipelineCache::Initialize() {
   return true;
 }
 
+void PipelineCache::EmitRenderAuditSummary(const char* phase) {
+  std::lock_guard<std::mutex> audit_lock(render_audit_mutex_);
+  if (!render_audit_enabled_.exchange(false, std::memory_order_acq_rel) ||
+      render_audit_summary_emitted_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  uint64_t shader_record_claims =
+      render_audit_shader_record_claims_.load(std::memory_order_relaxed);
+  uint64_t pso_record_claims = render_audit_pso_record_claims_.load(std::memory_order_relaxed);
+  REXGPU_INFO(
+      "XENOS_AUDIT_PIPELINE_SUMMARY v=1 phase={} shader_entries={} translate_vs_ok={} "
+      "translate_ps_ok={} translate_fail={} pso_entries={} pso_attempt={} pso_ok={} pso_fail={} "
+      "shader_records={} shader_overflow={} pso_records={} pso_overflow={}",
+      phase, shaders_.size(), render_audit_translate_vs_ok_.load(std::memory_order_relaxed),
+      render_audit_translate_ps_ok_.load(std::memory_order_relaxed),
+      render_audit_translate_fail_.load(std::memory_order_relaxed), pipelines_.size(),
+      render_audit_pso_attempt_.load(std::memory_order_relaxed),
+      render_audit_pso_ok_.load(std::memory_order_relaxed),
+      render_audit_pso_fail_.load(std::memory_order_relaxed),
+      std::min(shader_record_claims, kRenderAuditShaderRecordLimit),
+      shader_record_claims > kRenderAuditShaderRecordLimit
+          ? shader_record_claims - kRenderAuditShaderRecordLimit
+          : 0,
+      std::min(pso_record_claims, kRenderAuditPsoRecordLimit),
+      pso_record_claims > kRenderAuditPsoRecordLimit
+          ? pso_record_claims - kRenderAuditPsoRecordLimit
+          : 0);
+}
+
 void PipelineCache::Shutdown() {
   // Shut down all threads, before destroying the pipelines since they may be
   // creating them.
@@ -186,6 +216,8 @@ void PipelineCache::Shutdown() {
 
   // Shut down the persistent shader / pipeline storage.
   ShutdownShaderStorage();
+
+  EmitRenderAuditSummary("shutdown");
 
   // Destroy all pipelines.
   current_pipeline_ = nullptr;
@@ -646,6 +678,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       } else {
         new_pipeline->state.store(CreateD3D12Pipeline(pipeline_runtime_description),
                                   std::memory_order_release);
+        new_pipeline->creation_complete.store(true, std::memory_order_release);
       }
       ++pipelines_created;
     }
@@ -1034,6 +1067,7 @@ bool PipelineCache::ConfigurePipeline(
     creation_request_cond_.notify_one();
   } else {
     new_pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    new_pipeline->creation_complete.store(true, std::memory_order_release);
   }
 
   if (pipeline_storage_file_) {
@@ -1060,10 +1094,33 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
                                             IDxcCompiler* dxc_compiler) {
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
+  auto audit_translation = [this, &shader, &translation](bool succeeded) {
+    std::lock_guard<std::mutex> audit_lock(render_audit_mutex_);
+    if (!render_audit_enabled_) {
+      return;
+    }
+    if (succeeded) {
+      if (shader.type() == xenos::ShaderType::kVertex) {
+        render_audit_translate_vs_ok_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        render_audit_translate_ps_ok_.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else {
+      render_audit_translate_fail_.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t record_id = render_audit_shader_record_claims_.fetch_add(1, std::memory_order_relaxed);
+    if (record_id < kRenderAuditShaderRecordLimit) {
+      REXGPU_INFO(
+          "XENOS_AUDIT_SHADER v=1 id={} stage={} ucode={:016X} modification={:016X} result={}",
+          record_id, shader.type() == xenos::ShaderType::kVertex ? "vs" : "ps",
+          shader.ucode_data_hash(), translation.modification(), succeeded ? "ok" : "fail");
+    }
+  };
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
   if (!translator.TranslateAnalyzedShader(translation)) {
+    audit_translation(false);
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
@@ -1229,7 +1286,9 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                                     : "d3d12");
   }
 
-  return translation.is_valid();
+  bool translation_valid = translation.is_valid();
+  audit_translation(translation_valid);
+  return translation_valid;
 }
 
 bool PipelineCache::GetCurrentStateDescription(
@@ -2678,6 +2737,30 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     const PipelineRuntimeDescription& runtime_description) {
   const PipelineDescription& description = runtime_description.description;
+  auto audit_pso = [this, &runtime_description, &description](bool succeeded, HRESULT result) {
+    std::lock_guard<std::mutex> audit_lock(render_audit_mutex_);
+    if (!render_audit_enabled_) {
+      return;
+    }
+    render_audit_pso_attempt_.fetch_add(1, std::memory_order_relaxed);
+    (succeeded ? render_audit_pso_ok_ : render_audit_pso_fail_)
+        .fetch_add(1, std::memory_order_relaxed);
+    uint64_t record_id = render_audit_pso_record_claims_.fetch_add(1, std::memory_order_relaxed);
+    if (record_id < kRenderAuditPsoRecordLimit) {
+      uint64_t pixel_shader_hash =
+          runtime_description.pixel_shader
+              ? runtime_description.pixel_shader->shader().ucode_data_hash()
+              : 0;
+      REXGPU_INFO(
+          "XENOS_AUDIT_PSO v=1 id={} desc={:016X} vs={:016X} ps={:016X} host_msaa={} "
+          "depth_fmt={} depth_func={} depth_write={} result={} hresult={:08X}",
+          record_id, XXH3_64bits(&description, sizeof(description)),
+          runtime_description.vertex_shader->shader().ucode_data_hash(), pixel_shader_hash,
+          UINT32_C(1) << uint32_t(description.host_msaa_samples),
+          uint32_t(description.depth_format), uint32_t(description.depth_func),
+          uint32_t(description.depth_write), succeeded ? "ok" : "fail", uint32_t(result));
+    }
+  };
 
   if (runtime_description.pixel_shader != nullptr) {
     REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
@@ -3029,7 +3112,9 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // Create the D3D12 pipeline state object.
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
   ID3D12PipelineState* state;
-  if (FAILED(device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state)))) {
+  HRESULT create_result = device->CreateGraphicsPipelineState(&state_desc, IID_PPV_ARGS(&state));
+  if (FAILED(create_result)) {
+    audit_pso(false, create_result);
     if (runtime_description.pixel_shader != nullptr) {
       REXGPU_ERROR("Failed to create graphics pipeline with VS {:016X}, PS {:016X}",
                    runtime_description.vertex_shader->shader().ucode_data_hash(),
@@ -3040,6 +3125,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
     return nullptr;
   }
+  audit_pso(true, create_result);
   std::u16string name;
   if (runtime_description.pixel_shader != nullptr) {
     name = rex::string::to_utf16(fmt::format(
@@ -3232,6 +3318,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
       pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                       std::memory_order_release);
     }
+    pipeline_to_create->creation_complete.store(true, std::memory_order_release);
 
     // Pipeline created - the thread is not busy anymore, safe to set the
     // completion event if needed (at the next iteration, or in some other
@@ -3258,10 +3345,12 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
     PipelineRuntimeDescription runtime_description;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
+      pipeline_to_create->creation_complete.store(true, std::memory_order_release);
       continue;
     }
     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                     std::memory_order_release);
+    pipeline_to_create->creation_complete.store(true, std::memory_order_release);
   }
 }
 

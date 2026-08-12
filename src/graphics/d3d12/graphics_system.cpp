@@ -13,6 +13,7 @@
 
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/flags.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -35,6 +36,16 @@ std::string D3D12GraphicsSystem::name() const {
     return d3d12_command_processor->GetWindowTitleText();
   }
   return "Direct3D 12";
+}
+
+void D3D12GraphicsSystem::RequestRenderAuditCheckpoint() {
+  if (!REXCVAR_GET(gpu_render_audit)) {
+    return;
+  }
+  auto* d3d12_command_processor = static_cast<D3D12CommandProcessor*>(command_processor());
+  if (d3d12_command_processor != nullptr) {
+    d3d12_command_processor->RequestRenderAuditCheckpoint();
+  }
 }
 
 void D3D12GraphicsSystem::CreateProvider(bool /*with_presentation*/) {

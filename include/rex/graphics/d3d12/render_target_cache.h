@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool Initialize();
   void Shutdown(bool from_destructor = false);
+  void EmitRenderAuditSummaries(const char* phase);
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
@@ -676,6 +678,40 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool depth_float24_convert_in_pixel_shader_ = false;
 
   bool msaa_2x_supported_ = false;
+
+  static constexpr uint32_t kRenderAuditRenderTargetRecordLimit = 128;
+  static constexpr uint32_t kRenderAuditOwnershipModeLimit = 64;
+  static constexpr uint32_t kRenderAuditResolveModeLimit = 128;
+  bool render_audit_enabled_ = false;
+  bool render_audit_config_emitted_ = false;
+  std::atomic<bool> render_audit_summary_emitted_{false};
+  uint64_t render_audit_rt_create_attempt_ = 0;
+  uint64_t render_audit_rt_create_ok_ = 0;
+  uint64_t render_audit_rt_create_fail_ = 0;
+  uint64_t render_audit_rt_records_ = 0;
+  uint64_t render_audit_rt_overflow_ = 0;
+  uint64_t render_audit_host_depth_store_ = 0;
+  uint64_t render_audit_ownership_draws_ = 0;
+  std::array<uint64_t, kRenderAuditOwnershipModeLimit> render_audit_ownership_mode_keys_ = {};
+  uint32_t render_audit_ownership_mode_count_ = 0;
+  uint64_t render_audit_ownership_overflow_ = 0;
+  uint64_t render_audit_resolve_calls_ = 0;
+  uint64_t render_audit_resolve_info_ok_ = 0;
+  uint64_t render_audit_resolve_info_fail_ = 0;
+  uint64_t render_audit_resolve_zero_area_ = 0;
+  uint64_t render_audit_resolve_shader_known_ = 0;
+  uint64_t render_audit_resolve_shader_unknown_ = 0;
+  uint64_t render_audit_resolve_direct_preflight_ = 0;
+  uint64_t render_audit_resolve_direct_preflight_dump_ok_ = 0;
+  uint64_t render_audit_resolve_direct_reject_ = 0;
+  uint64_t render_audit_resolve_fallback_dump_ok_ = 0;
+  uint64_t render_audit_resolve_fallback_dump_fail_ = 0;
+  uint64_t render_audit_resolve_copy_dispatch_ = 0;
+  uint64_t render_audit_resolve_final_ok_ = 0;
+  uint64_t render_audit_resolve_final_fail_ = 0;
+  std::array<uint64_t, kRenderAuditResolveModeLimit> render_audit_resolve_mode_keys_ = {};
+  uint32_t render_audit_resolve_mode_count_ = 0;
+  uint64_t render_audit_resolve_mode_overflow_ = 0;
 
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_color_;
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_depth_;

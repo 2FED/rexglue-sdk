@@ -15,6 +15,9 @@
 
 REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
+REXCVAR_DEFINE_BOOL(gpu_render_audit, false, "GPU",
+                    "Emit bounded privacy-safe GPU rendering audit markers")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",

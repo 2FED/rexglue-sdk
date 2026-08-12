@@ -57,6 +57,9 @@ class D3D12CommandProcessor : public CommandProcessor {
                                bool blocking) override;
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
+  void RequestRenderAuditCheckpoint() {
+    render_audit_checkpoint_requested_.store(true, std::memory_order_release);
+  }
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -229,6 +232,8 @@ class D3D12CommandProcessor : public CommandProcessor {
 
  private:
   static constexpr uint32_t kQueueFrames = 3;
+
+  void EmitRenderAuditSummary(const char* phase);
 
   enum RootParameter : UINT {
     // Keep the size of the root signature at each stage 13 dwords or less
@@ -572,6 +577,37 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint8_t* gamma_ramp_upload_buffer_mapping_ = nullptr;
   bool gamma_ramp_256_entry_table_up_to_date_ = false;
   bool gamma_ramp_pwl_up_to_date_ = false;
+
+  static constexpr uint32_t kRenderAuditGammaRecordLimit = 16;
+  static constexpr uint32_t kRenderAuditBindRecordLimit = 128;
+  bool render_audit_enabled_ = false;
+  std::atomic<bool> render_audit_summary_emitted_{false};
+  std::atomic<bool> render_audit_checkpoint_requested_{false};
+  uint64_t render_audit_draw_issued_ = 0;
+  uint64_t render_audit_draw_indexed_ = 0;
+  uint64_t render_audit_draw_nonindexed_ = 0;
+  uint64_t render_audit_pso_pending_skip_ = 0;
+  uint64_t render_audit_pso_failed_skip_ = 0;
+  uint64_t render_audit_depth_test_ = 0;
+  uint64_t render_audit_depth_write_ = 0;
+  uint64_t render_audit_stencil_ = 0;
+  uint64_t render_audit_depth_bound_ = 0;
+  uint64_t render_audit_depth_without_bound_ = 0;
+  std::array<uint64_t, kRenderAuditBindRecordLimit> render_audit_bind_keys_ = {};
+  uint32_t render_audit_bind_record_count_ = 0;
+  uint64_t render_audit_bind_overflow_ = 0;
+  uint64_t render_audit_msaa_[3] = {};
+  uint64_t render_audit_gamma_table_dispatch_ = 0;
+  uint64_t render_audit_gamma_pwl_dispatch_ = 0;
+  uint64_t render_audit_gamma_identity_dispatch_ = 0;
+  uint64_t render_audit_gamma_nonidentity_dispatch_ = 0;
+  uint64_t render_audit_gamma_table_writes_ = 0;
+  uint64_t render_audit_gamma_pwl_writes_ = 0;
+  uint64_t render_audit_gamma_uploads_ = 0;
+  std::array<uint64_t, kRenderAuditGammaRecordLimit> render_audit_gamma_keys_ = {};
+  uint32_t render_audit_gamma_record_count_ = 0;
+  uint64_t render_audit_gamma_overflow_ = 0;
+  uint64_t render_audit_refresh_fail_ = 0;
 
   struct ApplyGammaConstants {
     uint32_t size[2];

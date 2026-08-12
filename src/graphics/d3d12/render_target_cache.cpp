@@ -171,6 +171,7 @@ D3D12RenderTargetCache::~D3D12RenderTargetCache() {
 }
 
 bool D3D12RenderTargetCache::Initialize() {
+  render_audit_enabled_ = REXCVAR_GET(gpu_render_audit);
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
@@ -955,12 +956,54 @@ bool D3D12RenderTargetCache::Initialize() {
     return false;
   }
 
+  if (render_audit_enabled_) {
+    REXGPU_INFO(
+        "XENOS_AUDIT_CONFIG v=1 backend=d3d12 rt_path={} bindless={} scale_x={} scale_y={} "
+        "native_2x_supported={} gamma_rt_unorm16={} depth_f24_ps={} depth_f24_round={} "
+        "direct_host_resolve={}",
+        path_ == Path::kHostRenderTargets ? "host" : "rov", uint32_t(bindless_resources_used_),
+        draw_resolution_scale_x(), draw_resolution_scale_y(), uint32_t(msaa_2x_supported_),
+        uint32_t(gamma_render_target_as_unorm16_), uint32_t(depth_float24_convert_in_pixel_shader_),
+        uint32_t(depth_float24_round_), uint32_t(REXCVAR_GET(direct_host_resolve)));
+    render_audit_config_emitted_ = true;
+  }
+
   InitializeCommon();
 
   return true;
 }
 
+void D3D12RenderTargetCache::EmitRenderAuditSummaries(const char* phase) {
+  if (!render_audit_enabled_ || !render_audit_config_emitted_ ||
+      render_audit_summary_emitted_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  render_audit_enabled_ = false;
+  REXGPU_INFO(
+      "XENOS_AUDIT_RT_SUMMARY v=1 phase={} create_attempt={} create_ok={} create_fail={} "
+      "records={} "
+      "overflow={} host_depth_store={} ownership_draws={} ownership_modes={} ownership_overflow={}",
+      phase, render_audit_rt_create_attempt_, render_audit_rt_create_ok_,
+      render_audit_rt_create_fail_, render_audit_rt_records_, render_audit_rt_overflow_,
+      render_audit_host_depth_store_, render_audit_ownership_draws_,
+      render_audit_ownership_mode_count_, render_audit_ownership_overflow_);
+  REXGPU_INFO(
+      "XENOS_AUDIT_RESOLVE_SUMMARY v=1 phase={} calls={} info_ok={} info_fail={} zero_area={} "
+      "shader_known={} shader_unknown={} direct_preflight={} direct_preflight_dump_ok={} "
+      "direct_reject={} fallback_dump_ok={} fallback_dump_fail={} copy_dispatch={} final_ok={} "
+      "final_fail={} modes={} overflow={} true_direct_dispatch=0",
+      phase, render_audit_resolve_calls_, render_audit_resolve_info_ok_,
+      render_audit_resolve_info_fail_, render_audit_resolve_zero_area_,
+      render_audit_resolve_shader_known_, render_audit_resolve_shader_unknown_,
+      render_audit_resolve_direct_preflight_, render_audit_resolve_direct_preflight_dump_ok_,
+      render_audit_resolve_direct_reject_, render_audit_resolve_fallback_dump_ok_,
+      render_audit_resolve_fallback_dump_fail_, render_audit_resolve_copy_dispatch_,
+      render_audit_resolve_final_ok_, render_audit_resolve_final_fail_,
+      render_audit_resolve_mode_count_, render_audit_resolve_mode_overflow_);
+}
+
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  EmitRenderAuditSummaries("shutdown");
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1169,6 +1212,9 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
                                      uint32_t& written_address_out, uint32_t& written_length_out) {
+  if (render_audit_enabled_) {
+    ++render_audit_resolve_calls_;
+  }
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1179,11 +1225,22 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
                                  fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+    if (render_audit_enabled_) {
+      ++render_audit_resolve_info_fail_;
+      ++render_audit_resolve_final_fail_;
+    }
     return false;
+  }
+  if (render_audit_enabled_) {
+    ++render_audit_resolve_info_ok_;
   }
 
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+    if (render_audit_enabled_) {
+      ++render_audit_resolve_zero_area_;
+      ++render_audit_resolve_final_ok_;
+    }
     return true;
   }
 
@@ -1199,17 +1256,60 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                    copy_shader_constants, copy_group_count_x, copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
+      if (render_audit_enabled_) {
+        ++render_audit_resolve_shader_known_;
+        draw_util::ResolveEdramInfo source_edram_info = resolve_info.IsCopyingDepth()
+                                                            ? resolve_info.depth_edram_info
+                                                            : resolve_info.color_edram_info;
+        uint64_t resolve_mode_key =
+            uint64_t(source_edram_info.is_depth) | (uint64_t(source_edram_info.format) << 1) |
+            (uint64_t(source_edram_info.msaa_samples) << 5) |
+            (uint64_t(resolve_info.copy_dest_info.copy_dest_format) << 7) |
+            (uint64_t(copy_shader) << 13) | (uint64_t(draw_resolution_scaled) << 17);
+        bool resolve_mode_seen = false;
+        for (uint32_t mode_index = 0; mode_index < render_audit_resolve_mode_count_; ++mode_index) {
+          if (render_audit_resolve_mode_keys_[mode_index] == resolve_mode_key) {
+            resolve_mode_seen = true;
+            break;
+          }
+        }
+        if (!resolve_mode_seen) {
+          if (render_audit_resolve_mode_count_ < kRenderAuditResolveModeLimit) {
+            uint32_t mode_id = render_audit_resolve_mode_count_++;
+            render_audit_resolve_mode_keys_[mode_id] = resolve_mode_key;
+            REXGPU_INFO(
+                "XENOS_AUDIT_RESOLVE v=1 id={} src_kind={} src_fmt={} guest_msaa={} dest_fmt={} "
+                "shader={} scaled={}",
+                mode_id, source_edram_info.is_depth ? "depth" : "color",
+                uint32_t(source_edram_info.format),
+                UINT32_C(1) << uint32_t(source_edram_info.msaa_samples),
+                uint32_t(resolve_info.copy_dest_info.copy_dest_format), uint32_t(copy_shader),
+                uint32_t(draw_resolution_scaled));
+          } else {
+            ++render_audit_resolve_mode_overflow_;
+          }
+        }
+      }
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
+          if (render_audit_enabled_) {
+            ++render_audit_resolve_direct_preflight_;
+          }
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
             ++direct_resolve_success_count_;
+            if (render_audit_enabled_) {
+              ++render_audit_resolve_direct_preflight_dump_ok_;
+            }
           } else {
             ++direct_resolve_fallback_count_;
+            if (render_audit_enabled_) {
+              ++render_audit_resolve_direct_reject_;
+            }
           }
         }
         if (!direct_resolved) {
@@ -1221,8 +1321,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+            if (render_audit_enabled_) {
+              ++render_audit_resolve_fallback_dump_fail_;
+              ++render_audit_resolve_final_fail_;
+            }
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
+          }
+          if (render_audit_enabled_) {
+            ++render_audit_resolve_fallback_dump_ok_;
           }
         }
       }
@@ -1308,6 +1415,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
+          if (render_audit_enabled_) {
+            ++render_audit_resolve_copy_dispatch_;
+          }
 
           // Order the resolve with other work using the destination as a UAV.
           if (draw_resolution_scaled) {
@@ -1328,6 +1438,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             "D3D12RenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
       }
+    } else if (render_audit_enabled_) {
+      ++render_audit_resolve_shader_unknown_;
     }
   } else {
     copied = true;
@@ -1421,7 +1533,15 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     cleared = true;
   }
 
-  return copied && cleared;
+  bool resolve_succeeded = copied && cleared;
+  if (render_audit_enabled_) {
+    if (resolve_succeeded) {
+      ++render_audit_resolve_final_ok_;
+    } else {
+      ++render_audit_resolve_final_fail_;
+    }
+  }
+  return resolve_succeeded;
 }
 
 bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
@@ -1710,6 +1830,15 @@ DXGI_FORMAT D3D12RenderTargetCache::GetDepthSRVStencilDXGIFormat(
 }
 
 RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
+  if (render_audit_enabled_) {
+    ++render_audit_rt_create_attempt_;
+  }
+  auto audit_create_failure = [this]() -> RenderTargetCache::RenderTarget* {
+    if (render_audit_enabled_) {
+      ++render_audit_rt_create_fail_;
+    }
+    return nullptr;
+  };
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
 
   D3D12_RESOURCE_DESC resource_desc;
@@ -1729,7 +1858,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   if (resource_desc.Format == DXGI_FORMAT_UNKNOWN) {
     REXGPU_ERROR("D3D12RenderTargetCache: Unknown {} render target format {}",
                  key.is_depth ? "depth" : "color", uint32_t(key.resource_format));
-    return nullptr;
+    return audit_create_failure();
   }
   if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported()) {
     resource_desc.SampleDesc.Count = 4;
@@ -1766,7 +1895,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                              D3D12_HEAP_FLAG_NONE, &resource_desc, resource_state,
                                              &optimized_clear_value, IID_PPV_ARGS(&resource)))) {
-    return nullptr;
+    return audit_create_failure();
   }
   {
     std::u16string resource_name = rex::string::to_utf16(key.GetDebugName());
@@ -1780,7 +1909,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_srv =
       descriptor_pool_srv_->AllocateDescriptor();
   if (!descriptor_draw.IsValid() || !descriptor_srv.IsValid()) {
-    return nullptr;
+    return audit_create_failure();
   }
   D3D12_CPU_DESCRIPTOR_HANDLE descriptor_draw_handle = descriptor_draw.GetHandle();
   ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_load_separate;
@@ -1800,7 +1929,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
     // DSV and stencil SRV.
     descriptor_srv_stencil = descriptor_pool_srv_->AllocateDescriptor();
     if (!descriptor_srv_stencil.IsValid()) {
-      return nullptr;
+      return audit_create_failure();
     }
     D3D12_DEPTH_STENCIL_VIEW_DESC dsv_desc;
     dsv_desc.Format = optimized_clear_value.Format;
@@ -1842,7 +1971,7 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
     if (rtv_desc.Format != load_format) {
       descriptor_load_separate = descriptor_pool.AllocateDescriptor();
       if (!descriptor_load_separate.IsValid()) {
-        return nullptr;
+        return audit_create_failure();
       }
       rtv_desc.Format = load_format;
       device->CreateRenderTargetView(resource.Get(), &rtv_desc,
@@ -1852,6 +1981,34 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
     srv_desc.Format = load_format;
   }
   device->CreateShaderResourceView(resource.Get(), &srv_desc, descriptor_srv.GetHandle());
+
+  if (render_audit_enabled_) {
+    ++render_audit_rt_create_ok_;
+    if (render_audit_rt_records_ < kRenderAuditRenderTargetRecordLimit) {
+      int32_t ownership_dxgi = -1;
+      int32_t depth_srv_dxgi = -1;
+      int32_t stencil_srv_dxgi = -1;
+      if (key.is_depth) {
+        depth_srv_dxgi = int32_t(GetDepthSRVDepthDXGIFormat(key.GetDepthFormat()));
+        stencil_srv_dxgi = int32_t(GetDepthSRVStencilDXGIFormat(key.GetDepthFormat()));
+      } else {
+        ownership_dxgi = int32_t(GetColorOwnershipTransferDXGIFormat(key.GetColorFormat()));
+      }
+      uint32_t guest_msaa = UINT32_C(1) << uint32_t(key.msaa_samples);
+      REXGPU_INFO(
+          "XENOS_AUDIT_RT v=1 id={} kind={} storage_fmt={} guest_msaa={} host_samples={} "
+          "resource_dxgi={} draw_dxgi={} ownership_dxgi={} depth_srv_dxgi={} "
+          "stencil_srv_dxgi={} emulated_2x={}",
+          render_audit_rt_records_, key.is_depth ? "depth" : "color", uint32_t(key.resource_format),
+          guest_msaa, resource_desc.SampleDesc.Count, int32_t(resource_desc.Format),
+          int32_t(optimized_clear_value.Format), ownership_dxgi, depth_srv_dxgi, stencil_srv_dxgi,
+          uint32_t(key.msaa_samples == xenos::MsaaSamples::k2X &&
+                   resource_desc.SampleDesc.Count == 4));
+      ++render_audit_rt_records_;
+    } else {
+      ++render_audit_rt_overflow_;
+    }
+  }
 
   return new D3D12RenderTarget(key, resource.Get(), std::move(descriptor_draw),
                                std::move(descriptor_load_separate), std::move(descriptor_srv),
@@ -4068,6 +4225,9 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             offsetof(HostDepthStoreConstants, rectangle) / sizeof(uint32_t));
         command_processor_.SubmitBarriers();
         command_list.D3DDispatch(group_count_x, group_count_y, 1);
+        if (render_audit_enabled_) {
+          ++render_audit_host_depth_store_;
+        }
         MarkEdramBufferModified();
       }
     }
@@ -4705,6 +4865,39 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+          if (render_audit_enabled_) {
+            ++render_audit_ownership_draws_;
+            RenderTargetKey source_rt_key = source_d3d12_rt.key();
+            uint32_t source_host_samples = source_d3d12_rt.resource()->GetDesc().SampleDesc.Count;
+            uint32_t dest_host_samples = dest_d3d12_rt.resource()->GetDesc().SampleDesc.Count;
+            uint64_t ownership_mode_key =
+                uint64_t(transfer_shader_key.mode) | (uint64_t(source_rt_key.msaa_samples) << 8) |
+                (uint64_t(dest_rt_key.msaa_samples) << 10) | (uint64_t(source_host_samples) << 12) |
+                (uint64_t(dest_host_samples) << 16);
+            bool ownership_mode_seen = false;
+            for (uint32_t mode_index = 0; mode_index < render_audit_ownership_mode_count_;
+                 ++mode_index) {
+              if (render_audit_ownership_mode_keys_[mode_index] == ownership_mode_key) {
+                ownership_mode_seen = true;
+                break;
+              }
+            }
+            if (!ownership_mode_seen) {
+              if (render_audit_ownership_mode_count_ < kRenderAuditOwnershipModeLimit) {
+                uint32_t mode_id = render_audit_ownership_mode_count_++;
+                render_audit_ownership_mode_keys_[mode_id] = ownership_mode_key;
+                REXGPU_INFO(
+                    "XENOS_AUDIT_OWNERSHIP v=1 id={} mode={} src_guest_msaa={} "
+                    "dst_guest_msaa={} src_host_samples={} dst_host_samples={}",
+                    mode_id, uint32_t(transfer_shader_key.mode),
+                    UINT32_C(1) << uint32_t(source_rt_key.msaa_samples),
+                    UINT32_C(1) << uint32_t(dest_rt_key.msaa_samples), source_host_samples,
+                    dest_host_samples);
+              } else {
+                ++render_audit_ownership_overflow_;
+              }
+            }
+          }
         }
       }
     }

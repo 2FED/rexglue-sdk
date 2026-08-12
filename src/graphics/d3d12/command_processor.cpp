@@ -878,6 +878,7 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
 }
 
 bool D3D12CommandProcessor::SetupContext() {
+  render_audit_enabled_ = REXCVAR_GET(gpu_render_audit);
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
@@ -1651,6 +1652,30 @@ bool D3D12CommandProcessor::SetupContext() {
   return true;
 }
 
+void D3D12CommandProcessor::EmitRenderAuditSummary(const char* phase) {
+  if (!render_audit_enabled_ ||
+      render_audit_summary_emitted_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  render_audit_enabled_ = false;
+  REXGPU_INFO(
+      "XENOS_AUDIT_CP_SUMMARY v=1 phase={} draw_issued={} draw_indexed={} draw_nonindexed={} "
+      "pso_pending_skip={} pso_failed_skip={} depth_test={} depth_write={} stencil={} "
+      "depth_bound={} depth_without_bound={} bind_records={} bind_overflow={} msaa1={} msaa2={} "
+      "msaa4={} gamma_table_dispatch={} gamma_pwl_dispatch={} gamma_identity_dispatch={} "
+      "gamma_nonidentity_dispatch={} gamma_table_writes={} gamma_pwl_writes={} gamma_uploads={} "
+      "gamma_records={} gamma_overflow={} refresh_fail={}",
+      phase, render_audit_draw_issued_, render_audit_draw_indexed_, render_audit_draw_nonindexed_,
+      render_audit_pso_pending_skip_, render_audit_pso_failed_skip_, render_audit_depth_test_,
+      render_audit_depth_write_, render_audit_stencil_, render_audit_depth_bound_,
+      render_audit_depth_without_bound_, render_audit_bind_record_count_,
+      render_audit_bind_overflow_, render_audit_msaa_[0], render_audit_msaa_[1],
+      render_audit_msaa_[2], render_audit_gamma_table_dispatch_, render_audit_gamma_pwl_dispatch_,
+      render_audit_gamma_identity_dispatch_, render_audit_gamma_nonidentity_dispatch_,
+      render_audit_gamma_table_writes_, render_audit_gamma_pwl_writes_, render_audit_gamma_uploads_,
+      render_audit_gamma_record_count_, render_audit_gamma_overflow_, render_audit_refresh_fail_);
+}
+
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
@@ -1727,6 +1752,8 @@ void D3D12CommandProcessor::ShutdownContext() {
   texture_cache_.reset();
 
   pipeline_cache_.reset();
+
+  EmitRenderAuditSummary("shutdown");
 
   primitive_processor_.reset();
 
@@ -1909,10 +1936,16 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 }
 
 void D3D12CommandProcessor::OnGammaRamp256EntryTableValueWritten() {
+  if (render_audit_enabled_) {
+    ++render_audit_gamma_table_writes_;
+  }
   gamma_ramp_256_entry_table_up_to_date_ = false;
 }
 
 void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+  if (render_audit_enabled_) {
+    ++render_audit_gamma_pwl_writes_;
+  }
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
@@ -2068,6 +2101,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         bool use_pwl_gamma_ramp =
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+        bool gamma_ramp_uploaded = false;
 
         context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
 
@@ -2111,6 +2145,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               gamma_ramp_upload_offset_bytes, gamma_ramp_size_bytes);
           (use_pwl_gamma_ramp ? gamma_ramp_pwl_up_to_date_
                               : gamma_ramp_256_entry_table_up_to_date_) = true;
+          gamma_ramp_uploaded = true;
+          if (render_audit_enabled_) {
+            ++render_audit_gamma_uploads_;
+          }
         }
 
         // Destination, source, and if bindful, gamma ramp.
@@ -2192,6 +2230,68 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         uint32_t group_count_x = (guest_output_width + 15) / 16;
         uint32_t group_count_y = (guest_output_height + 7) / 8;
         deferred_command_list_.D3DDispatch(group_count_x, group_count_y, 1);
+        if (render_audit_enabled_) {
+          bool gamma_ramp_identity = true;
+          if (use_pwl_gamma_ramp) {
+            const reg::DC_LUT_PWL_DATA* gamma_ramp = gamma_ramp_pwl_rgb();
+            for (uint32_t i = 0; i < 128 && gamma_ramp_identity; ++i) {
+              uint32_t expected_base = (i * UINT32_C(0xFFFF) / UINT32_C(0x7F)) & ~UINT32_C(0x3F);
+              uint32_t expected_delta = i < UINT32_C(0x7F) ? UINT32_C(0x200) : 0;
+              for (uint32_t component = 0; component < 3; ++component) {
+                const reg::DC_LUT_PWL_DATA& entry = gamma_ramp[i * 3 + component];
+                if (entry.base != expected_base || entry.delta != expected_delta) {
+                  gamma_ramp_identity = false;
+                  break;
+                }
+              }
+            }
+            ++render_audit_gamma_pwl_dispatch_;
+          } else {
+            const reg::DC_LUT_30_COLOR* gamma_ramp = gamma_ramp_256_entry_table();
+            for (uint32_t i = 0; i < 256; ++i) {
+              uint32_t expected = i * UINT32_C(0x3FF) / UINT32_C(0xFF);
+              const reg::DC_LUT_30_COLOR& entry = gamma_ramp[i];
+              if (entry.color_10_red != expected || entry.color_10_green != expected ||
+                  entry.color_10_blue != expected) {
+                gamma_ramp_identity = false;
+                break;
+              }
+            }
+            ++render_audit_gamma_table_dispatch_;
+          }
+          if (gamma_ramp_identity) {
+            ++render_audit_gamma_identity_dispatch_;
+          } else {
+            ++render_audit_gamma_nonidentity_dispatch_;
+          }
+          uint32_t luta_control = (*register_file_)[XE_GPU_REG_DC_LUTA_CONTROL];
+          uint64_t gamma_key = uint64_t(use_pwl_gamma_ramp) | (uint64_t(frontbuffer_format) << 1) |
+                               (uint64_t(luta_control) << 8) |
+                               (uint64_t(gamma_ramp_identity) << 40) |
+                               (uint64_t(gamma_ramp_uploaded) << 41);
+          bool gamma_key_seen = false;
+          for (uint32_t record_index = 0; record_index < render_audit_gamma_record_count_;
+               ++record_index) {
+            if (render_audit_gamma_keys_[record_index] == gamma_key) {
+              gamma_key_seen = true;
+              break;
+            }
+          }
+          if (!gamma_key_seen) {
+            if (render_audit_gamma_record_count_ < kRenderAuditGammaRecordLimit) {
+              uint32_t record_id = render_audit_gamma_record_count_++;
+              render_audit_gamma_keys_[record_id] = gamma_key;
+              REXGPU_INFO(
+                  "XENOS_AUDIT_GAMMA v=1 id={} mode={} "
+                  "mode_source=frontbuffer_format_heuristic fb_fmt={} luta_control={:08X} "
+                  "identity={} upload={} dispatch=1",
+                  record_id, use_pwl_gamma_ramp ? "pwl" : "table", uint32_t(frontbuffer_format),
+                  luta_control, uint32_t(gamma_ramp_identity), uint32_t(gamma_ramp_uploaded));
+            } else {
+              ++render_audit_gamma_overflow_;
+            }
+          }
+        }
 
         // Apply FXAA.
         if (use_fxaa) {
@@ -2282,7 +2382,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXGPU_INFO("D3D12 IssueSwap: first active guest output refresh succeeded source={}x{}",
                   guest_output_width, guest_output_height);
     }
+    if (render_audit_checkpoint_requested_.exchange(false, std::memory_order_acq_rel)) {
+      pipeline_cache_->EmitRenderAuditSummary("checkpoint");
+      EmitRenderAuditSummary("checkpoint");
+      render_target_cache_->EmitRenderAuditSummaries("checkpoint");
+    }
   } else {
+    if (render_audit_enabled_) {
+      ++render_audit_refresh_fail_;
+    }
     REXGPU_ERROR("IssueSwap: RefreshGuestOutput failed for active {}x{} guest output",
                  guest_output_width, guest_output_height);
   }
@@ -2436,6 +2544,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+    if (render_audit_enabled_) {
+      PipelineCache::PipelineAuditStatus pipeline_status =
+          pipeline_cache_->GetPipelineAuditStatus(pipeline_handle);
+      if (pipeline_status == PipelineCache::PipelineAuditStatus::kFailed) {
+        ++render_audit_pso_failed_skip_;
+      } else {
+        ++render_audit_pso_pending_skip_;
+      }
+    }
     return true;
   }
 
@@ -2727,6 +2844,94 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    }
+  }
+
+  if (render_audit_enabled_) {
+    ++render_audit_draw_issued_;
+    bool draw_indexed = primitive_processing_result.index_buffer_type !=
+                        PrimitiveProcessor::ProcessedIndexBufferType::kNone;
+    if (draw_indexed) {
+      ++render_audit_draw_indexed_;
+    } else {
+      ++render_audit_draw_nonindexed_;
+    }
+    if (normalized_depth_control.z_enable) {
+      ++render_audit_depth_test_;
+    }
+    if (normalized_depth_control.z_write_enable) {
+      ++render_audit_depth_write_;
+    }
+    if (normalized_depth_control.stencil_enable) {
+      ++render_audit_stencil_;
+    }
+    bool depth_bound =
+        host_render_targets_used && (bound_depth_and_color_render_target_bits & UINT32_C(1)) != 0;
+    if (depth_bound) {
+      ++render_audit_depth_bound_;
+    } else if (host_render_targets_used &&
+               (normalized_depth_control.z_enable || normalized_depth_control.z_write_enable ||
+                normalized_depth_control.stencil_enable)) {
+      ++render_audit_depth_without_bound_;
+    }
+    uint32_t msaa_index = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+    if (msaa_index < rex::countof(render_audit_msaa_)) {
+      ++render_audit_msaa_[msaa_index];
+    }
+    uint32_t guest_msaa = UINT32_C(1) << msaa_index;
+    auto record_render_target_bind = [this, msaa_index, guest_msaa, normalized_depth_control](
+                                         uint32_t slot_id, const char* slot_name,
+                                         uint32_t guest_format, int32_t storage_format,
+                                         bool host_bound) {
+      uint64_t key = uint64_t(slot_id & 0x7);
+      key |= uint64_t(guest_format & 0xF) << 3;
+      key |= uint64_t(uint32_t(storage_format + 1) & 0x1F) << 7;
+      key |= uint64_t(msaa_index & 0x3) << 12;
+      key |= uint64_t(normalized_depth_control.z_enable != 0) << 14;
+      key |= uint64_t(normalized_depth_control.z_write_enable != 0) << 15;
+      key |= uint64_t(normalized_depth_control.stencil_enable != 0) << 16;
+      key |= uint64_t(host_bound) << 17;
+      for (uint32_t i = 0; i < render_audit_bind_record_count_; ++i) {
+        if (render_audit_bind_keys_[i] == key) {
+          return;
+        }
+      }
+      if (render_audit_bind_record_count_ >= kRenderAuditBindRecordLimit) {
+        ++render_audit_bind_overflow_;
+        return;
+      }
+      REXGPU_INFO(
+          "XENOS_AUDIT_BIND v=1 id={} slot={} guest_fmt={} storage_fmt={} guest_msaa={} "
+          "depth_test={} depth_write={} stencil={} host_bound={}",
+          render_audit_bind_record_count_, slot_name, guest_format, storage_format, guest_msaa,
+          uint32_t(normalized_depth_control.z_enable != 0),
+          uint32_t(normalized_depth_control.z_write_enable != 0),
+          uint32_t(normalized_depth_control.stencil_enable != 0), uint32_t(host_bound));
+      render_audit_bind_keys_[render_audit_bind_record_count_++] = key;
+    };
+    bool depth_used = normalized_depth_control.z_enable ||
+                      normalized_depth_control.z_write_enable ||
+                      normalized_depth_control.stencil_enable;
+    if (depth_used) {
+      int32_t storage_format =
+          depth_bound ? int32_t(bound_depth_and_color_render_target_formats[0]) : -1;
+      record_render_target_bind(0, "depth", uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format),
+                                storage_format, depth_bound);
+    }
+    static const char* const color_slot_names[xenos::kMaxColorRenderTargets] = {"color0", "color1",
+                                                                                "color2", "color3"};
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      if (((normalized_color_mask >> (i * 4)) & 0xF) == 0) {
+        continue;
+      }
+      bool color_bound = host_render_targets_used &&
+                         (bound_depth_and_color_render_target_bits & (UINT32_C(1) << (1 + i))) != 0;
+      int32_t storage_format =
+          color_bound ? int32_t(bound_depth_and_color_render_target_formats[1 + i]) : -1;
+      uint32_t guest_format = uint32_t(
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_format);
+      record_render_target_bind(1 + i, color_slot_names[i], guest_format, storage_format,
+                                color_bound);
     }
   }
 
