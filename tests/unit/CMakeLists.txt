@@ -2,6 +2,7 @@
 
 add_executable(unit_tests
     memory/heap_allocation_test.cpp
+    input/sdl_slot_mapping_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
     kernel/xam_user_profile_test.cpp

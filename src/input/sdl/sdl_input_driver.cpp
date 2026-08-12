@@ -16,7 +16,9 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
+#include <rex/input/sdl/input_slot_audit.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/sdl/slot_mapping.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
@@ -450,36 +452,27 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
       static_cast<int>(SDL_GetJoystickType(SDL_GetGamepadJoystick(controller))),
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
       SDL_GetGamepadProduct(controller));
-  int user_id = -1;
-  // Check if the controller has a player index LED.
-  user_id = SDL_GetGamepadPlayerIndex(controller);
-  // Is that id already taken?
-  if (user_id < 0 || user_id >= static_cast<int>(controllers_.size()) ||
-      controllers_.at(user_id).sdl) {
-    user_id = -1;
+  uint32_t occupied_slot_mask = 0;
+  for (uint32_t slot = 0; slot < controllers_.size(); ++slot) {
+    if (controllers_.at(slot).sdl)
+      occupied_slot_mask |= uint32_t(1) << slot;
   }
-  // No player index or already taken, just take the first free slot.
-  if (user_id < 0) {
-    for (size_t i = 0; i < controllers_.size(); i++) {
-      if (!controllers_.at(i).sdl) {
-        user_id = static_cast<int>(i);
-#if SDL_VERSION_ATLEAST(2, 0, 12)
-        SDL_SetGamepadPlayerIndex(controller, user_id);
-#endif
-        break;
-      }
-    }
-  }
+  const auto selected_slot =
+      ChooseControllerSlot(SDL_GetGamepadPlayerIndex(controller), occupied_slot_mask);
+  const int user_id = selected_slot ? static_cast<int>(*selected_slot) : -1;
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {controller, {}};
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
+    SDL_SetGamepadPlayerIndex(controller, user_id);
+    internal::RecordInputSlotDeviceAssigned(static_cast<uint32_t>(user_id));
 
     REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
   } else {
     // No more controllers needed, close it.
+    internal::RecordInputSlotDeviceRejected();
     SDL_CloseGamepad(controller);
     REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored. No free slots.");
   }
@@ -489,6 +482,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
   auto idx = GetControllerIndexFromInstanceID(event.cdevice.which);
   if (idx) {
+    internal::RecordInputSlotDeviceRemoved(static_cast<uint32_t>(*idx));
     SDL_CloseGamepad(controllers_.at(*idx).sdl);
     controllers_.at(*idx) = {};
     keystroke_states_.at(*idx) = {};
@@ -577,6 +571,7 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     return;
   }
   auto xbutton = xbutton_lookup.at(event.gbutton.button);
+  const bool was_pressed = (xbuttons & xbutton) != 0;
   // Pressed or released?
   if (event.gbutton.down) {
     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
@@ -588,6 +583,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   }
   controller.state.gamepad.buttons = xbuttons;
   controller.state_changed = true;
+  const bool is_pressed = (xbuttons & xbutton) != 0;
+  if (IsInputSlotAuditChallengeButton(event.gbutton.button) && was_pressed != is_pressed) {
+    internal::RecordInputSlotSdlAEdge(static_cast<uint32_t>(*idx), is_pressed);
+  }
 }
 
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {

@@ -10,6 +10,7 @@
  */
 
 #include <rex/input/input.h>
+#include <rex/input/sdl/input_slot_audit.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -112,7 +113,10 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  const uint32_t result = is->GetState(actual_user_index, input_state);
+  rex::input::sdl::internal::RecordInputSlotGuestState(
+      user_index, actual_user_index, result, input_state ? input_state.host_address() : nullptr);
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx

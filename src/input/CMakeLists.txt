@@ -5,6 +5,7 @@ add_library(rexinput OBJECT
     input_system.cpp
     mnk/mnk_input_driver.cpp
     nop/nop_input_driver.cpp
+    sdl/input_slot_audit.cpp
 )
 add_library(rex::input ALIAS rexinput)
 
