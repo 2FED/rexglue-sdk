@@ -23,6 +23,7 @@
 #include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/env.h>
@@ -217,17 +218,18 @@ void InitLogging(const LogConfig& config) {
   }
 
   // File sink (rotating) with sequential naming fallback
-  std::string resolved_path;
+  std::filesystem::path resolved_path;
   if (config.log_file) {
-    resolved_path = config.log_file;
+    resolved_path = rex::to_path(config.log_file);
   } else if (!config.app_name.empty()) {
     auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+                                          : rex::to_path(config.log_dir);
+    resolved_path = NextSequentialLogPath(log_dir, config.app_name);
   }
   if (!resolved_path.empty()) {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+        resolved_path.native(),
+        static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);

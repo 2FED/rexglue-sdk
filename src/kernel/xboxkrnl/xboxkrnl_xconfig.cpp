@@ -14,6 +14,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
+#include <rex/kernel/xam/locale_audit.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -61,7 +62,8 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
           break;
         case 0x0009:  // XCONFIG_USER_LANGUAGE
           setting_size = 4;
-          memory::store_and_swap<uint32_t>(value, REXCVAR_GET(user_language));
+          memory::store_and_swap<uint32_t>(
+              value, rex::kernel::xam::NormalizeUserLanguage(REXCVAR_GET(user_language)));
           break;
         case 0x000A:  // XCONFIG_USER_VIDEO_FLAGS
           setting_size = 4;
@@ -117,6 +119,16 @@ u32 ExGetXConfigSetting_entry(u16 category, u16 setting, mapped_void buffer_ptr,
   uint16_t required_size = 0;
   X_STATUS result =
       xeExGetXConfigSetting(category, setting, buffer_ptr, buffer_size, &required_size);
+
+  uint32_t returned_value = 0;
+  const bool value_present =
+      result == X_STATUS_SUCCESS && buffer_ptr &&
+      ((setting == 9 && buffer_size >= 4) || (setting == 14 && buffer_size >= 1));
+  if (value_present) {
+    returned_value = setting == 9 ? memory::load_and_swap<uint32_t>(buffer_ptr.as<uint32_t*>())
+                                  : *buffer_ptr.as<uint8_t*>();
+  }
+  rex::kernel::xam::RecordLocaleXConfig(category, setting, result, value_present, returned_value);
 
   if (required_size_ptr) {
     *required_size_ptr = required_size;

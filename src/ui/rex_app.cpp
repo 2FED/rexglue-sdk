@@ -107,14 +107,14 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path game_dir;
   std::string game_data_cvar = REXCVAR_GET(game_data_root);
   if (!game_data_cvar.empty()) {
-    game_dir = game_data_cvar;
+    game_dir = rex::to_path(game_data_cvar);
   }
 
   // User data: cvar override, or platform user directory
   std::filesystem::path user_dir;
   std::string user_data_cvar = REXCVAR_GET(user_data_root);
   if (!user_data_cvar.empty()) {
-    user_dir = user_data_cvar;
+    user_dir = rex::to_path(user_data_cvar);
   } else {
     user_dir = rex::filesystem::GetUserFolder() / GetName();
   }
@@ -123,14 +123,14 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path update_dir;
   std::string update_data_cvar = REXCVAR_GET(update_data_root);
   if (!update_data_cvar.empty()) {
-    update_dir = update_data_cvar;
+    update_dir = rex::to_path(update_data_cvar);
   }
 
   // Cache: cvar override, or user_dir/cache
   std::filesystem::path cache_dir;
   std::string cache_root_cvar = REXCVAR_GET(cache_root);
   if (!cache_root_cvar.empty()) {
-    cache_dir = cache_root_cvar;
+    cache_dir = rex::to_path(cache_root_cvar);
   } else {
     cache_dir = user_dir / "cache";
   }
@@ -138,7 +138,7 @@ bool ReXApp::SetupEnvironment() {
   std::filesystem::path metadata_dir;
   std::string metadata_root_cvar = REXCVAR_GET(metadata_root);
   if (!metadata_root_cvar.empty()) {
-    metadata_dir = metadata_root_cvar;
+    metadata_dir = rex::to_path(metadata_root_cvar);
   }
 
   PathConfig path_config{game_dir,  user_dir,     update_dir,

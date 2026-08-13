@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -54,6 +55,23 @@ TEST_CASE("filesystem paths round-trip non-ASCII text through UTF-8", "[filesyst
   const auto path = rex::to_path(kUtf16);
   CHECK(rex::path_to_utf8(path) == kUtf8);
   CHECK(rex::to_path(rex::path_to_utf8(path)) == path);
+}
+
+TEST_CASE("filesystem opens a non-ASCII UTF-8 path without mojibake", "[filesystem]") {
+  ScopedTestDirectory fixture;
+  constexpr std::string_view kUtf8Name =
+      "\xD0\xB6\xD1\x83\xD1\x80\xD0\xBD\xD0\xB0\xD0\xBB-\xC3\xA9.log";
+  const auto expected_path = fixture.path() / rex::to_path(kUtf8Name);
+
+  FILE* file = rex::filesystem::OpenFile(expected_path, "wb");
+  REQUIRE(file != nullptr);
+  CHECK(std::fputs("locale-path", file) >= 0);
+  CHECK(std::fclose(file) == 0);
+
+  CHECK(std::filesystem::is_regular_file(expected_path));
+  CHECK(rex::path_to_utf8(expected_path.filename()) == kUtf8Name);
+  CHECK(std::filesystem::directory_iterator(fixture.path())->path().filename() ==
+        expected_path.filename());
 }
 
 TEST_CASE("read-only host VFS rejects traversal and every mutation path", "[filesystem][vfs]") {
