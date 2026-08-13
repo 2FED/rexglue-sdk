@@ -11,12 +11,14 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/app_manager.h>
+#include <rex/kernel/xam/xmp_audit.h>
 #include <rex/thread/mutex.h>
 
 namespace rex {
@@ -95,6 +97,8 @@ class XmpApp : public system::xam::App {
   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
 
   void OnStateChanged();
+  XmpFallbackState GetFallbackState() const;
+  X_HRESULT DispatchMessageSyncImpl(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length);
 
   State state_;
   PlaybackClient playback_client_;
@@ -109,6 +113,7 @@ class XmpApp : public system::xam::App {
   std::unordered_map<uint32_t, Playlist*> playlists_;
   uint32_t next_playlist_handle_;
   uint32_t next_song_handle_;
+  std::mutex dispatch_mutex_;
 };
 
 }  // namespace apps

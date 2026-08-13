@@ -129,19 +129,15 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
     playlist = it->second;
   }
 
-  if (playback_client_ == PlaybackClient::kSystem) {
-    REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled!");
-    return X_E_SUCCESS;
-  }
-
-  // Start playlist?
-  REXKRNL_WARN("Playlist playback not supported");
-  active_playlist_ = playlist;
+  // ReXGlue has no XMP decoder. Keep the externally visible state honest
+  // instead of reporting Playing without producing audio.
+  REXKRNL_WARN("Title playlist playback is unsupported; remaining idle");
+  (void)playlist;
+  (void)song_handle;
+  active_playlist_ = nullptr;
   active_song_index_ = 0;
-  state_ = State::kPlaying;
-  OnStateChanged();
-  kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
-  return X_E_SUCCESS;
+  state_ = State::kIdle;
+  return X_E_FAIL;
 }
 
 X_HRESULT XmpApp::XMPContinue() {
@@ -174,7 +170,7 @@ X_HRESULT XmpApp::XMPPause() {
 
 X_HRESULT XmpApp::XMPNext() {
   REXKRNL_DEBUG("XMPNext()");
-  if (!active_playlist_) {
+  if (!active_playlist_ || active_playlist_->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
@@ -185,7 +181,7 @@ X_HRESULT XmpApp::XMPNext() {
 
 X_HRESULT XmpApp::XMPPrevious() {
   REXKRNL_DEBUG("XMPPrevious()");
-  if (!active_playlist_) {
+  if (!active_playlist_ || active_playlist_->songs.empty()) {
     return X_E_NOTFOUND;
   }
   state_ = State::kPlaying;
@@ -202,8 +198,24 @@ void XmpApp::OnStateChanged() {
   kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
 }
 
+XmpFallbackState XmpApp::GetFallbackState() const {
+  return {static_cast<uint32_t>(state_), static_cast<uint32_t>(playback_client_),
+          static_cast<uint32_t>(playlists_.size()),
+          active_playlist_ ? static_cast<uint32_t>(active_playlist_->songs.size()) : 0, false};
+}
+
 X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                       uint32_t buffer_length) {
+  std::lock_guard dispatch_lock(dispatch_mutex_);
+  const bool audited = BeginXmpRouteMessage();
+  const XmpFallbackState before = GetFallbackState();
+  const X_HRESULT result = DispatchMessageSyncImpl(message, buffer_ptr, buffer_length);
+  EndXmpRouteMessage(audited, message, result, before, GetFallbackState());
+  return result;
+}
+
+X_HRESULT XmpApp::DispatchMessageSyncImpl(uint32_t message, uint32_t buffer_ptr,
+                                          uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
@@ -415,6 +427,12 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       return X_E_SUCCESS;
     }
+    case 0x00070025: {
+      // The title queries the current playlist item through this message.
+      // With the metadata-only fallback there is deliberately no active item.
+      REXKRNL_DEBUG("XMPGetCurrentItem: no active title playlist");
+      return X_E_NOTFOUND;
+    }
     case 0x00070029: {
       // XMPGetPlaybackBehavior
       assert_true(!buffer_length || buffer_length == 16);
@@ -460,10 +478,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                        4 + uint32_t(args->song_count) * 128);
       return X_E_SUCCESS;
     }
+    case 0x0007003B: {
+      // MCLA exposes a metadata/query wrapper for this message. ReXGlue has
+      // no system music library, so return an explicit empty result.
+      REXKRNL_DEBUG("XMP system-library query is unsupported");
+      return X_E_NOTFOUND;
+    }
     case 0x0007003D: {
       // XMPCaptureOutput - not sure how this works :/
       REXKRNL_DEBUG("XMPCaptureOutput(...)");
-      assert_always("XMP output not unimplemented");
+      REXKRNL_WARN("XMP output capture is unsupported");
       return X_E_FAIL;
     }
   }

@@ -22,6 +22,7 @@ set(REXKERNEL_SOURCES
     xam/xam_user.cpp
     xam/xam_video.cpp
     xam/xam_voice.cpp
+    xam/xmp_audit.cpp
     xam/xam_misc.cpp
     xam/apps/xam_app.cpp
     xam/apps/xgi_app.cpp
