@@ -128,3 +128,33 @@ TEST_CASE("read-only host VFS rejects traversal and every mutation path", "[file
   read_mapping->Close();
   CHECK(game_entry->OpenMapped(rex::memory::MappedMemory::Mode::kReadWrite) == nullptr);
 }
+
+TEST_CASE("VFS opens content symlink roots with trailing separators", "[filesystem][vfs]") {
+  ScopedTestDirectory fixture;
+  const auto save_path = fixture.path() / "mc4.sav";
+  {
+    std::ofstream save(save_path, std::ios::binary);
+    REQUIRE(save.good());
+    save << "SAVE";
+  }
+
+  rex::filesystem::VirtualFileSystem vfs;
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>("\\Device\\Content\\1\\",
+                                                                  fixture.path(), false);
+  REQUIRE(device->Initialize());
+  REQUIRE(vfs.RegisterDevice(std::move(device)));
+  REQUIRE(vfs.RegisterSymbolicLink("save0:", "\\Device\\Content\\1\\"));
+
+  auto* root = vfs.ResolvePath("save0:\\");
+  REQUIRE(root != nullptr);
+  CHECK(root->name().empty());
+  CHECK(vfs.ResolvePath("save0:\\mc4.sav") != nullptr);
+
+  rex::filesystem::File* file = nullptr;
+  rex::filesystem::FileAction action{};
+  CHECK(vfs.OpenFile(nullptr, "save0:\\mc4.sav", rex::filesystem::FileDisposition::kOpen,
+                     rex::filesystem::FileAccess::kGenericRead, false, true, &file,
+                     &action) == X_STATUS_SUCCESS);
+  REQUIRE(file != nullptr);
+  file->Destroy();
+}

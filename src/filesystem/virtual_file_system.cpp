@@ -160,8 +160,12 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  normalized_path = rex::string::utf8_canonicalize_guest_path(normalized_path);
-  relative_path = normalized_path.substr(device->mount_path().size());
+  // Canonicalize only the path inside the device. Canonicalizing the complete
+  // path removes a trailing separator from a device root such as
+  // "\\Device\\Content\\1\\". Subtracting the original mount-path length from
+  // that shortened string then throws for valid root opens such as
+  // "save0:\\".
+  relative_path = rex::string::utf8_canonicalize_guest_path(relative_path);
   auto* entry = device->ResolvePath(relative_path);
 
   if (entry) {
