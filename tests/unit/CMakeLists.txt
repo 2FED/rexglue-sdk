@@ -7,6 +7,7 @@ add_executable(unit_tests
     input/sdl_controller_matrix_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
+    kernel/offline_service_route_test.cpp
     kernel/rtl_critical_section_test.cpp
     kernel/xam_user_profile_test.cpp
     kernel/xmp_fallback_test.cpp

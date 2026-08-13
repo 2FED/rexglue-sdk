@@ -10,6 +10,7 @@
  */
 
 #include <rex/kernel/xam/apps/xlivebase_app.h>
+#include <rex/kernel/xam/offline_service_audit.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
 
@@ -27,6 +28,14 @@ XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state) : App(kernel_state, 0xFC) 
 
 X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
                                             uint32_t buffer_length) {
+  const bool audited = BeginOfflineServiceMessage();
+  const X_HRESULT result = DispatchMessageSyncImpl(message, buffer_ptr, buffer_length);
+  EndOfflineServiceMessage(audited, message, result);
+  return result;
+}
+
+X_HRESULT XLiveBaseApp::DispatchMessageSyncImpl(uint32_t message, uint32_t buffer_ptr,
+                                                uint32_t buffer_length) {
   // NOTE: buffer_length may be zero or valid.
   auto buffer = memory_->TranslateVirtual(buffer_ptr);
   switch (message) {
@@ -34,13 +43,13 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // Called on startup, seems to just return a bool in the buffer.
       assert_true(!buffer_length || buffer_length == 4);
       REXKRNL_DEBUG("XLiveBaseGetLogonId({:08X})", buffer_ptr);
-      memory::store_and_swap<uint32_t>(buffer + 0, 1);  // ?
+      memory::store_and_swap<uint32_t>(buffer + 0, 0);  // No online logon.
       return X_E_SUCCESS;
     }
     case 0x00058006: {
       assert_true(!buffer_length || buffer_length == 4);
       REXKRNL_DEBUG("XLiveBaseGetNatType({:08X})", buffer_ptr);
-      memory::store_and_swap<uint32_t>(buffer + 0, 1);  // XONLINE_NAT_OPEN
+      memory::store_and_swap<uint32_t>(buffer + 0, 0);  // No online NAT classification.
       return X_E_SUCCESS;
     }
     case 0x00058007: {
@@ -55,14 +64,14 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // We should create a XamEnumerate-able empty list here, but I'm not
       // sure of the format.
       // buffer_length seems to be the same ptr sent to 0x00058004.
-      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) unimplemented", buffer_ptr,
+      REXKRNL_DEBUG("CXLiveFriends::Enumerate({:08X}, {:08X}) unavailable offline", buffer_ptr,
                     buffer_length);
       return X_E_FAIL;
     }
     case 0x00058023: {
       REXKRNL_DEBUG(
           "CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X}) "
-          "unimplemented",
+          "unavailable offline",
           buffer_ptr, buffer_length);
       return X_E_FAIL;
     }
@@ -70,12 +79,20 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       // Required to be successful for 4D530910 to detect signed-in profile
       // Doesn't seem to set anything in the given buffer, probably only takes
       // input
-      REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) unimplemented", buffer_ptr, buffer_length);
+      REXKRNL_DEBUG("XLiveBaseUnk58046({:08X}, {:08X}) accepted as offline no-op", buffer_ptr,
+                    buffer_length);
       return X_E_SUCCESS;
     }
     case 0x00058037: {
-      REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
+      REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X}) accepted as offline no-op", buffer_ptr,
+                    buffer_length);
       return X_E_SUCCESS;
+    }
+    case 0x00058009:
+    case 0x0005800E:
+    case 0x00058035: {
+      REXKRNL_DEBUG("XLiveBase offline service message {:08X} unavailable", message);
+      return X_E_FAIL;
     }
   }
   REXKRNL_ERROR(

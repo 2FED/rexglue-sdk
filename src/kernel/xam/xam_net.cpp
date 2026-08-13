@@ -24,6 +24,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/kernel/xam/offline_service_audit.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xsocket.h>
@@ -623,6 +624,12 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
 }
 
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+  const bool blocked = ShouldBlockOfflineGuestSocket();
+  RecordOfflineGuestSocketAttempt(blocked);
+  if (blocked) {
+    XThread::SetLastError(0x2743);  // WSAENETUNREACH
+    return static_cast<u32>(-1);
+  }
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
