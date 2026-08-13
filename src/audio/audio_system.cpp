@@ -11,6 +11,7 @@
 
 #include <rex/assert.h>
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/audio_route_audit.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/xma/decoder.h>
@@ -232,6 +233,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   AudioDriver* driver;
   auto result = CreateDriver(index, client_semaphore, &driver);
   if (XFAILED(result)) {
+    RecordAudioRouteClient(false, static_cast<uint32_t>(index));
     return result;
   }
   assert_not_null(driver);
@@ -240,6 +242,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+  RecordAudioRouteClient(true, static_cast<uint32_t>(index));
 
   if (out_index) {
     *out_index = index;

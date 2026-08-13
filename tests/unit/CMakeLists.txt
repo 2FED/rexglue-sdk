@@ -1,6 +1,7 @@
 # Unit Tests for ReXGlue core components
 
 add_executable(unit_tests
+    audio/audio_route_audit_test.cpp
     memory/heap_allocation_test.cpp
     input/sdl_slot_mapping_test.cpp
     input/sdl_controller_matrix_test.cpp

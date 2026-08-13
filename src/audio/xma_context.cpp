@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include <rex/audio/xma/context.h>
+#include <rex/audio/audio_route_audit.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
 #include <rex/dbg.h>
@@ -656,6 +657,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   if (DecodePacket(av_context_, av_packet_, av_frame_)) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                  raw_frame_.data());
+    RecordAudioRouteXmaFrame(raw_frame_.data(), raw_frame_.size());
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
 
     // Loop end: limit output to subframes 0..loop_subframe_end.

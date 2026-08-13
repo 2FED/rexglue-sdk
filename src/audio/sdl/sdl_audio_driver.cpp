@@ -15,6 +15,7 @@
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
+#include <rex/audio/audio_route_audit.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
@@ -103,6 +104,7 @@ bool SDLAudioDriver::Initialize() {
 
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+  RecordAudioRouteSubmittedFrame(input_frame, frame_samples_);
   float* output_frame;
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
@@ -126,6 +128,7 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
     frames_queued_.push(output_frame);
+    RecordAudioRouteQueueDepth(frames_queued_.size());
     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
   }
 }
@@ -170,6 +173,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
     if (driver->frames_queued_.empty()) {
+      RecordAudioRouteStarvation();
       if (sdl_callback_count < 10) {
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;
@@ -198,7 +202,9 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             break;
         }
       }
-      if (!SDL_PutAudioStreamData(stream, data, len)) {
+      const bool submitted = SDL_PutAudioStreamData(stream, data, len);
+      RecordAudioRouteDeviceFrame(data, sample_count, driver->sdl_device_channels_, submitted);
+      if (!submitted) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
         driver->frames_unused_.push(buffer);
         break;
