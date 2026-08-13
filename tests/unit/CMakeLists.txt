@@ -3,8 +3,10 @@
 add_executable(unit_tests
     memory/heap_allocation_test.cpp
     input/sdl_slot_mapping_test.cpp
+    input/sdl_controller_matrix_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
+    kernel/rtl_critical_section_test.cpp
     kernel/xam_user_profile_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp

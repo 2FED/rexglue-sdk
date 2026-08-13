@@ -280,6 +280,12 @@ endif()
 
 add_subdirectory(sdl3)
 
+# Clang exposes the deprecated compatibility declaration on Windows, but the
+# UCRT import library provides only the underscore-prefixed `_itoa` symbol.
+if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_definitions(SDL3-static PRIVATE itoa=_itoa)
+endif()
+
 #=============================================================================
 # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
 #=============================================================================
@@ -369,6 +375,14 @@ if(REXGLUE_ENABLE_TRACY)
             TRACY_MANUAL_LIFETIME
             TRACY_FIBERS
     )
+
+    # The Windows UCRT exports the underscore-prefixed `_fileno` symbol, while
+    # Tracy uses the deprecated POSIX compatibility spelling. Clang accepts
+    # the declaration but emits a reference to the non-existent `fileno`
+    # import, so normalize the spelling at compile time for Windows builds.
+    if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_compile_definitions(TracyClient PRIVATE fileno=_fileno)
+    endif()
 
     target_compile_options(TracyClient PRIVATE -w)
 
@@ -542,6 +556,10 @@ target_include_directories(libavutil
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
 if(WIN32)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        # Match the actual UCRT export when FFmpeg uses the POSIX spelling.
+        target_compile_definitions(libavutil PRIVATE isatty=_isatty)
+    endif()
     target_link_libraries(libavutil PRIVATE bcrypt)
 endif()
 

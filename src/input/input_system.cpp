@@ -129,17 +129,13 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
 
-  bool any_connected = false;
   for (auto& driver : drivers_) {
     X_RESULT result = driver->SetState(user_index, vibration);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
-      any_connected = true;
-    }
-    if (result == X_ERROR_SUCCESS) {
       return result;
     }
   }
-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  return X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
@@ -186,9 +182,11 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     }
   }
 
-  // NOP driver (primary in tool mode, fallback otherwise)
-  uint8_t nop_index = tool_mode ? 0 : 1;
-  input->AddDriver(std::make_unique<nop::NopInputDriver>(nullptr, nop_index));
+  // Tool processes require a deterministic controller without a UI. Runtime
+  // processes must preserve physical disconnect and rumble failure semantics.
+  if (ShouldInstallNopInputDriver(tool_mode)) {
+    input->AddDriver(std::make_unique<nop::NopInputDriver>(nullptr, 0));
+  }
   return input;
 }
 

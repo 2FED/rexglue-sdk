@@ -16,6 +16,8 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
+#include <rex/input/sdl/controller_matrix.h>
+#include <rex/input/sdl/controller_matrix_audit.h>
 #include <rex/input/sdl/input_slot_audit.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/sdl/slot_mapping.h>
@@ -108,6 +110,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           }
         }
       }
+
       REXLOG_INFO("SDL input driver initialized successfully");
     });
   }
@@ -138,9 +141,27 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
   }
 }
 
-void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {}
+void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+  has_focus_ = false;
+  {
+    std::lock_guard lock(controllers_mutex_);
+    for (auto& controller : controllers_) {
+      if (controller.sdl) {
+        SDL_RumbleGamepad(controller.sdl, 0, 0, 0);
+      }
+    }
+    for (auto& state : keystroke_states_) {
+      state.repeat_state = RepeatState::Idle;
+      state.repeat_time = 0;
+    }
+  }
+  internal::RecordControllerMatrixFocus(false);
+}
 
-void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {}
+void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
+  has_focus_ = true;
+  internal::RecordControllerMatrixFocus(true);
+}
 
 X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
                                          X_INPUT_CAPABILITIES* out_caps) {
@@ -173,7 +194,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  auto is_active = this->is_active();
+  auto is_active = IsControllerInputActive(this->is_active(), has_focus_.load());
 
   if (is_active) {
     QueueControllerUpdate();
@@ -219,12 +240,23 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
   }
 
 #if SDL_VERSION_ATLEAST(2, 0, 9)
-  if (SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed, vibration->right_motor_speed,
-                        0)) {
+  const bool stopping = static_cast<uint16_t>(vibration->left_motor_speed) == 0 &&
+                        static_cast<uint16_t>(vibration->right_motor_speed) == 0;
+  const uint8_t motor_mask = (static_cast<uint16_t>(vibration->left_motor_speed) ? 1 : 0) |
+                             (static_cast<uint16_t>(vibration->right_motor_speed) ? 2 : 0);
+  if (internal::ShouldSuppressControllerMatrixResumeRumble(stopping)) {
+    internal::RecordControllerMatrixResumeRumbleSuppressed(user_index, motor_mask);
     return X_ERROR_FUNCTION_FAILED;
-  } else {
+  }
+  if (!ShouldSubmitRumble(has_focus_.load(), stopping)) {
     return X_ERROR_SUCCESS;
   }
+  const bool supported = SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller->sdl),
+                                                SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+  const X_RESULT result = SdlBoolToXResult(SDL_RumbleGamepad(
+      controller->sdl, vibration->left_motor_speed, vibration->right_motor_speed, 0));
+  internal::RecordControllerMatrixRumble(user_index, motor_mask, supported, result);
+  return result;
 #else
   return X_ERROR_SUCCESS;
 #endif
@@ -287,7 +319,7 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
       rex::ui::VirtualKey::kXInputPadRThumbDownLeft,
   };
 
-  auto is_active = this->is_active();
+  auto is_active = IsControllerInputActive(this->is_active(), has_focus_.load());
 
   if (is_active) {
     QueueControllerUpdate();
@@ -437,7 +469,7 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   // Open the controller.
-  const auto controller = SDL_OpenGamepad(event.cdevice.which);
+  const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
     assert_always();
     return;
@@ -468,11 +500,13 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     UpdateXCapabilities(state);
     SDL_SetGamepadPlayerIndex(controller, user_id);
     internal::RecordInputSlotDeviceAssigned(static_cast<uint32_t>(user_id));
+    internal::RecordControllerMatrixDeviceAssigned(static_cast<uint32_t>(user_id));
 
     REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
   } else {
     // No more controllers needed, close it.
     internal::RecordInputSlotDeviceRejected();
+    internal::RecordControllerMatrixDeviceRejected();
     SDL_CloseGamepad(controller);
     REXLOG_WARN("SDL OnControllerDeviceAdded: Ignored. No free slots.");
   }
@@ -480,9 +514,10 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
-  auto idx = GetControllerIndexFromInstanceID(event.cdevice.which);
+  auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
   if (idx) {
     internal::RecordInputSlotDeviceRemoved(static_cast<uint32_t>(*idx));
+    internal::RecordControllerMatrixDeviceRemoved(static_cast<uint32_t>(*idx));
     SDL_CloseGamepad(controllers_.at(*idx).sdl);
     controllers_.at(*idx) = {};
     keystroke_states_.at(*idx) = {};
@@ -495,7 +530,13 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.gaxis.which);
-  assert(idx);
+  if (!idx) {
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true))
+      REXLOG_WARN("SDL HID: Ignored stale axis event for an unavailable controller.");
+    internal::RecordControllerMatrixStaleEvent(true);
+    return;
+  }
   auto& pad = controllers_.at(*idx).state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
@@ -521,6 +562,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       break;
   }
   controllers_.at(*idx).state_changed = true;
+  internal::RecordControllerMatrixSdlAnalog(
+      static_cast<uint32_t>(*idx),
+      ClassifyControllerMatrixAnalog(controllers_.at(*idx).state.gamepad));
 }
 
 void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
@@ -559,8 +603,14 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   static_assert(SDL_GAMEPAD_BUTTON_SOUTH == 0);
   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);
 
-  auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
-  assert(idx);
+  auto idx = GetControllerIndexFromInstanceID(event.gbutton.which);
+  if (!idx) {
+    static std::atomic<bool> logged = false;
+    if (!logged.exchange(true))
+      REXLOG_WARN("SDL HID: Ignored stale button event for an unavailable controller.");
+    internal::RecordControllerMatrixStaleEvent(false);
+    return;
+  }
   auto& controller = controllers_.at(*idx);
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
@@ -586,6 +636,11 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   const bool is_pressed = (xbuttons & xbutton) != 0;
   if (IsInputSlotAuditChallengeButton(event.gbutton.button) && was_pressed != is_pressed) {
     internal::RecordInputSlotSdlAEdge(static_cast<uint32_t>(*idx), is_pressed);
+  }
+  const uint16_t standard_button = StandardSdlButtonToXInput(event.gbutton.button);
+  if (standard_button && was_pressed != is_pressed) {
+    internal::RecordControllerMatrixSdlButton(static_cast<uint32_t>(*idx), standard_button,
+                                              is_pressed);
   }
 }
 
@@ -639,6 +694,11 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
       SDL_JOYSTICK_CONNECTION_WIRELESS) {
     cap_flags |= X_INPUT_CAPS_WIRELESS;
   }
+
+  // Don't advertise the Xbox 360 force-feedback interface until the
+  // XInputdFF* exports are implemented. SDL rumble may still be used by the
+  // host-side diagnostic path, but exposing this flag makes titles enter an
+  // unsupported guest force-feedback path.
 
   // Check if all navigational buttons are present
   static constexpr std::array<SDL_GamepadButton, 6> nav_buttons = {

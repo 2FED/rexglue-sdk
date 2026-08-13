@@ -48,8 +48,12 @@ class InputSystem : public system::IInputSystem {
   std::vector<std::unique_ptr<InputDriver>> drivers_;
 };
 
-/// Create a default InputSystem with SDL + NOP drivers.
-/// In tool mode, only the NOP driver is added.
+constexpr bool ShouldInstallNopInputDriver(bool tool_mode) {
+  return tool_mode;
+}
+
+/// Create a default InputSystem. Tool mode uses only the deterministic NOP
+/// driver; runtime preserves real backend disconnect and failure results.
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode);
 
 }  // namespace rex::input

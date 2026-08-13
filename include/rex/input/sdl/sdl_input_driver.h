@@ -92,6 +92,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  std::atomic<bool> has_focus_{true};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;

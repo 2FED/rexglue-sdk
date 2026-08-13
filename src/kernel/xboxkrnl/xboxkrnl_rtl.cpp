@@ -31,6 +31,11 @@
 #include <rex/thread.h>
 #include <rex/thread/atomic.h>
 
+REXCVAR_DEFINE_BOOL(rtl_allow_cross_thread_critical_section_leave, false, "Kernel",
+                    "Allow release-compatible cross-thread critical-section leaves")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly)
+    .debug_only();
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
@@ -427,7 +432,22 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
-  assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+  const uint32_t current_thread = XThread::GetCurrentThread()->guest_object();
+  const bool allow_cross_thread_leave = REXCVAR_GET(rtl_allow_cross_thread_critical_section_leave);
+  if (!IsCriticalSectionLeaveAllowed(cs->owning_thread, current_thread, allow_cross_thread_leave)) {
+    assert_true(cs->owning_thread == current_thread,
+                "Cross-thread critical-section leave requires an explicit compatibility option");
+    return;
+  } else if (cs->owning_thread != current_thread) {
+    // Match release-build behavior only when an embedding title explicitly
+    // opts in. The original decrement and waiter wake-up must still run.
+    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+    if (!reported.test_and_set(std::memory_order_relaxed)) {
+      REXLOG_WARN(
+          "RtlLeaveCriticalSection: allowing one or more cross-thread leaves under the "
+          "explicit compatibility option");
+    }
+  }
 
   // Drop recursion count - if it isn't zero we still have the lock.
   assert_true(cs->recursion_count > 0);

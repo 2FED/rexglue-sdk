@@ -11,6 +11,7 @@
 
 #include <rex/input/input.h>
 #include <rex/input/sdl/input_slot_audit.h>
+#include <rex/input/sdl/controller_matrix_audit.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -116,6 +117,8 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   const uint32_t result = is->GetState(actual_user_index, input_state);
   rex::input::sdl::internal::RecordInputSlotGuestState(
       user_index, actual_user_index, result, input_state ? input_state.host_address() : nullptr);
+  rex::input::sdl::internal::RecordControllerMatrixGuestState(
+      user_index, actual_user_index, result, input_state ? input_state.host_address() : nullptr);
   return result;
 }
 
@@ -181,7 +184,7 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
 
   auto* is = input_system();
   auto result = is->GetKeystroke(user_index, flags, keystroke);
-  if (XSUCCEEDED(result)) {
+  if (result == X_ERROR_SUCCESS) {
     *user_index_ptr = keystroke->user_index;
   }
   return result;
