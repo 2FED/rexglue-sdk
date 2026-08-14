@@ -210,7 +210,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     if (disposition == kDispositionState::Create) {
       result = content_manager->CreateContent(root_name, xuid, content_data);
       if (XSUCCEEDED(result)) {
-        content_manager->WriteContentHeaderFile(xuid, content_data);
+        result = content_manager->WriteContentHeaderFile(xuid, content_data);
+        if (XFAILED(result)) {
+          content_manager->CloseContent(root_name);
+          content_manager->DeleteContent(xuid, content_data);
+          disposition = kDispositionState::Unknown;
+        }
       }
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);

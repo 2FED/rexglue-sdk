@@ -11,6 +11,7 @@ add_executable(unit_tests
     kernel/locale_route_test.cpp
     kernel/rtl_critical_section_test.cpp
     kernel/xam_user_profile_test.cpp
+    system/xam_content_persistence_test.cpp
     kernel/xmp_fallback_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp

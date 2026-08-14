@@ -214,11 +214,18 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   if (!file) {
     return X_ERROR_FILE_NOT_FOUND;
   }
-  fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file);
+  bool write_succeeded =
+      fwrite(&data, 1, sizeof(XCONTENT_AGGREGATE_DATA), file) == sizeof(XCONTENT_AGGREGATE_DATA);
   if (license_mask != 0) {
-    fwrite(&license_mask, 1, sizeof(license_mask), file);
+    write_succeeded = write_succeeded &&
+                      fwrite(&license_mask, 1, sizeof(license_mask), file) == sizeof(license_mask);
   }
-  fclose(file);
+  write_succeeded = fclose(file) == 0 && write_succeeded;
+  if (!write_succeeded) {
+    std::error_code error;
+    std::filesystem::remove(header_path, error);
+    return X_ERROR_ACCESS_DENIED;
+  }
   return X_ERROR_SUCCESS;
 }
 
