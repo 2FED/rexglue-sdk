@@ -17,6 +17,9 @@
 REXCVAR_DEFINE_BOOL(sdl_audio_route_audit, false, "Audio",
                     "Emit bounded privacy-safe SDL/XAudio/XMA route evidence")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sdl_audio_event_audit, false, "Audio",
+                    "Emit bounded privacy-safe audio event-window evidence")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::audio {
 namespace {
@@ -191,8 +194,124 @@ class AudioRouteAudit {
   uint32_t submit_peak_ppm_ = 0, device_peak_ppm_ = 0, xma_peak_ppm_ = 0;
 };
 
+class AudioEventAudit {
+ public:
+  bool Begin(AudioEventPhase phase) {
+    std::lock_guard lock(mutex_);
+    if (!enabled_ || summary_) {
+      return false;
+    }
+    ConfigureLocked();
+    if (active_ || !IsAudioEventPhaseOrderValid(next_phase_, phase)) {
+      FailLocked("phase_order");
+      return false;
+    }
+    active_ = true;
+    active_phase_ = phase;
+    frames_ = nonzero_ = invalid_ = submit_failures_ = 0;
+    peak_ppm_ = 0;
+    REXAPU_INFO("SDL_AUDIO_EVENT_AUDIT_PHASE v=1 event=BEGIN phase={} index={}",
+                AudioEventPhaseName(phase), next_phase_);
+    return true;
+  }
+
+  bool End(AudioEventPhase phase) {
+    std::lock_guard lock(mutex_);
+    if (!enabled_ || summary_) {
+      return false;
+    }
+    if (!active_ || active_phase_ != phase || !IsAudioEventPhaseOrderValid(next_phase_, phase)) {
+      FailLocked("phase_order");
+      return false;
+    }
+    const bool healthy = IsAudioEventPhaseHealthy(frames_, nonzero_, invalid_, submit_failures_);
+    REXAPU_INFO(
+        "SDL_AUDIO_EVENT_AUDIT_PHASE v=1 event=END phase={} index={} status={} "
+        "device_frames={} nonzero={} invalid={} submit_failures={} peak_ppm={}",
+        AudioEventPhaseName(phase), next_phase_, healthy ? "PASS" : "FAIL", frames_, nonzero_,
+        invalid_, submit_failures_, peak_ppm_);
+    active_ = false;
+    if (!healthy) {
+      FailLocked("phase_health");
+      return false;
+    }
+    ++next_phase_;
+    return true;
+  }
+
+  void Device(const AudioSampleClassification& classification, bool submitted) {
+    std::lock_guard lock(mutex_);
+    if (!enabled_ || summary_ || !active_) {
+      return;
+    }
+    ++frames_;
+    nonzero_ += classification.nonzero;
+    invalid_ += !classification.finite;
+    submit_failures_ += !submitted;
+    peak_ppm_ = std::max(peak_ppm_, classification.peak_ppm);
+  }
+
+  void Summary() {
+    std::lock_guard lock(mutex_);
+    if (!enabled_ || summary_) {
+      return;
+    }
+    const bool pass = configured_ && !active_ && !failure_count_ &&
+                      next_phase_ == uint32_t(AudioEventPhase::kCount);
+    summary_ = true;
+    enabled_ = false;
+    REXAPU_INFO(
+        "SDL_AUDIO_EVENT_AUDIT_SUMMARY v=1 status={} phases={} failures={} "
+        "dropped_records=0 external_listening_required=1",
+        pass ? "PASS" : "FAIL", next_phase_, failure_count_);
+  }
+
+ private:
+  void ConfigureLocked() {
+    if (configured_) {
+      return;
+    }
+    configured_ = true;
+    REXAPU_INFO(
+        "SDL_AUDIO_EVENT_AUDIT_CONFIG v=1 enabled=1 backend=sdl "
+        "sample_rate=48000 phases=music,ambient,voice,engine,collision,ui");
+  }
+
+  void FailLocked(const char* failure_class) {
+    ++failure_count_;
+    active_ = false;
+    summary_ = true;
+    enabled_ = false;
+    REXAPU_INFO("SDL_AUDIO_EVENT_AUDIT_FAILURE v=1 class={} count={}", failure_class,
+                failure_count_);
+    REXAPU_INFO(
+        "SDL_AUDIO_EVENT_AUDIT_SUMMARY v=1 status=FAIL phases={} failures={} "
+        "dropped_records=0 external_listening_required=1",
+        next_phase_, failure_count_);
+  }
+
+  std::mutex mutex_;
+  bool enabled_ = REXCVAR_GET(sdl_audio_event_audit);
+  bool configured_ = false;
+  bool active_ = false;
+  bool summary_ = false;
+  AudioEventPhase active_phase_ = AudioEventPhase::kMusic;
+  uint32_t next_phase_ = 0;
+  uint64_t frames_ = 0;
+  uint64_t nonzero_ = 0;
+  uint64_t invalid_ = 0;
+  uint64_t submit_failures_ = 0;
+  uint64_t failure_count_ = 0;
+  uint32_t peak_ppm_ = 0;
+};
+
 AudioRouteAudit& GetAudioRouteAudit() {
   static AudioRouteAudit audit;
+  return audit;
+}
+
+AudioEventAudit& GetAudioEventAudit() {
+  static AudioEventAudit audit;
   return audit;
 }
 
@@ -227,6 +346,34 @@ bool IsAudioRouteBufferHealthBounded(uint64_t max_queue_depth,
   return max_queue_depth <= 64 && max_consecutive_starvation_fills <= 2;
 }
 
+const char* AudioEventPhaseName(AudioEventPhase phase) {
+  switch (phase) {
+    case AudioEventPhase::kMusic:
+      return "music";
+    case AudioEventPhase::kAmbient:
+      return "ambient";
+    case AudioEventPhase::kVoice:
+      return "voice";
+    case AudioEventPhase::kEngine:
+      return "engine";
+    case AudioEventPhase::kCollision:
+      return "collision";
+    case AudioEventPhase::kUi:
+      return "ui";
+    default:
+      return "invalid";
+  }
+}
+
+bool IsAudioEventPhaseOrderValid(uint32_t expected_index, AudioEventPhase phase) {
+  return expected_index < uint32_t(AudioEventPhase::kCount) && expected_index == uint32_t(phase);
+}
+
+bool IsAudioEventPhaseHealthy(uint64_t frames, uint64_t nonzero, uint64_t invalid,
+                              uint64_t submit_failures) {
+  return frames > 0 && nonzero > 0 && nonzero <= frames && invalid == 0 && submit_failures == 0;
+}
+
 void RecordAudioRouteClient(bool success, uint32_t index) {
   GetAudioRouteAudit().Client(success, index);
 }
@@ -235,7 +382,9 @@ void RecordAudioRouteSubmittedFrame(const float* samples, size_t sample_count) {
 }
 void RecordAudioRouteDeviceFrame(const float* samples, size_t sample_count, uint32_t channels,
                                  bool submitted) {
-  GetAudioRouteAudit().Device(ClassifyNativeFloatAudio(samples, sample_count), channels, submitted);
+  const auto classification = ClassifyNativeFloatAudio(samples, sample_count);
+  GetAudioRouteAudit().Device(classification, channels, submitted);
+  GetAudioEventAudit().Device(classification, submitted);
   if (submitted) {
     GetAudioRouteAudit().Consumed();
   }
@@ -251,6 +400,18 @@ void RecordAudioRouteXmaFrame(const uint8_t* samples, size_t byte_count) {
 }
 void EmitAudioRouteAuditSummary(const char* phase) {
   GetAudioRouteAudit().Summary(phase);
+}
+
+bool BeginAudioEventPhase(AudioEventPhase phase) {
+  return GetAudioEventAudit().Begin(phase);
+}
+
+bool EndAudioEventPhase(AudioEventPhase phase) {
+  return GetAudioEventAudit().End(phase);
+}
+
+void EmitAudioEventAuditSummary() {
+  GetAudioEventAudit().Summary();
 }
 
 }  // namespace rex::audio

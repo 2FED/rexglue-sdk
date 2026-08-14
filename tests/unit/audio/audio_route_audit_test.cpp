@@ -1,6 +1,7 @@
 #include <array>
 #include <bit>
 #include <limits>
+#include <string_view>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -54,4 +55,31 @@ TEST_CASE("audio route bounds queue growth and consecutive starvation", "[audio]
   CHECK(rex::audio::IsAudioRouteBufferHealthBounded(64, 2));
   CHECK_FALSE(rex::audio::IsAudioRouteBufferHealthBounded(65, 2));
   CHECK_FALSE(rex::audio::IsAudioRouteBufferHealthBounded(64, 3));
+}
+
+TEST_CASE("audio event phases use a fixed privacy-safe vocabulary", "[audio][event-audit]") {
+  CHECK(std::string_view(rex::audio::AudioEventPhaseName(rex::audio::AudioEventPhase::kMusic)) ==
+        "music");
+  CHECK(std::string_view(rex::audio::AudioEventPhaseName(
+            rex::audio::AudioEventPhase::kCollision)) == "collision");
+  CHECK(std::string_view(rex::audio::AudioEventPhaseName(rex::audio::AudioEventPhase::kUi)) ==
+        "ui");
+  CHECK(std::string_view(rex::audio::AudioEventPhaseName(rex::audio::AudioEventPhase::kCount)) ==
+        "invalid");
+}
+
+TEST_CASE("audio event phases reject reordered windows", "[audio][event-audit]") {
+  CHECK(rex::audio::IsAudioEventPhaseOrderValid(0, rex::audio::AudioEventPhase::kMusic));
+  CHECK(rex::audio::IsAudioEventPhaseOrderValid(5, rex::audio::AudioEventPhase::kUi));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseOrderValid(0, rex::audio::AudioEventPhase::kVoice));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseOrderValid(6, rex::audio::AudioEventPhase::kCount));
+}
+
+TEST_CASE("audio event phases require finite nonzero submitted output", "[audio][event-audit]") {
+  CHECK(rex::audio::IsAudioEventPhaseHealthy(100, 90, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(0, 0, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 0, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 101, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 90, 1, 0));
+  CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 90, 0, 1));
 }
