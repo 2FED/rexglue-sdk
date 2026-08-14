@@ -806,6 +806,13 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
   return true;
 }
 
+uint64_t Presenter::GetGuestOutputSequence() {
+  uint32_t mailbox_index = UINT32_MAX;
+  GuestOutputProperties properties;
+  auto consumer_lock = ConsumeGuestOutput(mailbox_index, &properties, nullptr);
+  return mailbox_index == UINT32_MAX ? 0 : properties.sequence;
+}
+
 std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
     GuestOutputPaintConfig* paint_config_out) {

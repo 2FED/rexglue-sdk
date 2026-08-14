@@ -330,6 +330,9 @@ void GraphicsSystem::MarkVblank() {
   // SCOPE_profile_cpu_f("gpu");
 
   // Increment vblank counter (so the game sees us making progress).
+  if (presenter_) {
+    presenter_->NotifyGuestVblank();
+  }
   if (command_processor_) {
     command_processor_->increment_counter();
   }

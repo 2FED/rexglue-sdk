@@ -358,6 +358,14 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Returns the latest successfully published active guest-output sequence,
+  // or zero when no active output has been published. Safe for diagnostic
+  // consumers on threads other than the guest-output producer.
+  uint64_t GetGuestOutputSequence();
+  void NotifyGuestVblank() { guest_vblank_sequence_.fetch_add(1, std::memory_order_release); }
+  uint64_t GetGuestVblankSequence() const {
+    return guest_vblank_sequence_.load(std::memory_order_acquire);
+  }
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -982,6 +990,7 @@ class Presenter {
   // Publication through guest_output_mailbox_acquired_and_ready_ releases the
   // corresponding GuestOutputProperties copy to consumers.
   uint64_t guest_output_sequence_ = 0;
+  std::atomic<uint64_t> guest_vblank_sequence_{0};
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
