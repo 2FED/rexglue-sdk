@@ -32,6 +32,15 @@ TEST_CASE("Default XAM profile exposes one stable local signed-in user", "[kerne
   CHECK(profile.type() == (1 | 2));
 }
 
+TEST_CASE("XAM profile sign-in compatibility state is explicit and fail-closed",
+          "[kernel][xam][profile]") {
+  UserProfile online_compatible(2);
+  UserProfile invalid(99);
+
+  CHECK(online_compatible.signin_state() == 2);
+  CHECK(invalid.signin_state() == 1);
+}
+
 TEST_CASE("Default XAM profile supplies MCLA voice settings", "[kernel][xam][profile]") {
   UserProfile profile;
 

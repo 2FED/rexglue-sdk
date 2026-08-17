@@ -18,6 +18,7 @@ REXCVAR_DECLARE(bool, log_high_frequency_kernel_calls);
 REXCVAR_DECLARE(uint32_t, license_mask);
 REXCVAR_DECLARE(uint32_t, user_country);
 REXCVAR_DECLARE(uint32_t, user_language);
+REXCVAR_DECLARE(uint32_t, xam_user_signin_state);
 REXCVAR_DECLARE(bool, kernel_pix);
 REXCVAR_DECLARE(std::string, cl);
 REXCVAR_DECLARE(bool, kernel_debug_monitor);

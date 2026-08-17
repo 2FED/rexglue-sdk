@@ -214,11 +214,11 @@ class UserProfile {
     }
   };
 
-  UserProfile();
+  explicit UserProfile(uint32_t signin_state = 1);
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
-  uint32_t signin_state() const { return 1; }
+  uint32_t signin_state() const { return signin_state_; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
@@ -229,6 +229,7 @@ class UserProfile {
  private:
   uint64_t xuid_;
   std::string name_;
+  uint32_t signin_state_;
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;

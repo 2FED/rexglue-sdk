@@ -21,12 +21,14 @@ namespace rex {
 namespace system {
 namespace xam {
 
-UserProfile::UserProfile() {
+UserProfile::UserProfile(uint32_t signin_state) : signin_state_(signin_state == 2 ? 2 : 1) {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
   name_ = "User";
+  REXSYS_INFO("XAM_USER_SIGNIN_CONFIG v=1 state={} mode={}", signin_state_,
+              signin_state_ == 2 ? "online-compatible" : "local");
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py

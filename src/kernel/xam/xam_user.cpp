@@ -34,6 +34,9 @@
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
+REXCVAR_DEFINE_UINT32(xam_user_signin_state, 1, "XAM",
+                      "Guest sign-in state: 1 for local, 2 for online-compatible title behavior")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(xam_profile_audit, false, "XAM",
                     "Emit bounded privacy-safe XAM user/profile audit markers")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
