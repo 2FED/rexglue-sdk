@@ -16,6 +16,7 @@
 #include <rex/string.h>
 #include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_device.h>
 
 #include <imgui.h>
 
@@ -510,7 +511,11 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
                 uint64_t(total_requested), device_id_ptr.guest_address(),
                 overlapped.guest_address());
   return xeXamDispatchHeadless(
-      [device_id_ptr]() -> X_RESULT {
+      [device_id_ptr, total_requested]() -> X_RESULT {
+        if (!system::xam::HasDummyHddCapacity(total_requested,
+                                              system::xam::GetDummyHddFreeBytes())) {
+          return X_ERROR_DISK_FULL;
+        }
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
         *device_id_ptr = 0x00000001;
         return X_ERROR_SUCCESS;

@@ -142,10 +142,11 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
   }
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
+              content_size, disposition_ptr,
               license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
+    bool recreate_existing = false;
     switch (flags & 0xF) {
       case 1:  // CREATE_NEW
                // Fail if exists.
@@ -160,16 +161,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Close any existing mount under this root name first.
         // Games may reuse the same root without explicitly closing.
         content_manager->CloseContent(root_name);
-        if (content_manager->ContentExists(xuid, content_data)) {
-          content_manager->DeleteContent(xuid, content_data);
-        }
-        // Check filesystem state after deletion attempt to decide
-        // whether to create fresh or open existing.
-        if (content_manager->ContentExists(xuid, content_data)) {
-          disposition = kDispositionState::Open;
-        } else {
-          disposition = kDispositionState::Create;
-        }
+        recreate_existing = content_manager->ContentExists(xuid, content_data);
+        disposition = kDispositionState::Create;
         break;
       case 3:  // OPEN_EXISTING
                // Open only if exists.
@@ -193,12 +186,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          content_manager->DeleteContent(xuid, content_data);
-          if (content_manager->ContentExists(xuid, content_data)) {
-            disposition = kDispositionState::Open;
-          } else {
-            disposition = kDispositionState::Create;
-          }
+          recreate_existing = true;
+          disposition = kDispositionState::Create;
         }
         break;
       default:
@@ -206,13 +195,37 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         break;
     }
 
+    if (disposition == kDispositionState::Create &&
+        content_data.content_type == XContentType::kSavedGame &&
+        !HasDummyHddCapacity(content_size, GetDummyHddFreeBytes())) {
+      result = X_ERROR_DISK_FULL;
+      disposition = kDispositionState::Unknown;
+    }
+
     uint32_t content_license = 0;
+    bool transaction_started = false;
+    if (disposition != kDispositionState::Unknown &&
+        content_data.content_type == XContentType::kSavedGame) {
+      result = content_manager->BeginContentTransaction(xuid, content_data);
+      transaction_started = result == X_ERROR_SUCCESS;
+      if (!transaction_started) {
+        disposition = kDispositionState::Unknown;
+      }
+    }
+    if (disposition == kDispositionState::Create) {
+      if (recreate_existing) {
+        result = content_manager->DeleteContent(xuid, content_data);
+        if (result != X_ERROR_SUCCESS && result != X_ERROR_FILE_NOT_FOUND) {
+          disposition = kDispositionState::Unknown;
+        }
+      }
+    }
     if (disposition == kDispositionState::Create) {
       result = content_manager->CreateContent(root_name, xuid, content_data);
-      if (XSUCCEEDED(result)) {
+      if (result == X_ERROR_SUCCESS) {
         result = content_manager->WriteContentHeaderFile(xuid, content_data);
-        if (XFAILED(result)) {
-          content_manager->CloseContent(root_name);
+        if (result != X_ERROR_SUCCESS) {
+          content_manager->UnmountContent(xuid, content_data);
           content_manager->DeleteContent(xuid, content_data);
           disposition = kDispositionState::Unknown;
         }
@@ -220,8 +233,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
+    if (transaction_started &&
+        (disposition == kDispositionState::Unknown || result != X_ERROR_SUCCESS)) {
+      content_manager->RollbackContentTransaction(xuid, content_data);
+    }
 
-    if (license_mask_ptr && XSUCCEEDED(result)) {
+    if (license_mask_ptr && result == X_ERROR_SUCCESS) {
       *license_mask_ptr = content_license;
     }
 

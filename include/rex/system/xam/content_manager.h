@@ -11,9 +11,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -68,9 +70,8 @@ struct XCONTENT_DATA {
   }
 
   std::string file_name() const {
-    std::string value;
-    value.assign(file_name_raw, std::min(strlen(file_name_raw), countof(file_name_raw)));
-    return value;
+    const auto end = std::find(std::begin(file_name_raw), std::end(file_name_raw), '\0');
+    return std::string(std::begin(file_name_raw), end);
   }
 
   void set_display_name(const std::u16string_view value) {
@@ -165,6 +166,14 @@ class ContentManager {
   X_RESULT UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountAndDeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
 
+  // Saved-game writes are transactionally backed up until XamContentClose.
+  // A process interruption leaves the marker and backup in place; the next
+  // enumeration/open restores the previous complete save (or removes an
+  // incomplete brand-new save) before exposing it to the guest.
+  X_RESULT BeginContentTransaction(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  X_RESULT CommitContentTransaction(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  X_RESULT RollbackContentTransaction(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+
   X_RESULT WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data,
                                   uint32_t license_mask = 0);
   X_RESULT ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid, uint32_t title_id,
@@ -189,6 +198,8 @@ class ContentManager {
   std::filesystem::path ResolvePackageHeaderPath(const std::string_view file_name, uint64_t xuid,
                                                  uint32_t title_id,
                                                  XContentType content_type) const;
+  X_RESULT RecoverContentTransaction(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  void RecoverContentTransactions(uint64_t xuid, XContentType content_type, uint32_t title_id);
 
   std::unordered_map<string::string_key_case, ContentPackage*,
                      string::string_key_case::Hash>::iterator
@@ -203,6 +214,7 @@ class ContentManager {
   rex::thread::global_critical_region global_critical_region_;
   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
       open_packages_;
+  std::unordered_set<std::filesystem::path> active_content_transactions_;
 };
 
 }  // namespace xam

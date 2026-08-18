@@ -35,6 +35,8 @@ struct DummyDeviceInfo {
 };
 
 const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id);
+uint64_t GetDummyHddFreeBytes();
+bool HasDummyHddCapacity(uint64_t requested_bytes, uint64_t free_bytes);
 
 }  // namespace xam
 }  // namespace system

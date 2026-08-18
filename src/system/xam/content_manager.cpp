@@ -35,6 +35,8 @@ static const char* kThumbnailFileName = "__thumbnail.png";
 static const char* kGameUserContentDirName = "profile";
 
 static const char* kGameContentHeaderDirName = "Headers";
+static constexpr std::string_view kTransactionBackupSuffix = ".rexbackup";
+static constexpr std::string_view kTransactionMarkerSuffix = ".rexpending";
 
 static int content_device_id_ = 0;
 
@@ -136,6 +138,199 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
          final_name;
 }
 
+X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
+                                                   const XCONTENT_AGGREGATE_DATA& data) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto package_path = ResolvePackagePath(xuid, data);
+  auto package_backup_path = package_path;
+  package_backup_path += kTransactionBackupSuffix;
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  auto header_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  auto header_backup_path = header_path;
+  header_backup_path += kTransactionBackupSuffix;
+  auto marker_path = header_path;
+  marker_path += kTransactionMarkerSuffix;
+
+  std::error_code error;
+  if (active_content_transactions_.contains(marker_path)) {
+    return X_ERROR_SUCCESS;
+  }
+  if (!std::filesystem::exists(marker_path)) {
+    // Backups without a marker were never made authoritative. They may be
+    // remnants of an interruption while the backup itself was being copied.
+    std::filesystem::remove_all(package_backup_path, error);
+    error.clear();
+    std::filesystem::remove(header_backup_path, error);
+    return X_ERROR_SUCCESS;
+  }
+
+  std::filesystem::remove_all(package_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  error.clear();
+  std::filesystem::remove(header_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+
+  // Keep the backups until the marker is removed so recovery is idempotent if
+  // this process is itself interrupted while restoring the prior save.
+  if (std::filesystem::exists(package_backup_path)) {
+    error.clear();
+    std::filesystem::copy(package_backup_path, package_path,
+                          std::filesystem::copy_options::recursive, error);
+    if (error) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+  if (std::filesystem::exists(header_backup_path)) {
+    error.clear();
+    std::filesystem::copy_file(header_backup_path, header_path,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    if (error) {
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+  error.clear();
+  std::filesystem::remove(marker_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  error.clear();
+  std::filesystem::remove_all(package_backup_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  error.clear();
+  std::filesystem::remove(header_backup_path, error);
+  return error ? X_ERROR_ACCESS_DENIED : X_ERROR_SUCCESS;
+}
+
+void ContentManager::RecoverContentTransactions(uint64_t xuid, XContentType content_type,
+                                                uint32_t title_id) {
+  if (title_id == kCurrentlyRunningTitleId) {
+    title_id = kernel_state_->title_id();
+  }
+  auto header_root = root_path_ / fmt::format("{:016X}", xuid) / fmt::format("{:08X}", title_id) /
+                     kGameContentHeaderDirName / fmt::format("{:08X}", uint32_t(content_type));
+  for (const auto& file_info : rex::filesystem::ListFiles(header_root)) {
+    auto name = rex::path_to_utf8(file_info.name);
+    const std::string suffix = std::string(".header") + std::string(kTransactionMarkerSuffix);
+    if (!name.ends_with(suffix)) {
+      continue;
+    }
+    XCONTENT_AGGREGATE_DATA data{};
+    data.device_id = 1;
+    data.content_type = content_type;
+    data.xuid = xuid;
+    data.title_id = title_id;
+    data.set_file_name(name.substr(0, name.size() - suffix.size()));
+    RecoverContentTransaction(xuid, data);
+  }
+}
+
+X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
+                                                 const XCONTENT_AGGREGATE_DATA& data) {
+  auto recovery_result = RecoverContentTransaction(xuid, data);
+  if (recovery_result != X_ERROR_SUCCESS) {
+    return recovery_result;
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  auto package_path = ResolvePackagePath(xuid, data);
+  auto package_backup_path = package_path;
+  package_backup_path += kTransactionBackupSuffix;
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  auto header_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  auto header_backup_path = header_path;
+  header_backup_path += kTransactionBackupSuffix;
+  auto marker_path = header_path;
+  marker_path += kTransactionMarkerSuffix;
+
+  if (active_content_transactions_.contains(marker_path)) {
+    return X_ERROR_BUSY;
+  }
+
+  std::error_code error;
+  std::filesystem::remove_all(package_backup_path, error);
+  error.clear();
+  std::filesystem::remove(header_backup_path, error);
+  if (std::filesystem::exists(package_path)) {
+    error.clear();
+    std::filesystem::copy(package_path, package_backup_path,
+                          std::filesystem::copy_options::recursive, error);
+    if (error) {
+      std::filesystem::remove_all(package_backup_path, error);
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+  if (std::filesystem::exists(header_path)) {
+    error.clear();
+    std::filesystem::copy_file(header_path, header_backup_path,
+                               std::filesystem::copy_options::overwrite_existing, error);
+    if (error) {
+      std::filesystem::remove_all(package_backup_path, error);
+      std::filesystem::remove(header_backup_path, error);
+      return X_ERROR_ACCESS_DENIED;
+    }
+  }
+  error.clear();
+  std::filesystem::create_directories(marker_path.parent_path(), error);
+  if (error || !rex::filesystem::CreateEmptyFile(marker_path)) {
+    std::filesystem::remove_all(package_backup_path, error);
+    std::filesystem::remove(header_backup_path, error);
+    return X_ERROR_ACCESS_DENIED;
+  }
+  active_content_transactions_.insert(marker_path);
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::CommitContentTransaction(uint64_t xuid,
+                                                  const XCONTENT_AGGREGATE_DATA& data) {
+  auto global_lock = global_critical_region_.Acquire();
+  auto package_backup_path = ResolvePackagePath(xuid, data);
+  package_backup_path += kTransactionBackupSuffix;
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  auto header_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  auto header_backup_path = header_path;
+  header_backup_path += kTransactionBackupSuffix;
+  auto marker_path = header_path;
+  marker_path += kTransactionMarkerSuffix;
+  // Removing the marker commits the replacement. Do this before deleting the
+  // backups so an interruption can never leave a marker without recovery data.
+  std::error_code error;
+  std::filesystem::remove(marker_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  active_content_transactions_.erase(marker_path);
+  error.clear();
+  std::filesystem::remove_all(package_backup_path, error);
+  if (error) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  error.clear();
+  std::filesystem::remove(header_backup_path, error);
+  return error ? X_ERROR_ACCESS_DENIED : X_ERROR_SUCCESS;
+}
+
+X_RESULT ContentManager::RollbackContentTransaction(uint64_t xuid,
+                                                    const XCONTENT_AGGREGATE_DATA& data) {
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  auto marker_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  marker_path += kTransactionMarkerSuffix;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    active_content_transactions_.erase(marker_path);
+  }
+  return RecoverContentTransaction(xuid, data);
+}
+
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
                                                                  XContentType content_type,
                                                                  uint32_t title_id) {
@@ -144,6 +339,8 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   if (title_id == kCurrentlyRunningTitleId) {
     title_id = kernel_state_->title_id();
   }
+
+  RecoverContentTransactions(xuid, content_type, title_id);
 
   // Search path:
   // content_root/xuid/title_id/type_name/*
@@ -154,11 +351,28 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       // Directories only.
       continue;
     }
+    auto file_name = rex::path_to_utf8(file_info.name);
+    if (file_name.ends_with(kTransactionBackupSuffix)) {
+      continue;
+    }
 
     XCONTENT_AGGREGATE_DATA content_data;
-    if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
-                                         content_type, content_data))) {
+    RecoverContentTransaction(xuid, [&] {
+      XCONTENT_AGGREGATE_DATA value{};
+      value.device_id = device_id;
+      value.content_type = content_type;
+      value.xuid = xuid;
+      value.title_id = title_id;
+      value.set_file_name(file_name);
+      return value;
+    }());
+    if (ReadContentHeaderFile(file_name, xuid, title_id, content_type, content_data) ==
+        X_ERROR_SUCCESS) {
       result.emplace_back(std::move(content_data));
+    } else if (content_type == XContentType::kSavedGame) {
+      // Saved games without valid metadata are incomplete or corrupt and must
+      // not be surfaced to the guest as loadable slots.
+      continue;
     } else {
       content_data.device_id = device_id;
       content_data.content_type = content_type;
@@ -184,6 +398,9 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  if (RecoverContentTransaction(xuid, data) != X_ERROR_SUCCESS) {
+    return false;
+  }
   auto path = ResolvePackagePath(xuid, data);
   return std::filesystem::exists(path);
 }
@@ -259,6 +476,11 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
   }
 
   std::memcpy(&data, buffer.data(), buffer.size());
+  const uint64_t stored_xuid = data.xuid;
+  if (data.content_type != content_type || data.title_id != title_id ||
+      (stored_xuid != 0 && stored_xuid != xuid) || data.file_name() != file_name) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -323,6 +545,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
 
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   ContentPackage* package = nullptr;
+  XCONTENT_AGGREGATE_DATA content_data{};
   {
     auto global_lock = global_critical_region_.Acquire();
     // Some games use different casing between Create and Close (e.g. "save" vs "SAVE")
@@ -331,8 +554,16 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
       return X_ERROR_FILE_NOT_FOUND;
     }
     package = DetachPackage(it);
+    content_data = package->GetPackageContentData();
   }
   delete package;
+  if (content_data.content_type == XContentType::kSavedGame) {
+    uint64_t xuid = content_data.xuid;
+    if (xuid == 0 || xuid == uint64_t(-1)) {
+      xuid = kernel_state_->user_profile()->xuid();
+    }
+    return CommitContentTransaction(xuid, content_data);
+  }
   return X_ERROR_SUCCESS;
 }
 

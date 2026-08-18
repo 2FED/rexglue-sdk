@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -24,6 +25,10 @@ namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+REXCVAR_DEFINE_UINT32(xam_hdd_free_bytes, 3u * 1024u * 1024u * 1024u, "XAM",
+                      "Free bytes reported by the dummy HDD (0 simulates full storage)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 // TODO(gibbed): real information.
 //
@@ -61,6 +66,14 @@ const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id) {
     return static_cast<uint32_t>(item->device_id) == device_id;
   });
   return it == end ? nullptr : *it;
+}
+
+uint64_t GetDummyHddFreeBytes() {
+  return REXCVAR_GET(xam_hdd_free_bytes);
+}
+
+bool HasDummyHddCapacity(uint64_t requested_bytes, uint64_t free_bytes) {
+  return free_bytes != 0 && requested_bytes <= free_bytes;
 }
 
 u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32 name_capacity) {
@@ -117,7 +130,8 @@ u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA
   device_data->device_id = static_cast<uint32_t>(device_info->device_id);
   device_data->device_type = static_cast<uint32_t>(device_info->device_type);
   device_data->total_bytes = device_info->total_bytes;
-  device_data->free_bytes = device_info->free_bytes;
+  device_data->free_bytes = device_info->device_id == DummyDeviceId::HDD ? GetDummyHddFreeBytes()
+                                                                         : device_info->free_bytes;
   rex::string::copy_and_swap_truncating(device_data->name_chars, device_info->name,
                                         rex::countof(device_data->name_chars));
   return X_ERROR_SUCCESS;
@@ -145,7 +159,9 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
       device_data->device_id = static_cast<uint32_t>(device_info->device_id);
       device_data->device_type = static_cast<uint32_t>(device_info->device_type);
       device_data->total_bytes = device_info->total_bytes;
-      device_data->free_bytes = device_info->free_bytes;
+      device_data->free_bytes = device_info->device_id == DummyDeviceId::HDD
+                                    ? GetDummyHddFreeBytes()
+                                    : device_info->free_bytes;
       rex::string::copy_and_swap_truncating(device_data->name_chars, device_info->name,
                                             rex::countof(device_data->name_chars));
     }
@@ -166,6 +182,14 @@ namespace xam {
 
 const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id) {
   return rex::kernel::xam::GetDummyDeviceInfo(device_id);
+}
+
+uint64_t GetDummyHddFreeBytes() {
+  return rex::kernel::xam::GetDummyHddFreeBytes();
+}
+
+bool HasDummyHddCapacity(uint64_t requested_bytes, uint64_t free_bytes) {
+  return rex::kernel::xam::HasDummyHddCapacity(requested_bytes, free_bytes);
 }
 
 }  // namespace xam
