@@ -16,6 +16,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/profile_audit.h>
@@ -746,29 +747,46 @@ u32 XamUserReadProfileSettingsEx_entry(u32 title_id, u32 user_index, u32 xuid_co
 u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_count,
                                       ppc_ptr_t<X_USER_PROFILE_SETTING> settings,
                                       ppc_ptr_t<XAM_OVERLAPPED> overlapped) {
+  auto finish = [&](uint32_t result) {
+    if (overlapped) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(), result);
+      return static_cast<uint32_t>(X_ERROR_IO_PENDING);
+    }
+    return result;
+  };
   if (!setting_count || !settings) {
-    return X_ERROR_INVALID_PARAMETER;
+    return finish(X_ERROR_INVALID_PARAMETER);
   }
 
   if (user_index) {
     // Only support user 0.
-    if (overlapped) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
-                                                      X_ERROR_NO_SUCH_USER);
-      return X_ERROR_IO_PENDING;
-    }
-    return X_ERROR_NO_SUCH_USER;
+    return finish(X_ERROR_NO_SUCH_USER);
   }
 
-  // Update and save settings.
+  // Validate and materialize the complete batch before applying any setting,
+  // so an invalid later entry cannot leave a partially persisted profile.
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+  std::vector<std::unique_ptr<UserProfile::Setting>> updates;
+  updates.reserve(setting_count);
+  std::unordered_set<uint32_t> setting_ids;
+  setting_ids.reserve(setting_count);
 
   for (uint32_t n = 0; n < setting_count; ++n) {
     const X_USER_PROFILE_SETTING& setting = settings[n];
-
+    if (!setting_ids.insert(setting.setting_id).second) {
+      REXKRNL_ERROR("XamUserWriteProfileSettings: duplicate setting {:08X}",
+                    static_cast<uint32_t>(setting.setting_id));
+      return finish(X_ERROR_INVALID_PARAMETER);
+    }
     auto setting_type = static_cast<UserProfile::Setting::Type>(setting.data.type);
-    if (setting_type == UserProfile::Setting::Type::UNSET) {
-      continue;
+    UserProfile::Setting::Key setting_key{};
+    setting_key.value = setting.setting_id;
+    UserProfile::Setting* existing = user_profile->GetSetting(setting.setting_id);
+    if (!existing || setting_type == UserProfile::Setting::Type::UNSET ||
+        setting_key.type != static_cast<uint32_t>(setting_type) || existing->type != setting_type) {
+      REXKRNL_ERROR("XamUserWriteProfileSettings: invalid setting {:08X} type {}",
+                    static_cast<uint32_t>(setting.setting_id), setting.data.type);
+      return finish(X_ERROR_INVALID_PARAMETER);
     }
 
     REXKRNL_DEBUG(
@@ -776,40 +794,70 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
         " from={} setting_id={:08X} data.type={}",
         n, (uint32_t)setting.from, (uint32_t)setting.setting_id, setting.data.type);
 
+    std::unique_ptr<UserProfile::Setting> update;
     switch (setting_type) {
-      case UserProfile::Setting::Type::CONTENT:
       case UserProfile::Setting::Type::BINARY: {
-        uint8_t* binary_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
-        size_t binary_size = setting.data.binary.size;
+        const uint32_t binary_size = setting.data.binary.size;
+        if (binary_size > setting_key.size || (binary_size && !setting.data.binary.ptr)) {
+          return finish(X_ERROR_INVALID_PARAMETER);
+        }
         std::vector<uint8_t> bytes;
-        if (setting.data.binary.ptr) {
-          // Copy provided data
+        if (binary_size) {
+          const uint8_t* binary_ptr =
+              REX_KERNEL_MEMORY()->TranslateVirtual(setting.data.binary.ptr);
           bytes.resize(binary_size);
           std::memcpy(bytes.data(), binary_ptr, binary_size);
-        } else {
-          // Data pointer was NULL, so just fill with zeroes
-          bytes.resize(binary_size, 0);
         }
-        user_profile->AddSetting(
-            std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
+        update = std::make_unique<UserProfile::BinarySetting>(setting.setting_id, bytes);
       } break;
-      case UserProfile::Setting::Type::WSTRING:
+      case UserProfile::Setting::Type::WSTRING: {
+        const uint32_t byte_size = setting.data.unicode.size;
+        if ((byte_size & 1) != 0 || byte_size > setting_key.size ||
+            (byte_size && !setting.data.unicode.ptr)) {
+          return finish(X_ERROR_INVALID_PARAMETER);
+        }
+        std::u16string value(byte_size / sizeof(char16_t), u'\0');
+        if (byte_size) {
+          const auto* source = REX_KERNEL_MEMORY()->TranslateVirtual<const rex::be<uint16_t>*>(
+              setting.data.unicode.ptr);
+          for (size_t i = 0; i < value.size(); ++i) {
+            value[i] = static_cast<char16_t>(source[i]);
+          }
+          if (!value.empty() && value.back() == u'\0') {
+            value.pop_back();
+          }
+        }
+        update = std::make_unique<UserProfile::UnicodeSetting>(setting.setting_id, value);
+      } break;
       case UserProfile::Setting::Type::DOUBLE:
+        update = std::make_unique<UserProfile::DoubleSetting>(setting.setting_id, setting.data.f64);
+        break;
       case UserProfile::Setting::Type::FLOAT:
+        update = std::make_unique<UserProfile::FloatSetting>(setting.setting_id, setting.data.f32);
+        break;
       case UserProfile::Setting::Type::INT32:
+        update = std::make_unique<UserProfile::Int32Setting>(setting.setting_id, setting.data.s32);
+        break;
       case UserProfile::Setting::Type::INT64:
+        update = std::make_unique<UserProfile::Int64Setting>(setting.setting_id, setting.data.s64);
+        break;
       case UserProfile::Setting::Type::DATETIME:
+        update = std::make_unique<UserProfile::DateTimeSetting>(setting.setting_id,
+                                                                setting.data.filetime);
+        break;
+      case UserProfile::Setting::Type::CONTENT:
       default: {
         REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
+        return finish(X_ERROR_INVALID_PARAMETER);
       } break;
     };
+    updates.push_back(std::move(update));
   }
 
-  if (overlapped) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(), X_ERROR_SUCCESS);
-    return X_ERROR_IO_PENDING;
+  for (auto& update : updates) {
+    user_profile->AddSetting(std::move(update));
   }
-  return X_ERROR_SUCCESS;
+  return finish(X_ERROR_SUCCESS);
 }
 
 u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) {

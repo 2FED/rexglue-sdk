@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -113,12 +115,13 @@ class UserProfile {
     uint32_t loaded_title_id;
     Setting(uint32_t setting_id, Type type, size_t size, bool is_set)
         : setting_id(setting_id), type(type), size(size), is_set(is_set), loaded_title_id(0) {}
+    virtual ~Setting() = default;
     virtual void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) {
       (void)stream;
       data->type = static_cast<uint8_t>(type);
     }
     virtual std::vector<uint8_t> Serialize() const { return std::vector<uint8_t>(); }
-    virtual void Deserialize(std::vector<uint8_t>) {}
+    virtual bool Deserialize(const std::vector<uint8_t>&) { return false; }
     bool is_title_specific() const { return (setting_id & 0x3F00) == 0x3F00; }
   };
   struct Int32Setting : public Setting {
@@ -129,6 +132,19 @@ class UserProfile {
       Setting::Append(data, stream);
       data->s32 = value;
     }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(sizeof(value));
+      std::memcpy(data.data(), &value, sizeof(value));
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if (data.size() != sizeof(value)) {
+        return false;
+      }
+      std::memcpy(&value, data.data(), sizeof(value));
+      is_set = true;
+      return true;
+    }
   };
   struct Int64Setting : public Setting {
     Int64Setting(uint32_t setting_id, int64_t value)
@@ -138,6 +154,19 @@ class UserProfile {
       Setting::Append(data, stream);
       data->s64 = value;
     }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(sizeof(value));
+      std::memcpy(data.data(), &value, sizeof(value));
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if (data.size() != sizeof(value)) {
+        return false;
+      }
+      std::memcpy(&value, data.data(), sizeof(value));
+      is_set = true;
+      return true;
+    }
   };
   struct DoubleSetting : public Setting {
     DoubleSetting(uint32_t setting_id, double value)
@@ -146,6 +175,19 @@ class UserProfile {
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
       data->f64 = value;
+    }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(sizeof(value));
+      std::memcpy(data.data(), &value, sizeof(value));
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if (data.size() != sizeof(value)) {
+        return false;
+      }
+      std::memcpy(&value, data.data(), sizeof(value));
+      is_set = true;
+      return true;
     }
   };
   struct UnicodeSetting : public Setting {
@@ -168,6 +210,28 @@ class UserProfile {
         memory::copy_and_swap(buffer, (uint16_t*)value.data(), count);
       }
     }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(value.size() * sizeof(char16_t));
+      for (size_t i = 0; i < value.size(); ++i) {
+        const uint16_t code_unit = static_cast<uint16_t>(value[i]);
+        data[i * 2] = static_cast<uint8_t>(code_unit);
+        data[i * 2 + 1] = static_cast<uint8_t>(code_unit >> 8);
+      }
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if ((data.size() & 1) != 0) {
+        return false;
+      }
+      std::u16string decoded(data.size() / sizeof(char16_t), u'\0');
+      for (size_t i = 0; i < decoded.size(); ++i) {
+        decoded[i] = static_cast<char16_t>(static_cast<uint16_t>(data[i * 2]) |
+                                           (static_cast<uint16_t>(data[i * 2 + 1]) << 8));
+      }
+      value = std::move(decoded);
+      is_set = true;
+      return true;
+    }
   };
   struct FloatSetting : public Setting {
     FloatSetting(uint32_t setting_id, float value)
@@ -176,6 +240,19 @@ class UserProfile {
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
       data->f32 = value;
+    }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(sizeof(value));
+      std::memcpy(data.data(), &value, sizeof(value));
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if (data.size() != sizeof(value)) {
+        return false;
+      }
+      std::memcpy(&value, data.data(), sizeof(value));
+      is_set = true;
+      return true;
     }
   };
   struct BinarySetting : public Setting {
@@ -196,12 +273,11 @@ class UserProfile {
         stream->Write(value.data(), size);
       }
     }
-    std::vector<uint8_t> Serialize() const override {
-      return std::vector<uint8_t>(value.data(), value.data() + value.size());
-    }
-    void Deserialize(std::vector<uint8_t> data) override {
+    std::vector<uint8_t> Serialize() const override { return value; }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
       value = data;
       is_set = true;
+      return true;
     }
   };
   struct DateTimeSetting : public Setting {
@@ -211,6 +287,19 @@ class UserProfile {
     void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) override {
       Setting::Append(data, stream);
       data->filetime = value;
+    }
+    std::vector<uint8_t> Serialize() const override {
+      std::vector<uint8_t> data(sizeof(value));
+      std::memcpy(data.data(), &value, sizeof(value));
+      return data;
+    }
+    bool Deserialize(const std::vector<uint8_t>& data) override {
+      if (data.size() != sizeof(value)) {
+        return false;
+      }
+      std::memcpy(&value, data.data(), sizeof(value));
+      is_set = true;
+      return true;
     }
   };
 
@@ -222,6 +311,7 @@ class UserProfile {
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+  void SetPersistenceRoot(const std::filesystem::path& root);
 
   void AddSetting(std::unique_ptr<Setting> setting);
   Setting* GetSetting(uint32_t setting_id);
@@ -233,9 +323,12 @@ class UserProfile {
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;
+  std::filesystem::path persistence_root_;
 
   void LoadSetting(UserProfile::Setting*);
   void SaveSetting(UserProfile::Setting*);
+  void LoadPersistentSetting(UserProfile::Setting*);
+  void SavePersistentSetting(UserProfile::Setting*);
 };
 
 }  // namespace xam

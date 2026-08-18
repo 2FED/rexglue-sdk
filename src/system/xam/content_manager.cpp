@@ -687,6 +687,11 @@ std::filesystem::path ContentManager::ResolveGameUserContentPath() {
   return root_path_ / title_id / kGameUserContentDirName / user_name;
 }
 
+std::filesystem::path ContentManager::ResolveGlobalUserProfilePath() {
+  auto user_name = rex::to_path(kernel_state_->user_profile()->name());
+  return root_path_ / kGameUserContentDirName / user_name;
+}
+
 std::unordered_map<string::string_key_case, ContentPackage*,
                    string::string_key_case::Hash>::iterator
 ContentManager::FindOpenPackageByData(const XCONTENT_AGGREGATE_DATA& data) {

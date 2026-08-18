@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
+#include <array>
+#include <fstream>
+#include <limits>
 #include <sstream>
 
 #include <fmt/format.h>
@@ -20,6 +24,52 @@
 namespace rex {
 namespace system {
 namespace xam {
+
+namespace {
+
+constexpr std::array<uint8_t, 8> kPersistentSettingMagic = {'R', 'E', 'X', 'P', 'R', 'O', 'F', '1'};
+constexpr size_t kPersistentSettingHeaderSize = 20;
+constexpr size_t kMaxPersistentSettingPayload = 64 * 1024;
+
+void StoreLe32(uint8_t* destination, uint32_t value) {
+  destination[0] = static_cast<uint8_t>(value);
+  destination[1] = static_cast<uint8_t>(value >> 8);
+  destination[2] = static_cast<uint8_t>(value >> 16);
+  destination[3] = static_cast<uint8_t>(value >> 24);
+}
+
+uint32_t LoadLe32(const uint8_t* source) {
+  return static_cast<uint32_t>(source[0]) | (static_cast<uint32_t>(source[1]) << 8) |
+         (static_cast<uint32_t>(source[2]) << 16) | (static_cast<uint32_t>(source[3]) << 24);
+}
+
+std::filesystem::path PersistentSettingPath(const std::filesystem::path& root,
+                                            uint32_t setting_id) {
+  return root / fmt::format("{:08X}.bin", setting_id);
+}
+
+void RecoverPersistentSettingFile(const std::filesystem::path& file_path) {
+  std::filesystem::path temporary_path = file_path;
+  temporary_path += ".tmp";
+  std::filesystem::path backup_path = file_path;
+  backup_path += ".bak";
+  std::error_code ec;
+  if (std::filesystem::exists(file_path, ec)) {
+    std::filesystem::remove(temporary_path, ec);
+    ec.clear();
+    std::filesystem::remove(backup_path, ec);
+    return;
+  }
+  ec.clear();
+  if (std::filesystem::exists(backup_path, ec)) {
+    ec.clear();
+    std::filesystem::rename(backup_path, file_path, ec);
+  }
+  ec.clear();
+  std::filesystem::remove(temporary_path, ec);
+}
+
+}  // namespace
 
 UserProfile::UserProfile(uint32_t signin_state) : signin_state_(signin_state == 2 ? 2 : 1) {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
@@ -99,7 +149,8 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
 
-  if (setting->is_set && setting->is_title_specific()) {
+  if (setting->is_set && ((setting->is_title_specific() && kernel_state_) ||
+                          (!setting->is_title_specific() && !persistence_root_.empty()))) {
     SaveSetting(setting.get());
   }
 
@@ -114,6 +165,18 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   } else {
     // new setting: add to the owning list
     setting_list_.push_back(std::move(setting));
+  }
+}
+
+void UserProfile::SetPersistenceRoot(const std::filesystem::path& root) {
+  persistence_root_ = root;
+  if (persistence_root_.empty()) {
+    return;
+  }
+  for (const auto& setting : setting_list_) {
+    if (!setting->is_title_specific()) {
+      LoadPersistentSetting(setting.get());
+    }
   }
 }
 
@@ -135,25 +198,45 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
 
 void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
+    setting->is_set = false;
+    if (setting->type == Setting::Type::BINARY) {
+      static_cast<BinarySetting*>(setting)->value.clear();
+    }
     auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "rb");
     if (file) {
       fseek(file, 0, SEEK_END);
-      uint32_t input_file_size = static_cast<uint32_t>(ftell(file));
+      const long input_file_size_long = ftell(file);
       fseek(file, 0, SEEK_SET);
 
-      std::vector<uint8_t> serialized_data(input_file_size);
-      fread(serialized_data.data(), 1, serialized_data.size(), file);
-      fclose(file);
-      setting->Deserialize(serialized_data);
-      setting->loaded_title_id = kernel_state_->title_id();
+      Setting::Key key{};
+      key.value = setting->setting_id;
+      if (input_file_size_long < 0 || static_cast<uint64_t>(input_file_size_long) > key.size) {
+        fclose(file);
+        setting->is_set = false;
+        if (setting->type == Setting::Type::BINARY) {
+          static_cast<BinarySetting*>(setting)->value.clear();
+        }
+        REXSYS_WARN("Ignoring invalid title profile setting {:08X}", setting->setting_id);
+      } else {
+        const uint32_t input_file_size = static_cast<uint32_t>(input_file_size_long);
+        std::vector<uint8_t> serialized_data(input_file_size);
+        const size_t bytes_read = fread(serialized_data.data(), 1, serialized_data.size(), file);
+        fclose(file);
+        if (bytes_read != serialized_data.size() || !setting->Deserialize(serialized_data)) {
+          setting->is_set = false;
+          if (setting->type == Setting::Type::BINARY) {
+            static_cast<BinarySetting*>(setting)->value.clear();
+          }
+          REXSYS_WARN("Ignoring invalid title profile setting {:08X}", setting->setting_id);
+        }
+      }
     }
+    setting->loaded_title_id = kernel_state_->title_id();
   } else {
-    // Unsupported for now.  Other settings aren't per-game and need to be
-    // stored some other way.
-    REXSYS_WARN("Attempting to load unsupported profile setting from disk");
+    LoadPersistentSetting(setting);
   }
 }
 
@@ -164,14 +247,135 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
     std::filesystem::create_directories(content_dir);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
+    Setting::Key key{};
+    key.value = setting->setting_id;
+    if (serialized_setting.size() > key.size) {
+      REXSYS_WARN("Refusing oversized title profile setting {:08X}", setting->setting_id);
+      return;
+    }
     auto file = rex::filesystem::OpenFile(file_path, "wb");
-    fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+    if (!file) {
+      REXSYS_WARN("Unable to write title profile setting {:08X}", setting->setting_id);
+      return;
+    }
+    const size_t bytes_written =
+        fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
     fclose(file);
+    if (bytes_written != serialized_setting.size()) {
+      REXSYS_WARN("Short write for title profile setting {:08X}", setting->setting_id);
+    }
   } else {
-    // Unsupported for now.  Other settings aren't per-game and need to be
-    // stored some other way.
-    REXSYS_WARN("Attempting to save unsupported profile setting to disk");
+    SavePersistentSetting(setting);
   }
+}
+
+void UserProfile::LoadPersistentSetting(UserProfile::Setting* setting) {
+  if (persistence_root_.empty() || setting->is_title_specific()) {
+    return;
+  }
+  const auto file_path = PersistentSettingPath(persistence_root_, setting->setting_id);
+  RecoverPersistentSettingFile(file_path);
+  std::error_code ec;
+  const uintmax_t file_size = std::filesystem::file_size(file_path, ec);
+  if (ec) {
+    return;
+  }
+  if (file_size < kPersistentSettingHeaderSize ||
+      file_size > kPersistentSettingHeaderSize + kMaxPersistentSettingPayload) {
+    REXSYS_WARN("Ignoring invalid persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  std::vector<uint8_t> serialized(static_cast<size_t>(file_size));
+  std::ifstream file(file_path, std::ios::binary);
+  if (!file || !file.read(reinterpret_cast<char*>(serialized.data()),
+                          static_cast<std::streamsize>(serialized.size()))) {
+    REXSYS_WARN("Unable to read persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  const uint32_t stored_id = LoadLe32(serialized.data() + 8);
+  const uint32_t stored_type = LoadLe32(serialized.data() + 12);
+  const uint32_t payload_size = LoadLe32(serialized.data() + 16);
+  if (!std::equal(kPersistentSettingMagic.begin(), kPersistentSettingMagic.end(),
+                  serialized.begin()) ||
+      stored_id != setting->setting_id || stored_type != static_cast<uint32_t>(setting->type) ||
+      payload_size != serialized.size() - kPersistentSettingHeaderSize) {
+    REXSYS_WARN("Ignoring mismatched persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  std::vector<uint8_t> payload(serialized.begin() + kPersistentSettingHeaderSize, serialized.end());
+  Setting::Key key{};
+  key.value = setting->setting_id;
+  if ((setting->type == Setting::Type::WSTRING || setting->type == Setting::Type::BINARY) &&
+      payload.size() > key.size) {
+    REXSYS_WARN("Ignoring oversized persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  if (!setting->Deserialize(payload)) {
+    REXSYS_WARN("Ignoring malformed persistent profile setting {:08X}", setting->setting_id);
+  }
+}
+
+void UserProfile::SavePersistentSetting(UserProfile::Setting* setting) {
+  if (persistence_root_.empty() || setting->is_title_specific() || !setting->is_set) {
+    return;
+  }
+  const std::vector<uint8_t> payload = setting->Serialize();
+  Setting::Key key{};
+  key.value = setting->setting_id;
+  if (payload.size() > kMaxPersistentSettingPayload ||
+      ((setting->type == Setting::Type::WSTRING || setting->type == Setting::Type::BINARY) &&
+       payload.size() > key.size)) {
+    REXSYS_WARN("Refusing oversized persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  std::vector<uint8_t> serialized(kPersistentSettingHeaderSize + payload.size());
+  std::copy(kPersistentSettingMagic.begin(), kPersistentSettingMagic.end(), serialized.begin());
+  StoreLe32(serialized.data() + 8, setting->setting_id);
+  StoreLe32(serialized.data() + 12, static_cast<uint32_t>(setting->type));
+  StoreLe32(serialized.data() + 16, static_cast<uint32_t>(payload.size()));
+  std::copy(payload.begin(), payload.end(), serialized.begin() + kPersistentSettingHeaderSize);
+
+  std::error_code ec;
+  std::filesystem::create_directories(persistence_root_, ec);
+  if (ec) {
+    REXSYS_WARN("Unable to create persistent profile directory");
+    return;
+  }
+  const auto file_path = PersistentSettingPath(persistence_root_, setting->setting_id);
+  std::filesystem::path temporary_path = file_path;
+  temporary_path += ".tmp";
+  std::filesystem::path backup_path = file_path;
+  backup_path += ".bak";
+  {
+    std::ofstream file(temporary_path, std::ios::binary | std::ios::trunc);
+    if (!file || !file.write(reinterpret_cast<const char*>(serialized.data()),
+                             static_cast<std::streamsize>(serialized.size()))) {
+      REXSYS_WARN("Unable to write persistent profile setting {:08X}", setting->setting_id);
+      return;
+    }
+  }
+  std::filesystem::remove(backup_path, ec);
+  ec.clear();
+  if (std::filesystem::exists(file_path, ec)) {
+    ec.clear();
+    std::filesystem::rename(file_path, backup_path, ec);
+    if (ec) {
+      std::filesystem::remove(temporary_path, ec);
+      REXSYS_WARN("Unable to stage persistent profile setting {:08X}", setting->setting_id);
+      return;
+    }
+  }
+  ec.clear();
+  std::filesystem::rename(temporary_path, file_path, ec);
+  if (ec) {
+    std::error_code restore_ec;
+    if (std::filesystem::exists(backup_path, restore_ec)) {
+      std::filesystem::rename(backup_path, file_path, restore_ec);
+    }
+    REXSYS_WARN("Unable to commit persistent profile setting {:08X}", setting->setting_id);
+    return;
+  }
+  std::filesystem::remove(backup_path, ec);
 }
 
 }  // namespace xam

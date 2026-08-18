@@ -64,15 +64,16 @@ KernelState::KernelState(Runtime* emulator)
   function_dispatcher_ = emulator->function_dispatcher();
   file_system_ = emulator->file_system();
 
-  app_manager_ = std::make_unique<xam::AppManager>();
-  user_profile_ = std::make_unique<xam::UserProfile>(REXCVAR_GET(xam_user_signin_state));
-  user_profile_->set_kernel_state(this);
-
   auto user_data_root = emulator_->user_data_root();
   if (!user_data_root.empty()) {
     user_data_root = std::filesystem::absolute(user_data_root);
   }
+
+  app_manager_ = std::make_unique<xam::AppManager>();
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+  user_profile_ = std::make_unique<xam::UserProfile>(REXCVAR_GET(xam_user_signin_state));
+  user_profile_->set_kernel_state(this);
+  user_profile_->SetPersistenceRoot(content_manager_->ResolveGlobalUserProfilePath());
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
