@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include <rex/logging.h>
+#include <rex/kernel/xam/offline_progression.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
 #include <rex/system/flags.h>
@@ -582,6 +583,15 @@ u32 XamShowPlayerReviewUIOffline_entry() {
   return X_ERROR_NOT_LOGGED_ON;
 }
 
+u32 XamShowAchievementsUIOffline_entry(u32 user_index, u32 title_id) {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN(
+        "[OFFLINE] XamShowAchievementsUI unavailable; local achievement state remains active");
+  });
+  return kOfflineAchievementsUiResult;
+}
+
 uint32_t XamShowMessageBoxUIEx_entry() {
   // TODO(tomc): implement properly
   static bool warned = false;
@@ -604,6 +614,7 @@ REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErr
 REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
 REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
 REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
+REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUIOffline_entry)
 
 REX_EXPORT_STUB(__imp__XamIsGuideDisabled);
 REX_EXPORT_STUB(__imp__XamIsMessageBoxActive);
@@ -615,7 +626,6 @@ REX_EXPORT_STUB(__imp__XamNavigate);
 REX_EXPORT_STUB(__imp__XamNavigateBack);
 REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
 REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
 REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
 REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
 REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);

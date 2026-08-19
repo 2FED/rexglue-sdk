@@ -20,6 +20,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel/xam/profile_audit.h>
+#include <rex/kernel/xam/offline_progression.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -53,6 +54,13 @@ namespace {
 constexpr std::array<uint32_t, 3> kMclaProfileSettingIds = {0x1004000C, 0x1004000D, 0x1004000E};
 constexpr uint32_t kMclaProfileBufferSize =
     sizeof(uint32_t) * 2 + sizeof(X_USER_PROFILE_SETTING) * kMclaProfileSettingIds.size();
+
+struct OfflineStatsSpec {
+  be_u32 view_id;
+  be_u32 num_column_ids;
+  be_u16 column_ids[kOfflineStatsMaxColumnsPerSpec];
+};
+static_assert(sizeof(OfflineStatsSpec) == 0x88);
 
 class XamProfileAudit {
  public:
@@ -1223,6 +1231,49 @@ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
   return X_ERROR_SUCCESS;
 }
 
+u32 XamUserCreateStatsEnumerator_entry(u32 title_id, u32 enumerator_type, u64 pivot_user,
+                                       u32 num_rows, u32 num_stats_specs, mapped_void stats_ptr,
+                                       mapped_u32 buffer_size_ptr, mapped_u32 handle_ptr) {
+  if (buffer_size_ptr) {
+    *buffer_size_ptr = 0;
+  }
+  if (handle_ptr) {
+    *handle_ptr = 0;
+  }
+  if (!buffer_size_ptr || !handle_ptr || !pivot_user || !num_rows || !num_stats_specs ||
+      num_stats_specs > kOfflineStatsMaxSpecs || !stats_ptr || enumerator_type > 3) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  const auto* stats_specs = stats_ptr.as<const OfflineStatsSpec*>();
+  std::array<uint32_t, kOfflineStatsMaxSpecs> column_counts{};
+  for (uint32_t i = 0; i < num_stats_specs; ++i) {
+    column_counts[i] = stats_specs[i].num_column_ids;
+  }
+  uint32_t buffer_size = 0;
+  if (!ComputeOfflineStatsBufferSize(
+          num_rows, std::span<const uint32_t>(column_counts.data(), num_stats_specs),
+          &buffer_size)) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto enumerator = object_ref<XStaticUntypedEnumerator>(
+      new XStaticUntypedEnumerator(REX_KERNEL_STATE(), 1, buffer_size));
+  auto result = enumerator->Initialize(0xFF, 0xFB, 0xB0023, 0xB0024, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN(
+        "[OFFLINE] XamUserCreateStatsEnumerator returning an empty leaderboard enumerator");
+  });
+  *buffer_size_ptr = buffer_size;
+  *handle_ptr = enumerator->handle();
+  return X_ERROR_SUCCESS;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -1254,12 +1305,13 @@ REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_e
 REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
 REX_EXPORT(__imp__XamSessionCreateHandle, rex::kernel::xam::XamSessionCreateHandle_entry)
 REX_EXPORT(__imp__XamSessionRefObjByHandle, rex::kernel::xam::XamSessionRefObjByHandle_entry)
+REX_EXPORT(__imp__XamUserCreateStatsEnumerator,
+           rex::kernel::xam::XamUserCreateStatsEnumerator_entry)
 
 REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
 REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
 REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
-REX_EXPORT_STUB(__imp__XamUserCreateStatsEnumerator);
 REX_EXPORT_STUB(__imp__XamUserCreateTitlesPlayedEnumerator);
 REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
 REX_EXPORT_STUB(__imp__XamUserGetAge);

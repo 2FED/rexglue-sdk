@@ -15,6 +15,7 @@
 #include <mutex>
 
 #include <rex/kernel/xam/private.h>
+#include <rex/kernel/xam/offline_progression.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -50,6 +51,14 @@ u32 XamVoiceHeadsetPresent_entry(mapped_void voice_ptr) {
   return 0;
 }
 
+u32 XamVoiceSubmitPacket_entry(mapped_u32 voice_ptr, u32 flags, mapped_u32 packet_ptr) {
+  static std::once_flag log_once;
+  std::call_once(log_once, [] {
+    REXKRNL_WARN("[OFFLINE] XamVoiceSubmitPacket rejected; XHV voice transport is unavailable");
+  });
+  return kOfflineVoiceSubmitResult;
+}
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex
@@ -58,6 +67,7 @@ REX_EXPORT(__imp__XamVoiceIsActiveProcess, rex::kernel::xam::XamVoiceIsActivePro
 REX_EXPORT(__imp__XamVoiceCreate, rex::kernel::xam::XamVoiceCreate_entry)
 REX_EXPORT(__imp__XamVoiceClose, rex::kernel::xam::XamVoiceClose_entry)
 REX_EXPORT(__imp__XamVoiceHeadsetPresent, rex::kernel::xam::XamVoiceHeadsetPresent_entry)
+REX_EXPORT(__imp__XamVoiceSubmitPacket, rex::kernel::xam::XamVoiceSubmitPacket_entry)
 
 REX_EXPORT_STUB(__imp__XamMuteSound);
 REX_EXPORT_STUB(__imp__XamVoiceDisableMicArray);
@@ -73,4 +83,3 @@ REX_EXPORT_STUB(__imp__XamVoiceRecordUserPrivileges);
 REX_EXPORT_STUB(__imp__XamVoiceSetAudioCaptureRoutine);
 REX_EXPORT_STUB(__imp__XamVoiceSetMicArrayBeamAngle);
 REX_EXPORT_STUB(__imp__XamVoiceSetMicArrayIdleUsers);
-REX_EXPORT_STUB(__imp__XamVoiceSubmitPacket);
