@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <string_view>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
 #include <rex/audio/audio_route_audit.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/sdl/audio_config.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -25,6 +28,14 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+
+REXCVAR_DEFINE_STRING(audio_device, "default", "Audio",
+                      "Playback device name (default = operating-system default)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_DOUBLE(audio_volume, 1.0, "Audio", "Host output volume (0.0 = silent, 1.0 = full)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::audio::sdl {
 
@@ -52,14 +63,40 @@ bool SDLAudioDriver::Initialize() {
   }
   sdl_initialized_ = true;
 
+  SDL_AudioDeviceID requested_device = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+  const std::string_view configured_device = REXCVAR_GET(audio_device);
+  if (configured_device != "default") {
+    int playback_device_count = 0;
+    SDL_AudioDeviceID* playback_devices = SDL_GetAudioPlaybackDevices(&playback_device_count);
+    if (!playback_devices) {
+      REXAPU_ERROR("SDL_GetAudioPlaybackDevices() failed: {}", SDL_GetError());
+      return false;
+    }
+    std::vector<PlaybackDeviceConfigEntry> device_entries;
+    device_entries.reserve(static_cast<size_t>(playback_device_count));
+    for (int i = 0; i < playback_device_count; ++i) {
+      const char* device_name = SDL_GetAudioDeviceName(playback_devices[i]);
+      if (device_name) {
+        device_entries.push_back({playback_devices[i], device_name});
+      }
+    }
+    requested_device =
+        static_cast<SDL_AudioDeviceID>(FindPlaybackDeviceByName(configured_device, device_entries));
+    SDL_free(playback_devices);
+    if (!requested_device) {
+      REXAPU_ERROR("Configured audio playback device is unavailable");
+      return false;
+    }
+  }
+  output_volume_ = static_cast<float>(REXCVAR_GET(audio_volume));
+
   SDL_AudioSpec desired_spec = {};
   SDL_AudioSpec obtained_spec = {};
   desired_spec.freq = frame_frequency_;
   desired_spec.format = SDL_AUDIO_F32LE;
   desired_spec.channels = frame_channels_;
   sdl_device_channels_ = frame_channels_;
-  sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
-                                          SDLCallback, this);
+  sdl_stream_ = SDL_OpenAudioDeviceStream(requested_device, &desired_spec, SDLCallback, this);
   if (!sdl_stream_) {
     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
     return false;
@@ -81,8 +118,7 @@ bool SDLAudioDriver::Initialize() {
     sdl_stream_ = nullptr;
     desired_spec.channels = 2;
     sdl_device_channels_ = 2;
-    sdl_stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired_spec,
-                                            SDLCallback, this);
+    sdl_stream_ = SDL_OpenAudioDeviceStream(requested_device, &desired_spec, SDLCallback, this);
     if (!sdl_stream_) {
       REXAPU_ERROR("SDL_OpenAudioDeviceStream() stereo fallback failed: {}", SDL_GetError());
       return false;
@@ -292,6 +328,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
         }
+        ApplyOutputVolume(data, static_cast<size_t>(sample_count), driver->output_volume_);
       }
       const bool submitted = SDL_PutAudioStreamData(stream, data, len);
       RecordAudioRouteDeviceFrame(data, sample_count, driver->sdl_device_channels_, submitted);

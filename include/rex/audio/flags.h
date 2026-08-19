@@ -14,4 +14,6 @@
 #include <rex/cvar.h>
 
 REXCVAR_DECLARE(bool, audio_mute);
+REXCVAR_DECLARE(std::string, audio_device);
+REXCVAR_DECLARE(double, audio_volume);
 REXCVAR_DECLARE(bool, ffmpeg_verbose);

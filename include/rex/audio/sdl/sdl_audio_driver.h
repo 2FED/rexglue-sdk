@@ -47,6 +47,7 @@ class SDLAudioDriver : public AudioDriver {
   bool sdl_event_watch_registered_ = false;
   bool stream_paused_ = false;
   uint8_t sdl_device_channels_ = 0;
+  float output_volume_ = 1.0f;
   std::string physical_device_name_;
 
   static const uint32_t frame_frequency_ = 48000;
