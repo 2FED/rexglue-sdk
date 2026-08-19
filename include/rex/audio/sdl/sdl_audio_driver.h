@@ -14,6 +14,7 @@
 #include <mutex>
 #include <queue>
 #include <stack>
+#include <string>
 
 #include <rex/audio/audio_driver.h>
 #include <rex/thread.h>
@@ -29,9 +30,13 @@ class SDLAudioDriver : public AudioDriver {
 
   bool Initialize();
   void SubmitFrame(uint32_t frame_ptr) override;
+  bool Pause() override;
+  bool Resume() override;
+  bool PollDefaultDeviceChange() override;
   void Shutdown();
 
  protected:
+  static bool SDLCALL SDLEventWatch(void* userdata, SDL_Event* event);
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
 
@@ -39,7 +44,10 @@ class SDLAudioDriver : public AudioDriver {
 
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
+  bool sdl_event_watch_registered_ = false;
+  bool stream_paused_ = false;
   uint8_t sdl_device_channels_ = 0;
+  std::string physical_device_name_;
 
   static const uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;

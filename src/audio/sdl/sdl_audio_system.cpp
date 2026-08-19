@@ -10,6 +10,7 @@
  */
 
 #include <rex/audio/flags.h>
+#include <rex/audio/audio_route_audit.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 
@@ -34,6 +35,7 @@ X_STATUS SDLAudioSystem::CreateDriver([[maybe_unused]] size_t index,
   assert_not_null(out_driver);
   auto driver = new SDLAudioDriver(memory_, semaphore);
   if (!driver->Initialize()) {
+    RecordAudioStabilityDriver(false, 0);
     driver->Shutdown();
     delete driver;
     return X_STATUS_UNSUCCESSFUL;

@@ -22,6 +22,9 @@ class AudioDriver {
   virtual ~AudioDriver();
 
   virtual void SubmitFrame(uint32_t samples_ptr) = 0;
+  virtual bool Pause() { return true; }
+  virtual bool Resume() { return true; }
+  virtual bool PollDefaultDeviceChange() { return false; }
 
  protected:
   inline uint8_t* TranslatePhysical(uint32_t guest_address) const {

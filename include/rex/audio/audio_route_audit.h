@@ -13,6 +13,7 @@
 
 REXCVAR_DECLARE(bool, sdl_audio_route_audit);
 REXCVAR_DECLARE(bool, sdl_audio_event_audit);
+REXCVAR_DECLARE(bool, sdl_audio_stability_audit);
 
 namespace rex::audio {
 
@@ -23,6 +24,14 @@ enum class AudioEventPhase : uint32_t {
   kEngine,
   kCollision,
   kUi,
+  kCount,
+};
+
+enum class AudioDeviceEvent : uint32_t {
+  kAdded = 0,
+  kRemoved,
+  kFormatChanged,
+  kMigrated,
   kCount,
 };
 
@@ -41,6 +50,10 @@ const char* AudioEventPhaseName(AudioEventPhase phase);
 bool IsAudioEventPhaseOrderValid(uint32_t expected_index, AudioEventPhase phase);
 bool IsAudioEventPhaseHealthy(uint64_t frames, uint64_t nonzero, uint64_t invalid,
                               uint64_t submit_failures);
+const char* AudioDeviceEventName(AudioDeviceEvent event);
+bool IsAudioStabilityHealthy(uint64_t driver_success, uint64_t pause_success,
+                             uint64_t resume_success, uint64_t resume_recoveries,
+                             uint64_t device_events, uint64_t device_recoveries, uint64_t failures);
 
 void RecordAudioRouteClient(bool success, uint32_t index);
 void RecordAudioRouteSubmittedFrame(const float* samples, size_t sample_count);
@@ -50,6 +63,12 @@ void RecordAudioRouteQueueDepth(size_t depth);
 void RecordAudioRouteStarvation();
 void RecordAudioRouteXmaFrame(const uint8_t* samples, size_t byte_count);
 void EmitAudioRouteAuditSummary(const char* phase);
+void RecordAudioStabilityDriver(bool success, uint32_t channels);
+void RecordAudioStabilityPause(bool paused, bool success);
+void PrepareAudioStabilityResume();
+bool ArmAudioStabilityDeviceSwitch();
+void RecordAudioStabilityDeviceEvent(AudioDeviceEvent event);
+void EmitAudioStabilityAuditSummary(const char* phase);
 bool BeginAudioEventPhase(AudioEventPhase phase);
 bool EndAudioEventPhase(AudioEventPhase phase);
 void EmitAudioEventAuditSummary();

@@ -359,10 +359,22 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
 }
 
 void AudioSystem::Pause() {
-  if (paused_) {
+  if (paused_.exchange(true)) {
     return;
   }
-  paused_ = true;
+
+  bool driver_success = true;
+  size_t driver_count = 0;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (size_t i = 0; i < kMaximumClientCount; ++i) {
+      if (clients_[i].in_use) {
+        ++driver_count;
+        driver_success &= clients_[i].driver->Pause();
+      }
+    }
+  }
+  RecordAudioStabilityPause(true, driver_count != 0 && driver_success);
 
   // Kind of a hack, but it works.
   shutdown_event_->Set();
@@ -372,14 +384,36 @@ void AudioSystem::Pause() {
 }
 
 void AudioSystem::Resume() {
-  if (!paused_) {
+  if (!paused_.exchange(false)) {
     return;
   }
-  paused_ = false;
 
   resume_event_->Set();
-
   xma_decoder_->Resume();
+
+  PrepareAudioStabilityResume();
+  bool driver_success = true;
+  size_t driver_count = 0;
+  auto global_lock = global_critical_region_.Acquire();
+  for (size_t i = 0; i < kMaximumClientCount; ++i) {
+    if (clients_[i].in_use) {
+      ++driver_count;
+      driver_success &= clients_[i].driver->Resume();
+    }
+  }
+  global_lock.unlock();
+  RecordAudioStabilityPause(false, driver_count != 0 && driver_success);
+}
+
+bool AudioSystem::PollDefaultDeviceChanges() {
+  bool changed = false;
+  auto global_lock = global_critical_region_.Acquire();
+  for (size_t i = 0; i < kMaximumClientCount; ++i) {
+    if (clients_[i].in_use) {
+      changed |= clients_[i].driver->PollDefaultDeviceChange();
+    }
+  }
+  return changed;
 }
 
 }  // namespace rex::audio

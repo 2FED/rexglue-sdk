@@ -20,6 +20,9 @@ REXCVAR_DEFINE_BOOL(sdl_audio_route_audit, false, "Audio",
 REXCVAR_DEFINE_BOOL(sdl_audio_event_audit, false, "Audio",
                     "Emit bounded privacy-safe audio event-window evidence")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sdl_audio_stability_audit, false, "Audio",
+                    "Emit bounded privacy-safe pause and default-device recovery evidence")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::audio {
 namespace {
@@ -194,6 +197,239 @@ class AudioRouteAudit {
   uint32_t submit_peak_ppm_ = 0, device_peak_ppm_ = 0, xma_peak_ppm_ = 0;
 };
 
+class AudioStabilityAudit {
+ public:
+  void Driver(bool success, uint32_t channels) {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked()) {
+      return;
+    }
+    ++driver_calls_;
+    driver_success_ += success;
+    failures_ += !success;
+    if (!driver_recorded_) {
+      REXAPU_INFO(
+          "SDL_AUDIO_STABILITY_DRIVER v=1 event=open result={:08X} "
+          "source_channels={}",
+          success ? 0u : 0xC0000001u, channels);
+      driver_recorded_ = true;
+    }
+  }
+
+  void Pause(bool paused, bool success) {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_) {
+      return;
+    }
+    const bool order_valid = paused ? !paused_ && !resume_prepared_ : resume_prepared_;
+    if (paused) {
+      ++pause_calls_;
+      pause_success_ += success;
+      if (!output_nonzero_) {
+        ++failures_;
+      }
+    } else {
+      ++resume_calls_;
+      resume_success_ += success;
+    }
+    if (!order_valid || !success) {
+      ++failures_;
+    }
+    if (paused && success && order_valid) {
+      paused_ = true;
+    } else if (!paused && order_valid) {
+      if (!success) {
+        paused_ = true;
+        pending_resume_recovery_ = false;
+      }
+      resume_prepared_ = false;
+    }
+    REXAPU_INFO(
+        "SDL_AUDIO_STABILITY_STATE v=1 event={} result={:08X} order_valid={} "
+        "cycle={}",
+        paused ? "pause" : "resume", success ? 0u : 0xC0000001u, order_valid ? 1 : 0,
+        paused ? pause_calls_ : resume_calls_);
+    if (!paused && success && order_valid && resume_output_seen_) {
+      ++resume_recoveries_;
+      pending_resume_recovery_ = false;
+      REXAPU_INFO(
+          "SDL_AUDIO_STABILITY_RECOVERY v=1 source=pause cycle={} "
+          "nonzero=1 result=00000000",
+          resume_recoveries_);
+    }
+    if (!paused) {
+      resume_output_seen_ = false;
+    }
+  }
+
+  void PrepareResume() {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_) {
+      return;
+    }
+    if (!paused_ || resume_prepared_) {
+      ++failures_;
+      return;
+    }
+    paused_ = false;
+    resume_prepared_ = true;
+    resume_output_seen_ = false;
+    pending_resume_recovery_ = true;
+  }
+
+  void DeviceEvent(AudioDeviceEvent event) {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_) {
+      return;
+    }
+    // SDL may publish unrelated playback topology during startup. The
+    // stability contract only attributes events that occur after the app has
+    // completed both pause/resume cycles and explicitly armed the operator's
+    // device-switch window.
+    if (!device_armed_) {
+      return;
+    }
+    if (event >= AudioDeviceEvent::kCount) {
+      ++failures_;
+      return;
+    }
+    if (device_events_ >= 16) {
+      ++failures_;
+      return;
+    }
+    ++device_events_;
+    pending_device_recovery_ = true;
+    const uint32_t event_index = static_cast<uint32_t>(event);
+    if (!device_event_recorded_[event_index]) {
+      REXAPU_INFO("SDL_AUDIO_STABILITY_DEVICE v=1 event={} playback=1 sequence={}",
+                  AudioDeviceEventName(event), device_events_);
+      device_event_recorded_[event_index] = true;
+    }
+  }
+
+  bool ArmDeviceSwitch() {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_ || device_armed_) {
+      return false;
+    }
+    const bool ready = driver_success_ > 0 && output_nonzero_ > 0 && pause_success_ == 2 &&
+                       resume_success_ == 2 && resume_recoveries_ == 2 && !paused_ &&
+                       !resume_prepared_ && !pending_resume_recovery_ && failures_ == 0;
+    if (!ready) {
+      ++failures_;
+      return false;
+    }
+    device_armed_ = true;
+    REXAPU_INFO(
+        "SDL_AUDIO_STABILITY_READY v=1 phase=device-switch "
+        "pause_recoveries=2 output_nonzero={} status=READY",
+        output_nonzero_);
+    return true;
+  }
+
+  void Output(const AudioSampleClassification& classification, bool submitted) {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_) {
+      return;
+    }
+    if (!submitted || !classification.finite) {
+      ++failures_;
+      return;
+    }
+    if (!classification.nonzero) {
+      return;
+    }
+    ++output_nonzero_;
+    if (paused_) {
+      // A backend callback already in flight when Pause completes may still
+      // reach telemetry. It is not evidence of a failed SDL pause, and it
+      // must not be counted as post-resume recovery.
+      return;
+    }
+    if (resume_prepared_) {
+      resume_output_seen_ = true;
+      return;
+    }
+    if (pending_resume_recovery_) {
+      ++resume_recoveries_;
+      pending_resume_recovery_ = false;
+      REXAPU_INFO(
+          "SDL_AUDIO_STABILITY_RECOVERY v=1 source=pause cycle={} "
+          "nonzero=1 result=00000000",
+          resume_recoveries_);
+    }
+    if (pending_device_recovery_) {
+      ++device_recoveries_;
+      pending_device_recovery_ = false;
+      REXAPU_INFO(
+          "SDL_AUDIO_STABILITY_RECOVERY v=1 source=device cycle={} "
+          "nonzero=1 result=00000000",
+          device_recoveries_);
+    }
+  }
+
+  void Summary(const char* phase) {
+    std::lock_guard lock(mutex_);
+    if (!BeginLocked() || summary_) {
+      return;
+    }
+    summary_ = true;
+    const bool phase_valid = phase && std::string_view(phase) == "title";
+    const bool pass =
+        phase_valid && device_armed_ && output_nonzero_ > 0 && !paused_ && !resume_prepared_ &&
+        !pending_resume_recovery_ && !pending_device_recovery_ &&
+        IsAudioStabilityHealthy(driver_success_, pause_success_, resume_success_,
+                                resume_recoveries_, device_events_, device_recoveries_, failures_);
+    enabled_ = false;
+    REXAPU_INFO(
+        "SDL_AUDIO_STABILITY_SUMMARY v=1 phase={} status={} driver_calls={} "
+        "driver_success={} output_nonzero={} pause_calls={} pause_success={} "
+        "resume_calls={} resume_success={} resume_recoveries={} "
+        "device_events={} device_recoveries={} failures={} dropped_records=0",
+        phase_valid ? "title" : "invalid", pass ? "PASS" : "FAIL", driver_calls_, driver_success_,
+        output_nonzero_, pause_calls_, pause_success_, resume_calls_, resume_success_,
+        resume_recoveries_, device_events_, device_recoveries_, failures_);
+  }
+
+ private:
+  bool BeginLocked() {
+    if (!enabled_ || summary_) {
+      return false;
+    }
+    if (!configured_) {
+      REXAPU_INFO(
+          "SDL_AUDIO_STABILITY_CONFIG v=1 enabled=1 backend=sdl default_device=1 "
+          "pause_cycles=2 device_identity=redacted");
+      configured_ = true;
+    }
+    return true;
+  }
+
+  std::mutex mutex_;
+  bool enabled_ = REXCVAR_GET(sdl_audio_stability_audit);
+  bool configured_ = false;
+  bool summary_ = false;
+  bool driver_recorded_ = false;
+  bool paused_ = false;
+  bool resume_prepared_ = false;
+  bool resume_output_seen_ = false;
+  bool pending_resume_recovery_ = false;
+  bool pending_device_recovery_ = false;
+  bool device_armed_ = false;
+  bool device_event_recorded_[static_cast<uint32_t>(AudioDeviceEvent::kCount)] = {};
+  uint64_t driver_calls_ = 0;
+  uint64_t driver_success_ = 0;
+  uint64_t output_nonzero_ = 0;
+  uint64_t pause_calls_ = 0;
+  uint64_t pause_success_ = 0;
+  uint64_t resume_calls_ = 0;
+  uint64_t resume_success_ = 0;
+  uint64_t resume_recoveries_ = 0;
+  uint64_t device_events_ = 0;
+  uint64_t device_recoveries_ = 0;
+  uint64_t failures_ = 0;
+};
+
 class AudioEventAudit {
  public:
   bool Begin(AudioEventPhase phase) {
@@ -310,6 +546,11 @@ AudioRouteAudit& GetAudioRouteAudit() {
   return audit;
 }
 
+AudioStabilityAudit& GetAudioStabilityAudit() {
+  static AudioStabilityAudit audit;
+  return audit;
+}
+
 AudioEventAudit& GetAudioEventAudit() {
   static AudioEventAudit audit;
   return audit;
@@ -374,6 +615,29 @@ bool IsAudioEventPhaseHealthy(uint64_t frames, uint64_t nonzero, uint64_t invali
   return frames > 0 && nonzero > 0 && nonzero <= frames && invalid == 0 && submit_failures == 0;
 }
 
+const char* AudioDeviceEventName(AudioDeviceEvent event) {
+  switch (event) {
+    case AudioDeviceEvent::kAdded:
+      return "added";
+    case AudioDeviceEvent::kRemoved:
+      return "removed";
+    case AudioDeviceEvent::kFormatChanged:
+      return "format-changed";
+    case AudioDeviceEvent::kMigrated:
+      return "migrated";
+    default:
+      return "invalid";
+  }
+}
+
+bool IsAudioStabilityHealthy(uint64_t driver_success, uint64_t pause_success,
+                             uint64_t resume_success, uint64_t resume_recoveries,
+                             uint64_t device_events, uint64_t device_recoveries,
+                             uint64_t failures) {
+  return driver_success > 0 && pause_success == 2 && resume_success == 2 &&
+         resume_recoveries == 2 && device_events > 0 && device_recoveries > 0 && failures == 0;
+}
+
 void RecordAudioRouteClient(bool success, uint32_t index) {
   GetAudioRouteAudit().Client(success, index);
 }
@@ -385,6 +649,7 @@ void RecordAudioRouteDeviceFrame(const float* samples, size_t sample_count, uint
   const auto classification = ClassifyNativeFloatAudio(samples, sample_count);
   GetAudioRouteAudit().Device(classification, channels, submitted);
   GetAudioEventAudit().Device(classification, submitted);
+  GetAudioStabilityAudit().Output(classification, submitted);
   if (submitted) {
     GetAudioRouteAudit().Consumed();
   }
@@ -400,6 +665,30 @@ void RecordAudioRouteXmaFrame(const uint8_t* samples, size_t byte_count) {
 }
 void EmitAudioRouteAuditSummary(const char* phase) {
   GetAudioRouteAudit().Summary(phase);
+}
+
+void RecordAudioStabilityDriver(bool success, uint32_t channels) {
+  GetAudioStabilityAudit().Driver(success, channels);
+}
+
+void RecordAudioStabilityPause(bool paused, bool success) {
+  GetAudioStabilityAudit().Pause(paused, success);
+}
+
+void PrepareAudioStabilityResume() {
+  GetAudioStabilityAudit().PrepareResume();
+}
+
+bool ArmAudioStabilityDeviceSwitch() {
+  return GetAudioStabilityAudit().ArmDeviceSwitch();
+}
+
+void RecordAudioStabilityDeviceEvent(AudioDeviceEvent event) {
+  GetAudioStabilityAudit().DeviceEvent(event);
+}
+
+void EmitAudioStabilityAuditSummary(const char* phase) {
+  GetAudioStabilityAudit().Summary(phase);
 }
 
 bool BeginAudioEventPhase(AudioEventPhase phase) {

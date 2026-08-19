@@ -51,9 +51,10 @@ class AudioSystem : public system::IAudioSystem {
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
-  bool is_paused() const { return paused_; }
+  bool is_paused() const { return paused_.load(); }
   void Pause();
   void Resume();
+  bool PollDefaultDeviceChanges();
 
  protected:
   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
@@ -93,7 +94,7 @@ class AudioSystem : public system::IAudioSystem {
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
 
-  bool paused_ = false;
+  std::atomic<bool> paused_ = false;
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
 };

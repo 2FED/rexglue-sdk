@@ -99,6 +99,22 @@ bool SDLAudioDriver::Initialize() {
     return false;
   }
 
+  if (REXCVAR_GET(sdl_audio_stability_audit)) {
+    const char* physical_device_name = SDL_GetAudioDeviceName(sdl_device);
+    if (!physical_device_name) {
+      REXAPU_ERROR("SDL_GetAudioDeviceName() failed for audio stability monitoring: {}",
+                   SDL_GetError());
+      return false;
+    }
+    physical_device_name_ = physical_device_name;
+    if (!SDL_AddEventWatch(SDLEventWatch, this)) {
+      REXAPU_ERROR("SDL_AddEventWatch() failed for audio device monitoring: {}", SDL_GetError());
+      return false;
+    }
+    sdl_event_watch_registered_ = true;
+    RecordAudioStabilityDriver(true, sdl_device_channels_);
+  }
+
   return true;
 }
 
@@ -133,7 +149,52 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 }
 
+bool SDLAudioDriver::Pause() {
+  if (!sdl_stream_ || stream_paused_) {
+    return sdl_stream_ != nullptr;
+  }
+  const bool success = SDL_PauseAudioStreamDevice(sdl_stream_);
+  if (success) {
+    stream_paused_ = true;
+  } else {
+    REXAPU_ERROR("SDL_PauseAudioStreamDevice() failed: {}", SDL_GetError());
+  }
+  return success;
+}
+
+bool SDLAudioDriver::Resume() {
+  if (!sdl_stream_ || !stream_paused_) {
+    return sdl_stream_ != nullptr;
+  }
+  const bool success = SDL_ResumeAudioStreamDevice(sdl_stream_);
+  if (success) {
+    stream_paused_ = false;
+  } else {
+    REXAPU_ERROR("SDL_ResumeAudioStreamDevice() failed: {}", SDL_GetError());
+  }
+  return success;
+}
+
+bool SDLAudioDriver::PollDefaultDeviceChange() {
+  if (!sdl_stream_ || !REXCVAR_GET(sdl_audio_stability_audit)) {
+    return false;
+  }
+  const SDL_AudioDeviceID logical_device = SDL_GetAudioStreamDevice(sdl_stream_);
+  const char* physical_device_name =
+      logical_device ? SDL_GetAudioDeviceName(logical_device) : nullptr;
+  if (!physical_device_name || physical_device_name_ == physical_device_name) {
+    return false;
+  }
+  physical_device_name_ = physical_device_name;
+  RecordAudioStabilityDeviceEvent(AudioDeviceEvent::kMigrated);
+  return true;
+}
+
 void SDLAudioDriver::Shutdown() {
+  if (sdl_event_watch_registered_) {
+    SDL_RemoveEventWatch(SDLEventWatch, this);
+    sdl_event_watch_registered_ = false;
+  }
   if (sdl_stream_) {
     SDL_DestroyAudioStream(sdl_stream_);
     sdl_stream_ = nullptr;
@@ -151,6 +212,36 @@ void SDLAudioDriver::Shutdown() {
     delete[] frames_queued_.front();
     frames_queued_.pop();
   }
+  physical_device_name_.clear();
+}
+
+bool SDLCALL SDLAudioDriver::SDLEventWatch(void* userdata, SDL_Event* event) {
+  if (!userdata || !event) {
+    return false;
+  }
+  switch (event->type) {
+    case SDL_EVENT_AUDIO_DEVICE_ADDED:
+      if (event->adevice.recording) {
+        break;
+      }
+      RecordAudioStabilityDeviceEvent(AudioDeviceEvent::kAdded);
+      break;
+    case SDL_EVENT_AUDIO_DEVICE_REMOVED:
+      if (event->adevice.recording) {
+        break;
+      }
+      RecordAudioStabilityDeviceEvent(AudioDeviceEvent::kRemoved);
+      break;
+    case SDL_EVENT_AUDIO_DEVICE_FORMAT_CHANGED:
+      if (event->adevice.recording) {
+        break;
+      }
+      RecordAudioStabilityDeviceEvent(AudioDeviceEvent::kFormatChanged);
+      break;
+    default:
+      break;
+  }
+  return false;
 }
 
 void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,

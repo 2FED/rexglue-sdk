@@ -83,3 +83,28 @@ TEST_CASE("audio event phases require finite nonzero submitted output", "[audio]
   CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 90, 1, 0));
   CHECK_FALSE(rex::audio::IsAudioEventPhaseHealthy(100, 90, 0, 1));
 }
+
+TEST_CASE("audio stability uses a privacy-safe device-event vocabulary",
+          "[audio][stability-audit]") {
+  CHECK(std::string_view(rex::audio::AudioDeviceEventName(rex::audio::AudioDeviceEvent::kAdded)) ==
+        "added");
+  CHECK(std::string_view(
+            rex::audio::AudioDeviceEventName(rex::audio::AudioDeviceEvent::kRemoved)) == "removed");
+  CHECK(std::string_view(rex::audio::AudioDeviceEventName(
+            rex::audio::AudioDeviceEvent::kFormatChanged)) == "format-changed");
+  CHECK(std::string_view(rex::audio::AudioDeviceEventName(
+            rex::audio::AudioDeviceEvent::kMigrated)) == "migrated");
+  CHECK(std::string_view(rex::audio::AudioDeviceEventName(rex::audio::AudioDeviceEvent::kCount)) ==
+        "invalid");
+}
+
+TEST_CASE("audio stability requires two pause recoveries and a device recovery",
+          "[audio][stability-audit]") {
+  CHECK(rex::audio::IsAudioStabilityHealthy(1, 2, 2, 2, 1, 1, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(0, 2, 2, 2, 1, 1, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(1, 1, 1, 1, 1, 1, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(1, 2, 2, 1, 1, 1, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(1, 2, 2, 2, 0, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(1, 2, 2, 2, 1, 0, 0));
+  CHECK_FALSE(rex::audio::IsAudioStabilityHealthy(1, 2, 2, 2, 1, 1, 1));
+}
