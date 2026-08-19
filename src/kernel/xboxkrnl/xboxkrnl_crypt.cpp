@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <atomic>
 
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -29,6 +30,7 @@
 #endif
 
 #include "crypto/TinySHA1.hpp"
+#include "crypto_compat.h"
 #include "crypto/des/des.cpp"
 #include "crypto/des/des.h"
 #include "crypto/des/des3.h"
@@ -639,8 +641,21 @@ u32 XeKeysHmacShaUsingKey_entry(mapped_void obscured_key, mapped_void inp_1, u32
 }
 
 u32 XeKeysConsolePrivateKeySign_entry(mapped_void hash, mapped_void signature) {
-  REXKRNL_DEBUG("XeKeysConsolePrivateKeySign - stub");
-  return 0;  // Success
+  X_STATUS result = GetConsolePrivateKeySignResult(bool(hash), bool(signature));
+  if (result == X_STATUS_INVALID_PARAMETER) {
+    return result;
+  }
+
+  // ReXGlue has no physical console private key. MCLA ignores this status and
+  // retains its caller-provided cache signature buffer, so expose the missing
+  // capability instead of reporting false cryptographic success.
+  static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+  if (!logged.test_and_set(std::memory_order_relaxed)) {
+    REXKRNL_WARN(
+        "[UNAVAILABLE] XeKeysConsolePrivateKeySign has no console private key; "
+        "caller buffer preserved");
+  }
+  return result;
 }
 
 u32 XeKeysConsoleSignatureVerification_entry(mapped_void hash, mapped_void signature,

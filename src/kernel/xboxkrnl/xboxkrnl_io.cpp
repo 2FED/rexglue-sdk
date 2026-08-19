@@ -12,6 +12,8 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -28,6 +30,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+#include "io_compat.h"
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -729,8 +733,23 @@ u32 IoCreateDevice_entry(u32 device_struct, u32 r4, u32 r5, u32 r6, u32 r7, mapp
 }
 
 u32 IoDismountVolumeByFileHandle_entry(u32 handle) {
-  REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
-  return X_STATUS_SUCCESS;
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(handle);
+  X_STATUS result = GetDismountVolumeByFileHandleResult(bool(file));
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  // ReXGlue VFS mounts are owned by the host runtime rather than by guest
+  // file handles. MCLA uses this call after finishing its cache-volume write,
+  // so retaining the host mount while acknowledging a valid file handle is
+  // the compatible operation.
+  static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+  if (!logged.test_and_set(std::memory_order_relaxed)) {
+    REXKRNL_INFO(
+        "[COMPAT] IoDismountVolumeByFileHandle accepted; host VFS mount is "
+        "runtime-owned");
+  }
+  return result;
 }
 
 u32 IoDismountVolumeByName_entry(ppc_ptr_t<X_ANSI_STRING> name) {

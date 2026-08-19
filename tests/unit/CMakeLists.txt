@@ -11,6 +11,7 @@ add_executable(unit_tests
     kernel/offline_service_route_test.cpp
     kernel/locale_route_test.cpp
     kernel/rtl_critical_section_test.cpp
+    kernel/xboxkrnl_reached_compat_test.cpp
     kernel/xam_user_profile_test.cpp
     system/xam_content_persistence_test.cpp
     kernel/xmp_fallback_test.cpp
