@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -333,6 +334,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+
+  bool InitializePerformanceTelemetry();
+  void ShutdownPerformanceTelemetry();
+  void ConsumePerformanceTimestamp(uint32_t slot);
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
@@ -458,6 +463,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kQueueFrames] = {};
+
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> performance_timestamp_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> performance_timestamp_readback_;
+  uint64_t* performance_timestamp_mapping_ = nullptr;
+  uint64_t performance_timestamp_frequency_ = 0;
+  uint64_t performance_timestamp_submissions_[kQueueFrames] = {};
+  uint64_t performance_timestamp_frames_[kQueueFrames] = {};
+  bool performance_timestamp_begin_pending_ = false;
+  std::chrono::steady_clock::time_point performance_cpu_frame_start_{};
 
   struct CommandAllocator {
     ID3D12CommandAllocator* command_allocator;

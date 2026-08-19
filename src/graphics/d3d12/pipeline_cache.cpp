@@ -29,6 +29,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_audit.h>
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -1093,8 +1094,19 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             D3D12Shader::D3D12Translation& translation,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
                                             IDxcCompiler* dxc_compiler) {
+  const bool performance_audit_enabled = rex::perf::IsFrameAuditEnabled();
+  const auto performance_start = performance_audit_enabled
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
-  auto audit_translation = [this, &shader, &translation](bool succeeded) {
+  auto audit_translation = [this, &shader, &translation, performance_audit_enabled,
+                            performance_start](bool succeeded) {
+    if (performance_audit_enabled) {
+      rex::perf::RecordShaderTranslation(
+          succeeded, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - performance_start)
+                                  .count()));
+    }
     std::lock_guard<std::mutex> audit_lock(render_audit_mutex_);
     if (!render_audit_enabled_) {
       return;
@@ -2736,8 +2748,19 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     const PipelineRuntimeDescription& runtime_description) {
+  const bool performance_audit_enabled = rex::perf::IsFrameAuditEnabled();
+  const auto performance_start = performance_audit_enabled
+                                     ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
   const PipelineDescription& description = runtime_description.description;
-  auto audit_pso = [this, &runtime_description, &description](bool succeeded, HRESULT result) {
+  auto audit_pso = [this, &runtime_description, &description, performance_audit_enabled,
+                    performance_start](bool succeeded, HRESULT result) {
+    if (performance_audit_enabled) {
+      rex::perf::RecordPipelineCreation(
+          succeeded, uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - performance_start)
+                                  .count()));
+    }
     std::lock_guard<std::mutex> audit_lock(render_audit_mutex_);
     if (!render_audit_enabled_) {
       return;

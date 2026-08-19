@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstring>
+#include <chrono>
 #include <sstream>
 #include <utility>
 
@@ -20,6 +21,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/frame_audit.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
@@ -930,6 +932,11 @@ bool D3D12CommandProcessor::SetupContext() {
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
 
+  if (rex::perf::InitializeFrameAudit() && !InitializePerformanceTelemetry()) {
+    REXGPU_ERROR("Failed to initialize required D3D12 performance telemetry");
+    return false;
+  }
+
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
@@ -1678,6 +1685,10 @@ void D3D12CommandProcessor::EmitRenderAuditSummary(const char* phase) {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  for (uint32_t slot = 0; slot < kQueueFrames; ++slot) {
+    ConsumePerformanceTimestamp(slot);
+  }
+  ShutdownPerformanceTelemetry();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -3544,6 +3555,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
   if (is_opening_frame) {
+    const uint32_t performance_slot = uint32_t(frame_current_ % kQueueFrames);
+    ConsumePerformanceTimestamp(performance_slot);
+    if (performance_timestamp_query_heap_) {
+      rex::perf::BeginGuestFrame(frame_current_);
+      performance_cpu_frame_start_ = std::chrono::steady_clock::now();
+      performance_timestamp_begin_pending_ = true;
+    }
+
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
     // before reclaiming resources tracked with the frame number.
@@ -3694,7 +3713,23 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    const uint32_t performance_slot = uint32_t(frame_current_ % kQueueFrames);
+    if (performance_timestamp_begin_pending_ && performance_timestamp_query_heap_) {
+      command_list_->EndQuery(performance_timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                              performance_slot * 2);
+      performance_timestamp_begin_pending_ = false;
+    }
     deferred_command_list_.Execute(command_list_, command_list_1_);
+    if (is_closing_frame && performance_timestamp_query_heap_) {
+      command_list_->EndQuery(performance_timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                              performance_slot * 2 + 1);
+      command_list_->ResolveQueryData(performance_timestamp_query_heap_.Get(),
+                                      D3D12_QUERY_TYPE_TIMESTAMP, performance_slot * 2, 2,
+                                      performance_timestamp_readback_.Get(),
+                                      uint64_t(performance_slot) * 2 * sizeof(uint64_t));
+      performance_timestamp_frames_[performance_slot] = frame_current_;
+      performance_timestamp_submissions_[performance_slot] = submission_current_;
+    }
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -3721,6 +3756,13 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    if (performance_timestamp_query_heap_) {
+      const uint64_t cpu_us =
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - performance_cpu_frame_start_)
+                       .count());
+      rex::perf::RecordCpuFrame(frame_current_, cpu_us);
+    }
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
@@ -3771,6 +3813,74 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   return true;
+}
+
+bool D3D12CommandProcessor::InitializePerformanceTelemetry() {
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !queue ||
+      FAILED(queue->GetTimestampFrequency(&performance_timestamp_frequency_)) ||
+      !performance_timestamp_frequency_) {
+    return false;
+  }
+  D3D12_QUERY_HEAP_DESC query_desc = {};
+  query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  query_desc.Count = kQueueFrames * 2;
+  if (FAILED(
+          device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&performance_timestamp_query_heap_)))) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kQueueFrames * 2,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                             GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                             &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&performance_timestamp_readback_)))) {
+    performance_timestamp_query_heap_.Reset();
+    return false;
+  }
+  D3D12_RANGE read_range = {0, sizeof(uint64_t) * kQueueFrames * 2};
+  void* mapping = nullptr;
+  if (FAILED(performance_timestamp_readback_->Map(0, &read_range, &mapping))) {
+    performance_timestamp_readback_.Reset();
+    performance_timestamp_query_heap_.Reset();
+    return false;
+  }
+  performance_timestamp_mapping_ = reinterpret_cast<uint64_t*>(mapping);
+  std::memset(performance_timestamp_submissions_, 0, sizeof(performance_timestamp_submissions_));
+  std::memset(performance_timestamp_frames_, 0, sizeof(performance_timestamp_frames_));
+  return true;
+}
+
+void D3D12CommandProcessor::ShutdownPerformanceTelemetry() {
+  if (performance_timestamp_readback_ && performance_timestamp_mapping_) {
+    performance_timestamp_readback_->Unmap(0, nullptr);
+  }
+  performance_timestamp_mapping_ = nullptr;
+  performance_timestamp_readback_.Reset();
+  performance_timestamp_query_heap_.Reset();
+  performance_timestamp_frequency_ = 0;
+  performance_timestamp_begin_pending_ = false;
+  std::memset(performance_timestamp_submissions_, 0, sizeof(performance_timestamp_submissions_));
+  std::memset(performance_timestamp_frames_, 0, sizeof(performance_timestamp_frames_));
+}
+
+void D3D12CommandProcessor::ConsumePerformanceTimestamp(uint32_t slot) {
+  if (!performance_timestamp_mapping_ || slot >= kQueueFrames ||
+      !performance_timestamp_submissions_[slot] ||
+      performance_timestamp_submissions_[slot] > submission_completed_) {
+    return;
+  }
+  const uint64_t start = performance_timestamp_mapping_[slot * 2];
+  const uint64_t end = performance_timestamp_mapping_[slot * 2 + 1];
+  if (end >= start && performance_timestamp_frequency_) {
+    const uint64_t gpu_us =
+        rex::perf::ConvertGpuTicksToMicroseconds(end - start, performance_timestamp_frequency_);
+    rex::perf::RecordGpuFrame(performance_timestamp_frames_[slot], gpu_us);
+  }
+  performance_timestamp_submissions_[slot] = 0;
+  performance_timestamp_frames_[slot] = 0;
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {

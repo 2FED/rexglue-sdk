@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/perf/frame_audit.h>
 #include <rex/perf/counter.h>
 #include <SDL3/SDL.h>
 
@@ -301,6 +302,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
     if (driver->frames_queued_.empty()) {
       RecordAudioRouteStarvation();
+      rex::perf::RecordAudioUnderrun();
       if (sdl_callback_count < 10) {
         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
         sdl_callback_count++;

@@ -12,6 +12,10 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
 
+#include <chrono>
+
+#include <rex/perf/frame_audit.h>
+
 namespace rex::filesystem {
 
 HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
@@ -30,7 +34,18 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     return X_STATUS_ACCESS_DENIED;
   }
 
-  if (file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read)) {
+  bool read_succeeded;
+  if (rex::perf::IsFrameAuditEnabled()) {
+    const auto read_start = std::chrono::steady_clock::now();
+    read_succeeded = file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read);
+    const uint64_t read_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - read_start)
+                                          .count());
+    rex::perf::RecordStreamingRead(read_succeeded && out_bytes_read ? *out_bytes_read : 0, read_us);
+  } else {
+    read_succeeded = file_handle_->Read(byte_offset, buffer.data(), buffer.size(), out_bytes_read);
+  }
+  if (read_succeeded) {
     return X_STATUS_SUCCESS;
   } else {
     return X_STATUS_END_OF_FILE;

@@ -17,6 +17,7 @@ add_executable(unit_tests
     core/cvar_test.cpp
     core/fiber_test.cpp
     core/filesystem_test.cpp
+    core/frame_audit_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

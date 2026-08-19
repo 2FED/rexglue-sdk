@@ -14,6 +14,7 @@ add_library(rexcore OBJECT
     logging.cpp
     memory.cpp
     mutex.cpp
+    perf/frame_audit.cpp
     ring_buffer.cpp
     sha256.cpp
     string_buffer.cpp
@@ -122,4 +123,3 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_compile_definitions(rexcore PUBLIC
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
 endif()
-
