@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/input.h>
@@ -46,6 +48,9 @@ class InputSystem : public system::IInputSystem {
   rex::ui::Window* window_ = nullptr;
 
   std::vector<std::unique_ptr<InputDriver>> drivers_;
+  std::mutex merged_states_mutex_;
+  std::array<X_INPUT_STATE, 4> merged_states_ = {};
+  std::array<bool, 4> merged_states_connected_ = {};
 };
 
 constexpr bool ShouldInstallNopInputDriver(bool tool_mode) {

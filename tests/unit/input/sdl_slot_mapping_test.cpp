@@ -7,9 +7,11 @@
 #include <rex/input/sdl/slot_mapping.h>
 
 using rex::input::sdl::ChooseControllerSlot;
+using rex::input::sdl::ChooseMostRecentlyActiveController;
 using rex::input::sdl::IsInputSlotAuditChallengeButton;
+using rex::input::sdl::ResolveLogicalControllerSlot;
 
-TEST_CASE("First SDL controller deterministically owns Xbox slot zero", "[input][sdl][slot]") {
+TEST_CASE("First SDL controller deterministically owns physical slot zero", "[input][sdl][slot]") {
   CHECK(ChooseControllerSlot(0, 0) == 0);
   const auto slot = ChooseControllerSlot(3, 0);
   REQUIRE(slot.has_value());
@@ -35,4 +37,25 @@ TEST_CASE("SDL controller selection rejects a full four-slot map", "[input][sdl]
 TEST_CASE("Input-slot audit accepts only the SDL South face button", "[input][sdl][slot]") {
   CHECK(IsInputSlotAuditChallengeButton(0));
   CHECK_FALSE(IsInputSlotAuditChallengeButton(19));
+}
+
+TEST_CASE("Xbox slot zero follows the active physical controller", "[input][sdl][slot]") {
+  CHECK(ResolveLogicalControllerSlot(0, 2, 0x7) == 2);
+  CHECK_FALSE(ResolveLogicalControllerSlot(2, 2, 0x7).has_value());
+  CHECK(ResolveLogicalControllerSlot(1, 2, 0x7) == 1);
+  CHECK_FALSE(ResolveLogicalControllerSlot(3, 2, 0x7).has_value());
+  CHECK_FALSE(ResolveLogicalControllerSlot(0, 2, 0x3).has_value());
+  CHECK_FALSE(ResolveLogicalControllerSlot(4, 0, 0x1).has_value());
+}
+
+TEST_CASE("Fallback selection uses the most recently active connected controller",
+          "[input][sdl][slot]") {
+  std::array<uint64_t, rex::input::sdl::kControllerSlotCount> activity = {7, 0, 11, 3};
+  CHECK(ChooseMostRecentlyActiveController(0xF, activity) == 2);
+  CHECK(ChooseMostRecentlyActiveController(0xB, activity) == 0);
+  CHECK(ChooseMostRecentlyActiveController(0xA, activity) == 3);
+  CHECK_FALSE(ChooseMostRecentlyActiveController(0, activity).has_value());
+
+  activity = {};
+  CHECK(ChooseMostRecentlyActiveController(0xC, activity) == 2);
 }

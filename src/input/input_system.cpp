@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #include <rex/dbg.h>
 #include <rex/input/flags.h>
@@ -38,6 +39,9 @@ X_STATUS InputSystem::Setup() {
 
 void InputSystem::Shutdown() {
   drivers_.clear();
+  std::lock_guard lock(merged_states_mutex_);
+  merged_states_ = {};
+  merged_states_connected_ = {};
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
@@ -76,6 +80,10 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+
+  if (user_index >= merged_states_.size()) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
 
   bool any_connected = false;
   bool first_result = true;
@@ -117,7 +125,25 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (first_result) {
+    std::lock_guard lock(merged_states_mutex_);
+    merged_states_connected_.at(user_index) = false;
     return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  {
+    // Driver packet numbers are independent and cannot be compared when
+    // physical and synthetic inputs are merged. Publish a monotonic packet for
+    // the final guest-visible state instead.
+    std::lock_guard lock(merged_states_mutex_);
+    auto& previous = merged_states_.at(user_index);
+    auto& was_connected = merged_states_connected_.at(user_index);
+    if (!was_connected ||
+        std::memcmp(&previous.gamepad, &merged.gamepad, sizeof(merged.gamepad)) != 0) {
+      previous.packet_number++;
+    }
+    previous.gamepad = merged.gamepad;
+    was_connected = true;
+    merged.packet_number = previous.packet_number;
   }
 
   if (out_state) {

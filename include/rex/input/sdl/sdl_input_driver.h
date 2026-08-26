@@ -49,6 +49,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     SDL_Gamepad* sdl;
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
+    uint64_t last_activity_sequence;
     bool state_changed;
     bool is_active;
   };
@@ -82,7 +83,11 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
 
   inline uint64_t AnalogToKeyfield(const X_INPUT_GAMEPAD& gamepad) const;
   std::optional<size_t> GetControllerIndexFromInstanceID(SDL_JoystickID instance_id);
+  std::optional<size_t> ResolveControllerIndex(uint32_t user_index) const;
   ControllerState* GetControllerState(uint32_t user_index);
+  uint32_t GetConnectedControllerMask() const;
+  void SelectActiveControllerLocked(size_t controller_index, const char* reason);
+  void SelectFallbackControllerLocked(const char* reason);
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
@@ -94,6 +99,11 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   std::atomic<bool> sdl_pumpevents_queued_;
   std::atomic<bool> has_focus_{true};
   std::array<ControllerState, HID_SDL_USER_COUNT> controllers_;
+  std::optional<size_t> active_controller_index_;
+  uint64_t controller_activity_sequence_ = 0;
+  X_INPUT_STATE slot_zero_state_ = {};
+  std::optional<size_t> slot_zero_state_source_;
+  bool slot_zero_is_active_ = false;
   std::mutex controllers_mutex_;
   std::mutex event_queue_mutex_;
   std::vector<SDL_Event> pending_events_;

@@ -129,6 +129,10 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
         controllers_.at(i) = {};
       }
     }
+    active_controller_index_.reset();
+    slot_zero_state_source_.reset();
+    slot_zero_state_ = {};
+    slot_zero_is_active_ = false;
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
       SDL_Gamepad_initialized_ = false;
@@ -205,6 +209,23 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   auto controller = GetControllerState(user_index);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  if (user_index == 0) {
+    const bool source_changed = slot_zero_state_source_ != active_controller_index_;
+    if (source_changed || is_active != slot_zero_is_active_ ||
+        (is_active && controller->state_changed)) {
+      slot_zero_state_.packet_number++;
+    }
+    slot_zero_state_.gamepad = controller->state.gamepad;
+    slot_zero_state_source_ = active_controller_index_;
+    slot_zero_is_active_ = is_active;
+    controller->state_changed = false;
+    std::memcpy(out_state, &slot_zero_state_, sizeof(*out_state));
+    if (!is_active) {
+      std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
+    }
+    return X_ERROR_SUCCESS;
   }
 
   // Make sure packet_number is only incremented by 1, even if there have been
@@ -494,7 +515,8 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   const int user_id = selected_slot ? static_cast<int>(*selected_slot) : -1;
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
-    state = {controller, {}};
+    state = {};
+    state.sdl = controller;
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
@@ -503,6 +525,9 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     internal::RecordControllerMatrixDeviceAssigned(static_cast<uint32_t>(user_id));
 
     REXLOG_INFO("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
+    if (!active_controller_index_) {
+      SelectActiveControllerLocked(static_cast<size_t>(user_id), "first-connected");
+    }
   } else {
     // No more controllers needed, close it.
     internal::RecordInputSlotDeviceRejected();
@@ -516,12 +541,17 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
   auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
   if (idx) {
+    const bool removed_active = active_controller_index_ == idx;
     internal::RecordInputSlotDeviceRemoved(static_cast<uint32_t>(*idx));
     internal::RecordControllerMatrixDeviceRemoved(static_cast<uint32_t>(*idx));
     SDL_CloseGamepad(controllers_.at(*idx).sdl);
     controllers_.at(*idx) = {};
     keystroke_states_.at(*idx) = {};
     REXLOG_INFO("SDL OnControllerDeviceRemoved: Removed at player index {}.", *idx);
+    if (removed_active) {
+      active_controller_index_.reset();
+      SelectFallbackControllerLocked("active-disconnected");
+    }
   } else {
     // Can happen in case all slots where full previously.
     REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unused device.");
@@ -537,7 +567,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     internal::RecordControllerMatrixStaleEvent(true);
     return;
   }
-  auto& pad = controllers_.at(*idx).state.gamepad;
+  auto& controller = controllers_.at(*idx);
+  const X_INPUT_GAMEPAD previous_pad = controller.state.gamepad;
+  auto& pad = controller.state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
       pad.thumb_lx = event.gaxis.value;
@@ -561,10 +593,13 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       assert_always();
       break;
   }
-  controllers_.at(*idx).state_changed = true;
+  controller.state_changed = true;
+  if (IsMeaningfulControllerAnalogActivity(previous_pad, pad)) {
+    controller.last_activity_sequence = ++controller_activity_sequence_;
+    SelectActiveControllerLocked(*idx, "analog");
+  }
   internal::RecordControllerMatrixSdlAnalog(
-      static_cast<uint32_t>(*idx),
-      ClassifyControllerMatrixAnalog(controllers_.at(*idx).state.gamepad));
+      static_cast<uint32_t>(*idx), ClassifyControllerMatrixAnalog(controller.state.gamepad));
 }
 
 void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
@@ -634,6 +669,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   controller.state.gamepad.buttons = xbuttons;
   controller.state_changed = true;
   const bool is_pressed = (xbuttons & xbutton) != 0;
+  if (!was_pressed && is_pressed) {
+    controller.last_activity_sequence = ++controller_activity_sequence_;
+    SelectActiveControllerLocked(*idx, "button-down");
+  }
   if (IsInputSlotAuditChallengeButton(event.gbutton.button) && was_pressed != is_pressed) {
     internal::RecordInputSlotSdlAEdge(static_cast<uint32_t>(*idx), is_pressed);
   }
@@ -663,14 +702,78 @@ std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_Joyst
 }
 
 SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(uint32_t user_index) {
-  if (user_index >= controllers_.size()) {
+  const auto controller_index = ResolveControllerIndex(user_index);
+  if (!controller_index) {
     return nullptr;
   }
-  auto controller = &controllers_.at(user_index);
+  auto controller = &controllers_.at(*controller_index);
   if (!controller->sdl) {
     return nullptr;
   }
   return controller;
+}
+
+std::optional<size_t> SDLInputDriver::ResolveControllerIndex(uint32_t user_index) const {
+  const auto active =
+      active_controller_index_
+          ? std::optional<uint32_t>(static_cast<uint32_t>(*active_controller_index_))
+          : std::nullopt;
+  const auto resolved =
+      ResolveLogicalControllerSlot(user_index, active, GetConnectedControllerMask());
+  return resolved ? std::optional<size_t>(static_cast<size_t>(*resolved)) : std::nullopt;
+}
+
+uint32_t SDLInputDriver::GetConnectedControllerMask() const {
+  uint32_t mask = 0;
+  for (uint32_t slot = 0; slot < controllers_.size(); ++slot) {
+    if (controllers_.at(slot).sdl) {
+      mask |= uint32_t(1) << slot;
+    }
+  }
+  return mask;
+}
+
+void SDLInputDriver::SelectActiveControllerLocked(size_t controller_index, const char* reason) {
+  if (controller_index >= controllers_.size() || !controllers_.at(controller_index).sdl ||
+      active_controller_index_ == controller_index) {
+    return;
+  }
+
+  const int previous_index =
+      active_controller_index_ ? static_cast<int>(*active_controller_index_) : -1;
+  if (active_controller_index_) {
+    auto& previous = controllers_.at(*active_controller_index_);
+    if (previous.sdl) {
+      SDL_RumbleGamepad(previous.sdl, 0, 0, 0);
+    }
+  }
+  active_controller_index_ = controller_index;
+  for (auto& keystroke_state : keystroke_states_) {
+    keystroke_state = {};
+  }
+  REXLOG_INFO(
+      "SDL_ACTIVE_CONTROLLER v=1 guest_slot=0 previous_physical_slot={} "
+      "physical_slot={} reason={} activity_sequence={}",
+      previous_index, controller_index, reason,
+      controllers_.at(controller_index).last_activity_sequence);
+}
+
+void SDLInputDriver::SelectFallbackControllerLocked(const char* reason) {
+  std::array<uint64_t, kControllerSlotCount> activity_sequences = {};
+  for (size_t slot = 0; slot < controllers_.size(); ++slot) {
+    activity_sequences[slot] = controllers_.at(slot).last_activity_sequence;
+  }
+  const auto fallback =
+      ChooseMostRecentlyActiveController(GetConnectedControllerMask(), activity_sequences);
+  if (fallback) {
+    SelectActiveControllerLocked(*fallback, reason);
+  } else {
+    slot_zero_state_source_.reset();
+    for (auto& keystroke_state : keystroke_states_) {
+      keystroke_state = {};
+    }
+    REXLOG_INFO("SDL_ACTIVE_CONTROLLER v=1 guest_slot=0 physical_slot=none reason={}", reason);
+  }
 }
 
 bool SDLInputDriver::TestSDLVersion() const {

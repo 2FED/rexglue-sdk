@@ -21,6 +21,7 @@ using rex::input::sdl::IsCausalControllerMatrixPair;
 using rex::input::sdl::IsControllerInputActive;
 using rex::input::sdl::IsControllerMatrixInputReady;
 using rex::input::sdl::IsControllerMatrixSurfaceComplete;
+using rex::input::sdl::IsMeaningfulControllerAnalogActivity;
 using rex::input::sdl::IsSingleControllerMatrixBit;
 using rex::input::sdl::SdlBoolToXResult;
 using rex::input::sdl::ShouldIgnoreControllerMatrixFocusChurn;
@@ -51,6 +52,29 @@ class SetStateResultDriver final : public rex::input::InputDriver {
 
  private:
   X_RESULT result_;
+};
+
+class MutableStateDriver final : public rex::input::InputDriver {
+ public:
+  explicit MutableStateDriver(uint32_t packet) : InputDriver(nullptr, 0) {
+    state.packet_number = packet;
+  }
+  X_STATUS Setup() override { return X_STATUS_SUCCESS; }
+  X_RESULT GetCapabilities(uint32_t, uint32_t, rex::input::X_INPUT_CAPABILITIES*) override {
+    return X_ERROR_SUCCESS;
+  }
+  X_RESULT GetState(uint32_t user_index, rex::input::X_INPUT_STATE* out_state) override {
+    if (user_index != 0)
+      return X_ERROR_DEVICE_NOT_CONNECTED;
+    *out_state = state;
+    return X_ERROR_SUCCESS;
+  }
+  X_RESULT SetState(uint32_t, rex::input::X_INPUT_VIBRATION*) override { return X_ERROR_SUCCESS; }
+  X_RESULT GetKeystroke(uint32_t, uint32_t, rex::input::X_INPUT_KEYSTROKE*) override {
+    return X_ERROR_EMPTY;
+  }
+
+  rex::input::X_INPUT_STATE state = {};
 };
 }  // namespace
 
@@ -83,6 +107,30 @@ TEST_CASE("Vibration preserves the first connected backend result",
   CHECK(disconnected_ptr->calls == 1);
   CHECK(failed_ptr->calls == 1);
   CHECK(hidden_success_ptr->calls == 0);
+}
+
+TEST_CASE("Merged controller packets advance when a lower-packet backend changes",
+          "[input][sdl][controller-matrix]") {
+  rex::input::InputSystem input(nullptr);
+  auto physical = std::make_unique<MutableStateDriver>(1);
+  auto overlay = std::make_unique<MutableStateDriver>(20);
+  auto* physical_ptr = physical.get();
+  input.AddDriver(std::move(physical));
+  input.AddDriver(std::move(overlay));
+
+  rex::input::X_INPUT_STATE state = {};
+  REQUIRE(input.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.packet_number == 1);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == 0);
+
+  physical_ptr->state.packet_number = 2;
+  physical_ptr->state.gamepad.buttons = rex::input::X_INPUT_GAMEPAD_A;
+  REQUIRE(input.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.packet_number == 2);
+  CHECK(static_cast<uint16_t>(state.gamepad.buttons) == rex::input::X_INPUT_GAMEPAD_A);
+
+  REQUIRE(input.GetState(0, &state) == X_ERROR_SUCCESS);
+  CHECK(state.packet_number == 2);
 }
 
 TEST_CASE("Controller matrix distinguishes left right and combined rumble",
@@ -244,4 +292,28 @@ TEST_CASE("Controller matrix uses official XInput analog boundaries without muta
   gamepad.thumb_rx = -32768;
   gamepad.thumb_ry = 32767;
   CHECK(ClassifyControllerMatrixAnalog(gamepad) == 0x399);
+}
+
+TEST_CASE("Active controller selection rejects drift and accepts deliberate analog input",
+          "[input][sdl][controller-matrix]") {
+  X_INPUT_GAMEPAD previous = {};
+  X_INPUT_GAMEPAD current = {};
+
+  current.thumb_lx = 7849;
+  CHECK_FALSE(IsMeaningfulControllerAnalogActivity(previous, current));
+  current.thumb_lx = 7850;
+  CHECK(IsMeaningfulControllerAnalogActivity(previous, current));
+
+  previous = current;
+  current.thumb_lx = 9000;
+  CHECK_FALSE(IsMeaningfulControllerAnalogActivity(previous, current));
+  current.thumb_lx = -7850;
+  CHECK(IsMeaningfulControllerAnalogActivity(previous, current));
+
+  previous = {};
+  current = {};
+  current.left_trigger = 30;
+  CHECK_FALSE(IsMeaningfulControllerAnalogActivity(previous, current));
+  current.left_trigger = 31;
+  CHECK(IsMeaningfulControllerAnalogActivity(previous, current));
 }

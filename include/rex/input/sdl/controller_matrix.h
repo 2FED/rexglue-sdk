@@ -166,4 +166,14 @@ constexpr uint16_t ClassifyControllerMatrixAnalog(const X_INPUT_GAMEPAD& gamepad
   return mask;
 }
 
+// Axis noise inside the standard XInput deadzones must not steal the logical
+// controller. A controller becomes active when an axis newly crosses a
+// meaningful boundary or changes to another classified direction.
+constexpr bool IsMeaningfulControllerAnalogActivity(const X_INPUT_GAMEPAD& previous,
+                                                    const X_INPUT_GAMEPAD& current) {
+  const uint16_t previous_mask = ClassifyControllerMatrixAnalog(previous);
+  const uint16_t current_mask = ClassifyControllerMatrixAnalog(current);
+  return current_mask != 0 && current_mask != previous_mask;
+}
+
 }  // namespace rex::input::sdl
