@@ -1059,9 +1059,15 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       break;
   }
   controller.state_changed = true;
-  if (IsMeaningfulControllerAnalogActivity(previous_pad, pad)) {
+  const bool wheel_is_active =
+      active_controller_index_ && controllers_.at(*active_controller_index_).is_wheel;
+  const bool deliberate_takeover = wheel_is_active && IsDeliberateGamepadTakeoverActivity(pad);
+  if (IsMeaningfulControllerAnalogActivity(previous_pad, pad) || deliberate_takeover) {
     controller.last_activity_sequence = ++controller_activity_sequence_;
-    SelectActiveControllerLocked(*idx, "analog");
+    controller.last_activity_timestamp_ms = SDL_GetTicks();
+    if (!wheel_is_active || deliberate_takeover) {
+      SelectActiveControllerLocked(*idx, "analog");
+    }
   }
   internal::RecordControllerMatrixSdlAnalog(
       static_cast<uint32_t>(*idx), ClassifyControllerMatrixAnalog(controller.state.gamepad));
@@ -1085,9 +1091,15 @@ void SDLInputDriver::UpdateWheelAxisLocked(ControllerState& controller, uint8_t 
     return;
   }
   controller.state_changed = true;
-  if (record_activity && IsMeaningfulControllerAnalogActivity(previous_pad, pad)) {
+  const auto idx = record_activity
+                       ? GetControllerIndexFromInstanceID(SDL_GetJoystickID(controller.joystick))
+                       : std::nullopt;
+  const bool wheel_is_inactive = idx && active_controller_index_ != idx;
+  if (record_activity &&
+      (IsMeaningfulControllerAnalogActivity(previous_pad, pad) ||
+       (wheel_is_inactive && IsMeaningfulInactiveWheelActivity(previous_pad, pad)))) {
     controller.last_activity_sequence = ++controller_activity_sequence_;
-    const auto idx = GetControllerIndexFromInstanceID(SDL_GetJoystickID(controller.joystick));
+    controller.last_activity_timestamp_ms = SDL_GetTicks();
     if (idx) {
       SelectActiveControllerLocked(*idx, "wheel-axis");
     }
@@ -1128,6 +1140,7 @@ void SDLInputDriver::OnJoystickDeviceButtonChangedLocked(const SDL_Event& event)
   controller.state_changed = true;
   if (event.jbutton.down) {
     controller.last_activity_sequence = ++controller_activity_sequence_;
+    controller.last_activity_timestamp_ms = SDL_GetTicks();
     SelectActiveControllerLocked(*idx, "wheel-button-down");
   }
 }
@@ -1151,6 +1164,7 @@ void SDLInputDriver::OnJoystickDeviceHatMotionLocked(const SDL_Event& event) {
   controller.state_changed = true;
   if ((buttons & kDpadMask) != 0) {
     controller.last_activity_sequence = ++controller_activity_sequence_;
+    controller.last_activity_timestamp_ms = SDL_GetTicks();
     SelectActiveControllerLocked(*idx, "wheel-hat");
   }
 }
@@ -1228,6 +1242,7 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
   const bool is_pressed = (xbuttons & xbutton) != 0;
   if (!was_pressed && is_pressed) {
     controller.last_activity_sequence = ++controller_activity_sequence_;
+    controller.last_activity_timestamp_ms = SDL_GetTicks();
     SelectActiveControllerLocked(*idx, "button-down");
   }
   if (IsInputSlotAuditChallengeButton(event.gbutton.button) && was_pressed != is_pressed) {
@@ -1389,6 +1404,10 @@ void SDLInputDriver::SelectActiveControllerLocked(size_t controller_index, const
     return;
   }
 
+  if (ShouldSuppressMirroredGamepadSelectionLocked(controller_index)) {
+    return;
+  }
+
   const int previous_index =
       active_controller_index_ ? static_cast<int>(*active_controller_index_) : -1;
   if (active_controller_index_) {
@@ -1405,6 +1424,20 @@ void SDLInputDriver::SelectActiveControllerLocked(size_t controller_index, const
       "physical_slot={} reason={} activity_sequence={}",
       previous_index, controller_index, reason,
       controllers_.at(controller_index).last_activity_sequence);
+}
+
+bool SDLInputDriver::ShouldSuppressMirroredGamepadSelectionLocked(size_t controller_index) const {
+  if (!active_controller_index_) {
+    return false;
+  }
+  const auto& active = controllers_.at(*active_controller_index_);
+  const auto& candidate = controllers_.at(controller_index);
+  if (active.is_wheel || candidate.is_wheel || !active.gamepad || !candidate.gamepad) {
+    return false;
+  }
+  return IsMirroredGamepadActivity(active.state.gamepad, candidate.state.gamepad,
+                                   active.last_activity_timestamp_ms,
+                                   candidate.last_activity_timestamp_ms);
 }
 
 void SDLInputDriver::SelectFallbackControllerLocked(const char* reason) {

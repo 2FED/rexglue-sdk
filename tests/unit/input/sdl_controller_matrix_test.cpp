@@ -11,6 +11,8 @@
 using rex::X_RESULT;
 using rex::X_STATUS;
 using rex::input::X_INPUT_GAMEPAD;
+using rex::input::X_INPUT_GAMEPAD_A;
+using rex::input::X_INPUT_GAMEPAD_B;
 using rex::input::sdl::AreControllerMatrixResumeModesValid;
 using rex::input::sdl::ClassifyControllerMatrixAnalog;
 using rex::input::sdl::ControllerMatrixExpectedCurrentRumbleRecords;
@@ -21,7 +23,10 @@ using rex::input::sdl::IsCausalControllerMatrixPair;
 using rex::input::sdl::IsControllerInputActive;
 using rex::input::sdl::IsControllerMatrixInputReady;
 using rex::input::sdl::IsControllerMatrixSurfaceComplete;
+using rex::input::sdl::IsDeliberateGamepadTakeoverActivity;
 using rex::input::sdl::IsMeaningfulControllerAnalogActivity;
+using rex::input::sdl::IsMeaningfulInactiveWheelActivity;
+using rex::input::sdl::IsMirroredGamepadActivity;
 using rex::input::sdl::IsSingleControllerMatrixBit;
 using rex::input::sdl::SdlBoolToXResult;
 using rex::input::sdl::ShouldIgnoreControllerMatrixFocusChurn;
@@ -316,4 +321,43 @@ TEST_CASE("Active controller selection rejects drift and accepts deliberate anal
   CHECK_FALSE(IsMeaningfulControllerAnalogActivity(previous, current));
   current.left_trigger = 31;
   CHECK(IsMeaningfulControllerAnalogActivity(previous, current));
+}
+
+TEST_CASE("Wheel ownership resists gamepad drift and promptly follows real activity",
+          "[input][sdl][controller-matrix]") {
+  X_INPUT_GAMEPAD previous = {};
+  X_INPUT_GAMEPAD current = {};
+
+  current.thumb_lx = 16383;
+  CHECK_FALSE(IsDeliberateGamepadTakeoverActivity(current));
+  current.thumb_lx = 16384;
+  CHECK(IsDeliberateGamepadTakeoverActivity(current));
+  current = {};
+  current.right_trigger = 63;
+  CHECK_FALSE(IsDeliberateGamepadTakeoverActivity(current));
+  current.right_trigger = 64;
+  CHECK(IsDeliberateGamepadTakeoverActivity(current));
+
+  previous.thumb_lx = 20000;
+  current = previous;
+  current.thumb_lx = 21023;
+  CHECK_FALSE(IsMeaningfulInactiveWheelActivity(previous, current));
+  current.thumb_lx = 21024;
+  CHECK(IsMeaningfulInactiveWheelActivity(previous, current));
+  current = previous;
+  current.left_trigger = 7;
+  CHECK_FALSE(IsMeaningfulInactiveWheelActivity(previous, current));
+  current.left_trigger = 8;
+  CHECK(IsMeaningfulInactiveWheelActivity(previous, current));
+}
+
+TEST_CASE("Mirrored Steam Input endpoints do not thrash logical ownership",
+          "[input][sdl][controller-matrix]") {
+  X_INPUT_GAMEPAD active = {};
+  active.buttons = X_INPUT_GAMEPAD_A;
+  X_INPUT_GAMEPAD candidate = active;
+  CHECK(IsMirroredGamepadActivity(active, candidate, 1000, 1020));
+  CHECK_FALSE(IsMirroredGamepadActivity(active, candidate, 1000, 1021));
+  candidate.buttons = X_INPUT_GAMEPAD_B;
+  CHECK_FALSE(IsMirroredGamepadActivity(active, candidate, 1000, 1000));
 }

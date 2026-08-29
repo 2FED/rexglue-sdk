@@ -70,6 +70,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
     uint64_t last_activity_sequence;
+    uint64_t last_activity_timestamp_ms;
     bool state_changed;
     bool is_active;
     bool is_wheel;
@@ -123,6 +124,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   ControllerState* GetControllerState(uint32_t user_index);
   uint32_t GetConnectedControllerMask() const;
   void SelectActiveControllerLocked(size_t controller_index, const char* reason);
+  bool ShouldSuppressMirroredGamepadSelectionLocked(size_t controller_index) const;
   void SelectFallbackControllerLocked(const char* reason);
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);

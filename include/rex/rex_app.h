@@ -100,6 +100,10 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// Called before Runtime::Setup(). Override to modify backend config.
   virtual void OnPreSetup(RuntimeConfig& config) {}
 
+  /// Called after a configured GPU plugin is loaded and its CVars are
+  /// registered, but before graphics presentation setup begins.
+  virtual void OnPostLoadGraphicsPlugin() {}
+
   /// Called before Runtime::LoadXexImage(). Override to modify xex image.
   virtual void OnLoadXexImage(std::string& xex_image) {}
 

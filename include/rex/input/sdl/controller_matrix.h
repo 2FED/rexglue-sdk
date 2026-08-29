@@ -176,4 +176,59 @@ constexpr bool IsMeaningfulControllerAnalogActivity(const X_INPUT_GAMEPAD& previ
   return current_mask != 0 && current_mask != previous_mask;
 }
 
+// Switching away from a force-feedback wheel is more disruptive than changing
+// between ordinary gamepads: all running wheel effects must be suspended. Use a
+// deliberately higher takeover threshold so idle virtual-controller noise can't
+// make the wheel go limp, while a real stick or trigger movement still takes
+// ownership immediately.
+constexpr bool IsDeliberateGamepadTakeoverActivity(const X_INPUT_GAMEPAD& gamepad) {
+  constexpr int16_t kStickTakeoverThreshold = 16384;
+  constexpr uint8_t kTriggerTakeoverThreshold = 64;
+  return gamepad.thumb_lx <= -kStickTakeoverThreshold ||
+         gamepad.thumb_lx >= kStickTakeoverThreshold ||
+         gamepad.thumb_ly <= -kStickTakeoverThreshold ||
+         gamepad.thumb_ly >= kStickTakeoverThreshold ||
+         gamepad.thumb_rx <= -kStickTakeoverThreshold ||
+         gamepad.thumb_rx >= kStickTakeoverThreshold ||
+         gamepad.thumb_ry <= -kStickTakeoverThreshold ||
+         gamepad.thumb_ry >= kStickTakeoverThreshold ||
+         gamepad.left_trigger >= kTriggerTakeoverThreshold ||
+         gamepad.right_trigger >= kTriggerTakeoverThreshold;
+}
+
+// Once another device is active, a wheel must be able to reclaim ownership
+// without first crossing center or a pedal deadzone. Otherwise a wheel already
+// held in one classified direction can remain without FFB until it is moved all
+// the way through another classification boundary.
+constexpr bool IsMeaningfulInactiveWheelActivity(const X_INPUT_GAMEPAD& previous,
+                                                 const X_INPUT_GAMEPAD& current) {
+  constexpr int32_t kSteeringDelta = 1024;
+  constexpr int32_t kPedalDelta = 8;
+  const int32_t steering_delta = int32_t(current.thumb_lx) - int32_t(previous.thumb_lx);
+  const int32_t brake_delta = int32_t(current.left_trigger) - int32_t(previous.left_trigger);
+  const int32_t accelerator_delta =
+      int32_t(current.right_trigger) - int32_t(previous.right_trigger);
+  return steering_delta <= -kSteeringDelta || steering_delta >= kSteeringDelta ||
+         brake_delta <= -kPedalDelta || brake_delta >= kPedalDelta ||
+         accelerator_delta <= -kPedalDelta || accelerator_delta >= kPedalDelta;
+}
+
+// Steam Input may expose one physical controller through two synchronized SDL
+// gamepad endpoints. Keep the endpoint that handled the first event in a mirrored
+// pair instead of alternating logical ownership and packet state for every edge.
+constexpr bool IsMirroredGamepadActivity(const X_INPUT_GAMEPAD& active,
+                                         const X_INPUT_GAMEPAD& candidate,
+                                         uint64_t active_timestamp_ms,
+                                         uint64_t candidate_timestamp_ms) {
+  constexpr uint64_t kMirrorWindowMs = 20;
+  const uint64_t delta = active_timestamp_ms <= candidate_timestamp_ms
+                             ? candidate_timestamp_ms - active_timestamp_ms
+                             : active_timestamp_ms - candidate_timestamp_ms;
+  return delta <= kMirrorWindowMs && active.buttons == candidate.buttons &&
+         active.left_trigger == candidate.left_trigger &&
+         active.right_trigger == candidate.right_trigger && active.thumb_lx == candidate.thumb_lx &&
+         active.thumb_ly == candidate.thumb_ly && active.thumb_rx == candidate.thumb_rx &&
+         active.thumb_ry == candidate.thumb_ry;
+}
+
 }  // namespace rex::input::sdl

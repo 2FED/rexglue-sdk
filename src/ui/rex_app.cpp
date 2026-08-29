@@ -323,6 +323,7 @@ bool ReXApp::SetupPresentation() {
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;
     }
+    OnPostLoadGraphicsPlugin();
   }
 
   if (config_.graphics) {
