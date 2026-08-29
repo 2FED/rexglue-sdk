@@ -59,3 +59,23 @@ TEST_CASE("Fallback selection uses the most recently active connected controller
   activity = {};
   CHECK(ChooseMostRecentlyActiveController(0xC, activity) == 2);
 }
+
+TEST_CASE("Latest meaningful input alternates guest slot zero between wheel and gamepad",
+          "[input][sdl][slot]") {
+  // Physical slot 0 is a gamepad and slot 2 is a wheel. Device kind is
+  // intentionally absent from the selector: only connected state and the
+  // monotonic meaningful-input sequence decide which device owns guest slot 0.
+  std::array<uint64_t, rex::input::sdl::kControllerSlotCount> activity = {10, 0, 20, 0};
+  CHECK(ChooseMostRecentlyActiveController(0x5, activity) == 2);
+  CHECK(ResolveLogicalControllerSlot(0, 2, 0x5) == 2);
+
+  activity[0] = 30;
+  CHECK(ChooseMostRecentlyActiveController(0x5, activity) == 0);
+  CHECK(ResolveLogicalControllerSlot(0, 0, 0x5) == 0);
+
+  activity[2] = 40;
+  CHECK(ChooseMostRecentlyActiveController(0x5, activity) == 2);
+  CHECK(ResolveLogicalControllerSlot(0, 2, 0x5) == 2);
+
+  CHECK(ChooseMostRecentlyActiveController(0x4, activity) == 2);
+}

@@ -181,6 +181,49 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
+uint32_t InputSystem::GetForceFeedbackMaxEffectSlots(uint32_t user_index) {
+  for (auto& driver : drivers_) {
+    const uint32_t slots = driver->GetForceFeedbackMaxEffectSlots(user_index);
+    if (slots) {
+      return slots;
+    }
+  }
+  return 0;
+}
+
+X_RESULT InputSystem::SetForceFeedbackEffect(uint32_t user_index, const ForceFeedbackEffect& effect,
+                                             bool update) {
+  for (auto& driver : drivers_) {
+    const X_RESULT result = driver->SetForceFeedbackEffect(user_index, effect, update);
+    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+      return result;
+    }
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+X_RESULT InputSystem::SetForceFeedbackEffectRunning(uint32_t user_index, uint32_t effect_index,
+                                                    bool running, uint32_t iterations) {
+  for (auto& driver : drivers_) {
+    const X_RESULT result =
+        driver->SetForceFeedbackEffectRunning(user_index, effect_index, running, iterations);
+    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+      return result;
+    }
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+X_RESULT InputSystem::ForceFeedbackDeviceControl(uint32_t user_index, uint32_t command) {
+  for (auto& driver : drivers_) {
+    const X_RESULT result = driver->ForceFeedbackDeviceControl(user_index, command);
+    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+      return result;
+    }
+  }
+  return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   auto input = std::make_unique<InputSystem>(nullptr);
 

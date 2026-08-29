@@ -38,6 +38,19 @@ class InputDriver {
   virtual X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
                                 X_INPUT_KEYSTROKE* out_keystroke) = 0;
 
+  virtual uint32_t GetForceFeedbackMaxEffectSlots(uint32_t /*user_index*/) { return 0; }
+  virtual X_RESULT SetForceFeedbackEffect(uint32_t /*user_index*/,
+                                          const ForceFeedbackEffect& /*effect*/, bool /*update*/) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  virtual X_RESULT SetForceFeedbackEffectRunning(uint32_t /*user_index*/, uint32_t /*effect_index*/,
+                                                 bool /*running*/, uint32_t /*iterations*/) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  virtual X_RESULT ForceFeedbackDeviceControl(uint32_t /*user_index*/, uint32_t /*command*/) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
 
   void set_is_active_callback(std::function<bool()> is_active_callback) {

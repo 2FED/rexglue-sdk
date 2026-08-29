@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 
@@ -21,18 +22,153 @@
 #include <rex/input/sdl/input_slot_audit.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/input/sdl/slot_mapping.h>
+#include <rex/input/sdl/wheel_force_feedback.h>
+#include <rex/input/sdl/wheel_mapping.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_INT32(wheel_steering_axis, 0, "Input/Wheel", "Raw steering axis (-1 disables)")
+    .range(-1, 31);
+REXCVAR_DEFINE_INT32(wheel_brake_axis, 1, "Input/Wheel", "Raw brake axis (-1 disables)")
+    .range(-1, 31);
+REXCVAR_DEFINE_INT32(wheel_accelerator_axis, 2, "Input/Wheel", "Raw accelerator axis (-1 disables)")
+    .range(-1, 31);
+REXCVAR_DEFINE_BOOL(wheel_steering_inverted, false, "Input/Wheel", "Invert steering axis");
+REXCVAR_DEFINE_BOOL(wheel_brake_inverted, true, "Input/Wheel", "Invert brake axis");
+REXCVAR_DEFINE_BOOL(wheel_accelerator_inverted, true, "Input/Wheel", "Invert accelerator axis");
+REXCVAR_DEFINE_BOOL(wheel_force_feedback, true, "Input/Wheel",
+                    "Enable the safety-bounded Xbox 360 wheel force-feedback route");
+REXCVAR_DEFINE_INT32(wheel_force_feedback_gain, 100, "Input/Wheel",
+                     "Safety-bounded wheel force-feedback gain percentage")
+    .range(0, static_cast<int32_t>(rex::input::sdl::kMaximumWheelForceFeedbackGainPercent));
+REXCVAR_DEFINE_INT32(wheel_force_feedback_continuous_periodic_gain,
+                     rex::input::sdl::kDefaultContinuousPeriodicGainPercent, "Input/Wheel",
+                     "Continuous engine/road periodic force percentage of overall wheel gain")
+    .range(0, static_cast<int32_t>(rex::input::sdl::kMaximumWheelForceFeedbackGainPercent));
+REXCVAR_DEFINE_INT32(wheel_force_feedback_continuous_constant_gain,
+                     rex::input::sdl::kDefaultContinuousConstantGainPercent, "Input/Wheel",
+                     "Continuous directional force percentage of overall wheel gain")
+    .range(0, static_cast<int32_t>(rex::input::sdl::kMaximumWheelForceFeedbackGainPercent));
+REXCVAR_DEFINE_INT32(
+    wheel_force_feedback_minimum_transient_strength,
+    rex::input::sdl::kDefaultMinimumTransientStrengthPercent, "Input/Wheel",
+    "Minimum finite constant/periodic primary strength percentage of current wheel gain")
+    .range(0, static_cast<int32_t>(rex::input::sdl::kMaximumWheelForceFeedbackGainPercent));
+REXCVAR_DEFINE_INT32(wheel_button_left_shoulder, 0, "Input/Wheel", "Left paddle button")
+    .range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_right_shoulder, 1, "Input/Wheel", "Right paddle button")
+    .range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_y, 2, "Input/Wheel", "Y button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_x, 3, "Input/Wheel", "X button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_b, 4, "Input/Wheel", "B button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_a, 5, "Input/Wheel", "A button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_back, 6, "Input/Wheel", "Back button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_start, 7, "Input/Wheel", "Start button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_left_thumb, 10, "Input/Wheel", "Left-stick click button")
+    .range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_right_thumb, 11, "Input/Wheel", "Right-stick click button")
+    .range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_guide, 12, "Input/Wheel", "Guide button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_dpad_up, -1, "Input/Wheel", "D-pad Up button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_dpad_down, -1, "Input/Wheel", "D-pad Down button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_dpad_left, -1, "Input/Wheel", "D-pad Left button").range(-1, 255);
+REXCVAR_DEFINE_INT32(wheel_button_dpad_right, -1, "Input/Wheel", "D-pad Right button")
+    .range(-1, 255);
 
 namespace rex::input::sdl {
+
+namespace {
+
+WheelMapping GetConfiguredWheelMapping() {
+  return {
+      .steering_axis = REXCVAR_GET(wheel_steering_axis),
+      .brake_axis = REXCVAR_GET(wheel_brake_axis),
+      .accelerator_axis = REXCVAR_GET(wheel_accelerator_axis),
+      .steering_inverted = REXCVAR_GET(wheel_steering_inverted),
+      .brake_inverted = REXCVAR_GET(wheel_brake_inverted),
+      .accelerator_inverted = REXCVAR_GET(wheel_accelerator_inverted),
+      .left_shoulder_button = REXCVAR_GET(wheel_button_left_shoulder),
+      .right_shoulder_button = REXCVAR_GET(wheel_button_right_shoulder),
+      .y_button = REXCVAR_GET(wheel_button_y),
+      .x_button = REXCVAR_GET(wheel_button_x),
+      .b_button = REXCVAR_GET(wheel_button_b),
+      .a_button = REXCVAR_GET(wheel_button_a),
+      .back_button = REXCVAR_GET(wheel_button_back),
+      .start_button = REXCVAR_GET(wheel_button_start),
+      .left_thumb_button = REXCVAR_GET(wheel_button_left_thumb),
+      .right_thumb_button = REXCVAR_GET(wheel_button_right_thumb),
+      .guide_button = REXCVAR_GET(wheel_button_guide),
+      .dpad_up_button = REXCVAR_GET(wheel_button_dpad_up),
+      .dpad_down_button = REXCVAR_GET(wheel_button_dpad_down),
+      .dpad_left_button = REXCVAR_GET(wheel_button_dpad_left),
+      .dpad_right_button = REXCVAR_GET(wheel_button_dpad_right),
+  };
+}
+
+void LogWheelEffectParameters(const ForceFeedbackEffect& guest, const SDL_HapticEffect& host,
+                              const char* action, uint32_t gain) {
+  switch (guest.type) {
+    case ForceFeedbackEffectType::kConstant:
+      REXLOG_INFO(
+          "SDL_WHEEL_FFB_PARAMS v=1 action={} slot={} type=constant duration={} delay={} "
+          "guest_level={} host_level={} guest_attack={} host_attack={} guest_fade={} "
+          "host_fade={} gain_percent={}",
+          action, guest.effect_index, guest.duration_ms, guest.start_delay_ms, guest.constant_level,
+          host.constant.level, guest.attack_level, host.constant.attack_level, guest.fade_level,
+          host.constant.fade_level, gain);
+      break;
+    case ForceFeedbackEffectType::kRamp:
+      REXLOG_INFO(
+          "SDL_WHEEL_FFB_PARAMS v=1 action={} slot={} type=ramp duration={} delay={} "
+          "guest_start={} guest_end={} host_start={} host_end={} gain_percent={}",
+          action, guest.effect_index, guest.duration_ms, guest.start_delay_ms, guest.ramp_start,
+          guest.ramp_end, host.ramp.start, host.ramp.end, gain);
+      break;
+    case ForceFeedbackEffectType::kSquare:
+    case ForceFeedbackEffectType::kSine:
+    case ForceFeedbackEffectType::kTriangle:
+    case ForceFeedbackEffectType::kSawtoothUp:
+    case ForceFeedbackEffectType::kSawtoothDown:
+      REXLOG_INFO(
+          "SDL_WHEEL_FFB_PARAMS v=1 action={} slot={} type={} duration={} delay={} "
+          "guest_magnitude={} guest_offset={} guest_period={} host_magnitude={} "
+          "host_offset={} host_period={} guest_phase={} host_phase={} guest_attack={} "
+          "host_attack={} guest_fade={} host_fade={} gain_percent={}",
+          action, guest.effect_index, GetWheelEffectTypeName(guest.type), guest.duration_ms,
+          guest.start_delay_ms, guest.periodic_magnitude, guest.periodic_offset,
+          guest.periodic_period_ms, host.periodic.magnitude, host.periodic.offset,
+          host.periodic.period, guest.periodic_phase, host.periodic.phase, guest.attack_level,
+          host.periodic.attack_level, guest.fade_level, host.periodic.fade_level, gain);
+      break;
+    case ForceFeedbackEffectType::kSpring:
+    case ForceFeedbackEffectType::kDamper: {
+      const auto& condition = guest.conditions[0];
+      REXLOG_INFO(
+          "SDL_WHEEL_FFB_PARAMS v=1 action={} slot={} type={} duration={} delay={} "
+          "guest_center={} guest_right_coeff={} guest_left_coeff={} guest_right_sat={} "
+          "guest_left_sat={} guest_deadband={} host_center={} host_right_coeff={} "
+          "host_left_coeff={} host_right_sat={} host_left_sat={} host_deadband={} "
+          "gain_percent={}",
+          action, guest.effect_index, GetWheelEffectTypeName(guest.type), guest.duration_ms,
+          guest.start_delay_ms, condition.center, condition.right_coefficient,
+          condition.left_coefficient, condition.right_saturation, condition.left_saturation,
+          condition.deadband, host.condition.center[0], host.condition.right_coeff[0],
+          host.condition.left_coeff[0], host.condition.right_sat[0], host.condition.left_sat[0],
+          host.condition.deadband[0], gain);
+      break;
+    }
+  }
+}
+
+}  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
       sdl_events_initialized_(false),
       SDL_Gamepad_initialized_(false),
+      sdl_haptic_initialized_(false),
       sdl_events_unflushed_(0),
       sdl_pumpevents_queued_(false),
       controllers_(),
@@ -93,6 +229,12 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       }
       SDL_Gamepad_initialized_ = true;
 
+      if (!SDL_InitSubSystem(SDL_INIT_HAPTIC)) {
+        REXLOG_WARN("SDL: Failed to init optional haptic subsystem: {}", SDL_GetError());
+      } else {
+        sdl_haptic_initialized_ = true;
+      }
+
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
@@ -123,16 +265,17 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
       attached_window_->app_context().CallInUIThreadSynchronous(
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
     }
-    for (size_t i = 0; i < controllers_.size(); i++) {
-      if (controllers_.at(i).sdl) {
-        SDL_CloseGamepad(controllers_.at(i).sdl);
-        controllers_.at(i) = {};
-      }
+    for (auto& controller : controllers_) {
+      CloseController(controller);
     }
     active_controller_index_.reset();
     slot_zero_state_source_.reset();
     slot_zero_state_ = {};
     slot_zero_is_active_ = false;
+    if (sdl_haptic_initialized_) {
+      SDL_QuitSubSystem(SDL_INIT_HAPTIC);
+      sdl_haptic_initialized_ = false;
+    }
     if (SDL_Gamepad_initialized_) {
       SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
       SDL_Gamepad_initialized_ = false;
@@ -150,9 +293,7 @@ void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   {
     std::lock_guard lock(controllers_mutex_);
     for (auto& controller : controllers_) {
-      if (controller.sdl) {
-        SDL_RumbleGamepad(controller.sdl, 0, 0, 0);
-      }
+      StopControllerFeedback(controller, true);
     }
     for (auto& state : keystroke_states_) {
       state.repeat_state = RepeatState::Idle;
@@ -164,6 +305,15 @@ void SDLInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 
 void SDLInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   has_focus_ = true;
+  {
+    std::lock_guard lock(controllers_mutex_);
+    for (auto& controller : controllers_) {
+      const auto controller_index = static_cast<size_t>(&controller - controllers_.data());
+      if (active_controller_index_ == controller_index) {
+        ResumeControllerFeedback(controller, "focus");
+      }
+    }
+  }
   internal::RecordControllerMatrixFocus(true);
 }
 
@@ -272,15 +422,229 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
   if (!ShouldSubmitRumble(has_focus_.load(), stopping)) {
     return X_ERROR_SUCCESS;
   }
-  const bool supported = SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller->sdl),
+
+  if (controller->is_wheel) {
+    // Basic XInput motor vibration is not the Xbox 360 wheel force-feedback
+    // API. Do not turn it into an unsigned steering force; the independently
+    // bounded XInputdFF condition-effect route handles wheel forces.
+    return X_ERROR_SUCCESS;
+  }
+
+  const bool supported = SDL_GetBooleanProperty(SDL_GetGamepadProperties(controller->gamepad),
                                                 SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
   const X_RESULT result = SdlBoolToXResult(SDL_RumbleGamepad(
-      controller->sdl, vibration->left_motor_speed, vibration->right_motor_speed, 0));
+      controller->gamepad, vibration->left_motor_speed, vibration->right_motor_speed, 0));
   internal::RecordControllerMatrixRumble(user_index, motor_mask, supported, result);
   return result;
 #else
   return X_ERROR_SUCCESS;
 #endif
+}
+
+uint32_t SDLInputDriver::GetForceFeedbackMaxEffectSlots(uint32_t user_index) {
+  if (!REXCVAR_GET(wheel_force_feedback) || user_index >= HID_SDL_USER_COUNT) {
+    return 0;
+  }
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller || !controller->is_wheel || !controller->haptic) {
+    return 0;
+  }
+  const uint32_t features = SDL_GetHapticFeatures(controller->haptic);
+  const uint32_t effect_slots =
+      (features & kMclaWheelHapticFeatures) == 0
+          ? 0
+          : static_cast<uint32_t>(std::clamp(SDL_GetMaxHapticEffects(controller->haptic), 0,
+                                             static_cast<int>(kWheelForceFeedbackEffectSlots)));
+  if (!controller->force_feedback_device_info_logged) {
+    controller->force_feedback_device_info_logged = true;
+    REXLOG_INFO(
+        "SDL_WHEEL_FFB_DEVICE_INFO v=2 guest_slots={} host_effects={} host_playing={} "
+        "features=0x{:08X}",
+        effect_slots, SDL_GetMaxHapticEffects(controller->haptic),
+        SDL_GetMaxHapticEffectsPlaying(controller->haptic), features);
+  }
+  return effect_slots;
+}
+
+X_RESULT SDLInputDriver::SetForceFeedbackEffect(uint32_t user_index,
+                                                const ForceFeedbackEffect& effect, bool update) {
+  if (user_index >= HID_SDL_USER_COUNT || effect.effect_index == 0 ||
+      effect.effect_index > kWheelForceFeedbackEffectSlots) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  if (!REXCVAR_GET(wheel_force_feedback)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller || !controller->is_wheel || !controller->haptic) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  const int max_effects = std::clamp(SDL_GetMaxHapticEffects(controller->haptic), 0,
+                                     static_cast<int>(kWheelForceFeedbackEffectSlots));
+  if (effect.effect_index > static_cast<uint32_t>(max_effects)) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+
+  const uint32_t overall_gain = static_cast<uint32_t>(REXCVAR_GET(wheel_force_feedback_gain));
+  const uint32_t gain = GetWheelEffectGainPercent(
+      effect, overall_gain,
+      static_cast<uint32_t>(REXCVAR_GET(wheel_force_feedback_continuous_periodic_gain)),
+      static_cast<uint32_t>(REXCVAR_GET(wheel_force_feedback_continuous_constant_gain)));
+  const int haptic_axes = std::clamp(SDL_GetNumHapticAxes(controller->haptic), 0, 3);
+  SDL_HapticEffect sdl_effect = {};
+  if (!BuildSdlWheelEffect(
+          effect, gain, haptic_axes, sdl_effect,
+          static_cast<uint32_t>(REXCVAR_GET(wheel_force_feedback_minimum_transient_strength)))) {
+    REXLOG_WARN("SDL wheel FFB rejected unknown effect type {}.",
+                static_cast<uint32_t>(effect.type));
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
+  if (!SDL_HapticEffectSupported(controller->haptic, &sdl_effect)) {
+    REXLOG_WARN("SDL wheel does not support title-requested effect type {}.",
+                GetWheelEffectTypeName(effect.type));
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
+  auto& effect_state = controller->force_feedback_effects[effect.effect_index - 1];
+  bool submitted = false;
+  bool recreated = false;
+  if (effect_state.effect_id >= 0 && update && effect_state.type == effect.type) {
+    submitted = SDL_UpdateHapticEffect(controller->haptic, effect_state.effect_id, &sdl_effect);
+  } else {
+    const bool restart = effect_state.running && has_focus_.load();
+    if (effect_state.effect_id >= 0) {
+      SDL_DestroyHapticEffect(controller->haptic, effect_state.effect_id);
+      effect_state.effect_id = -1;
+      effect_state.running = false;
+    }
+    effect_state.effect_id = SDL_CreateHapticEffect(controller->haptic, &sdl_effect);
+    submitted = effect_state.effect_id >= 0;
+    recreated = true;
+    if (submitted && restart) {
+      submitted =
+          SDL_RunHapticEffect(controller->haptic, effect_state.effect_id, effect_state.iterations);
+      effect_state.running = submitted;
+      if (submitted) {
+        controller->force_feedback_total_start_count++;
+      }
+    }
+  }
+  if (!submitted) {
+    REXLOG_ERROR("SDL wheel FFB {} failed for slot {} type {}: {}", recreated ? "create" : "update",
+                 effect.effect_index, GetWheelEffectTypeName(effect.type), SDL_GetError());
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
+  effect_state.type = effect.type;
+  effect_state.duration_ms = effect.duration_ms;
+  if (update) {
+    if (effect_state.update_count == 0) {
+      LogWheelEffectParameters(effect, sdl_effect, "first-update", gain);
+    }
+    effect_state.update_count++;
+    controller->force_feedback_total_update_count++;
+    if (effect_state.update_count == 1) {
+      REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=first-update slot={} type={} gain_percent={}",
+                  effect.effect_index, GetWheelEffectTypeName(effect.type), gain);
+    }
+  } else {
+    LogWheelEffectParameters(effect, sdl_effect, "create", gain);
+    REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=create slot={} type={} gain_percent={}",
+                effect.effect_index, GetWheelEffectTypeName(effect.type), gain);
+  }
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT SDLInputDriver::SetForceFeedbackEffectRunning(uint32_t user_index, uint32_t effect_index,
+                                                       bool running, uint32_t iterations) {
+  if (user_index >= HID_SDL_USER_COUNT || effect_index == 0 ||
+      effect_index > kWheelForceFeedbackEffectSlots) {
+    return X_ERROR_BAD_ARGUMENTS;
+  }
+  if (!REXCVAR_GET(wheel_force_feedback)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller || !controller->is_wheel || !controller->haptic) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  auto& effect_state = controller->force_feedback_effects[effect_index - 1];
+  if (effect_state.effect_id < 0) {
+    return X_ERROR_FUNCTION_FAILED;
+  }
+
+  if (running) {
+    effect_state.iterations = NormalizeWheelEffectIterations(iterations);
+  }
+
+  if (running && !has_focus_.load()) {
+    if (effect_state.duration_ms != UINT32_MAX) {
+      effect_state.running = false;
+      effect_state.resume_pending = false;
+      REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=drop-start slot={} type={} reason=focus-finite",
+                  effect_index, GetWheelEffectTypeName(effect_state.type));
+      return X_ERROR_SUCCESS;
+    }
+    const bool first_deferred_start = !effect_state.resume_pending;
+    effect_state.running = false;
+    effect_state.resume_pending = true;
+    if (first_deferred_start) {
+      REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=defer-start slot={} type={} reason=focus",
+                  effect_index, GetWheelEffectTypeName(effect_state.type));
+    }
+    return X_ERROR_SUCCESS;
+  }
+
+  const bool status_supported =
+      (SDL_GetHapticFeatures(controller->haptic) & SDL_HAPTIC_STATUS) != 0;
+  const bool status_playing = running && effect_state.running && status_supported &&
+                              SDL_GetHapticEffectStatus(controller->haptic, effect_state.effect_id);
+  if (running && !ShouldSubmitWheelEffectStart(effect_state.duration_ms, effect_state.running,
+                                               status_supported, status_playing)) {
+    // Avoid re-articulating a genuinely running infinite condition or engine
+    // effect. Finite event starts are never suppressed by status.
+    return X_ERROR_SUCCESS;
+  }
+
+  const bool submitted = running ? SDL_RunHapticEffect(controller->haptic, effect_state.effect_id,
+                                                       effect_state.iterations)
+                                 : SDL_StopHapticEffect(controller->haptic, effect_state.effect_id);
+  if (!submitted) {
+    REXLOG_ERROR("SDL wheel FFB {} failed for slot {} type {}: {}", running ? "start" : "stop",
+                 effect_index, GetWheelEffectTypeName(effect_state.type), SDL_GetError());
+    return X_ERROR_FUNCTION_FAILED;
+  }
+  effect_state.running = running;
+  effect_state.resume_pending = false;
+  if (running) {
+    controller->force_feedback_total_start_count++;
+  }
+  REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action={} slot={} type={}", running ? "start" : "stop",
+              effect_index, GetWheelEffectTypeName(effect_state.type));
+  return X_ERROR_SUCCESS;
+}
+
+X_RESULT SDLInputDriver::ForceFeedbackDeviceControl(uint32_t user_index, uint32_t command) {
+  if (!REXCVAR_GET(wheel_force_feedback)) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  QueueControllerUpdate();
+  auto guard = DrainAndLock();
+  auto* controller = GetControllerState(user_index);
+  if (!controller || !controller->is_wheel || !controller->haptic) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  REXLOG_INFO("SDL_WHEEL_FFB_DEVICE_CONTROL v=1 command={}", command);
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
@@ -470,6 +834,22 @@ std::unique_lock<std::mutex> SDLInputDriver::DrainAndLock() {
 
 void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
   switch (event.type) {
+    case SDL_EVENT_JOYSTICK_ADDED:
+      OnJoystickDeviceAddedLocked(event);
+      break;
+    case SDL_EVENT_JOYSTICK_REMOVED:
+      OnControllerDeviceRemovedLocked(event);
+      break;
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+      OnJoystickDeviceAxisMotionLocked(event);
+      break;
+    case SDL_EVENT_JOYSTICK_BUTTON_DOWN:
+    case SDL_EVENT_JOYSTICK_BUTTON_UP:
+      OnJoystickDeviceButtonChangedLocked(event);
+      break;
+    case SDL_EVENT_JOYSTICK_HAT_MOTION:
+      OnJoystickDeviceHatMotionLocked(event);
+      break;
     case SDL_EVENT_GAMEPAD_ADDED:
       OnControllerDeviceAddedLocked(event);
       break;
@@ -488,7 +868,84 @@ void SDLInputDriver::ProcessEventLocked(const SDL_Event& event) {
   }
 }
 
+void SDLInputDriver::OnJoystickDeviceAddedLocked(const SDL_Event& event) {
+  const SDL_JoystickID instance_id = event.jdevice.which;
+  const uint16_t vendor_id = SDL_GetJoystickVendorForID(instance_id);
+  const uint16_t product_id = SDL_GetJoystickProductForID(instance_id);
+  if (!IsSupportedWheel(vendor_id, product_id, SDL_GetJoystickTypeForID(instance_id))) {
+    return;
+  }
+  if (GetControllerIndexFromInstanceID(instance_id)) {
+    return;
+  }
+
+  SDL_Joystick* joystick = SDL_OpenJoystick(instance_id);
+  if (!joystick) {
+    REXLOG_ERROR("SDL wheel open failed for instance {}: {}", instance_id, SDL_GetError());
+    return;
+  }
+
+  uint32_t occupied_slot_mask = GetConnectedControllerMask();
+  const auto selected_slot =
+      ChooseControllerSlot(SDL_GetJoystickPlayerIndex(joystick), occupied_slot_mask);
+  if (!selected_slot) {
+    SDL_CloseJoystick(joystick);
+    REXLOG_WARN("SDL wheel ignored because all four physical slots are occupied.");
+    return;
+  }
+
+  auto& state = controllers_.at(*selected_slot);
+  state = {};
+  state.joystick = joystick;
+  state.is_wheel = true;
+  state.state_changed = true;
+  SDL_SetJoystickPlayerIndex(joystick, static_cast<int>(*selected_slot));
+
+  if (sdl_haptic_initialized_) {
+    state.haptic = SDL_OpenHapticFromJoystick(joystick);
+    if (state.haptic && SDL_HapticRumbleSupported(state.haptic) &&
+        !SDL_InitHapticRumble(state.haptic)) {
+      REXLOG_WARN("SDL wheel rumble initialization failed: {}", SDL_GetError());
+    }
+  }
+
+  const int axis_count = SDL_GetNumJoystickAxes(joystick);
+  for (int axis = 0; axis < axis_count; ++axis) {
+    int16_t initial_value = 0;
+    if (SDL_GetJoystickAxisInitialState(joystick, axis, &initial_value)) {
+      UpdateWheelAxisLocked(state, static_cast<uint8_t>(axis), initial_value, false);
+    }
+  }
+  if (SDL_GetNumJoystickHats(joystick) > 0) {
+    state.state.gamepad.buttons = static_cast<uint16_t>(state.state.gamepad.buttons) |
+                                  WheelHatToXInput(SDL_GetJoystickHat(joystick, 0));
+  }
+  UpdateXCapabilities(state);
+
+  internal::RecordInputSlotDeviceAssigned(static_cast<uint32_t>(*selected_slot));
+  internal::RecordControllerMatrixDeviceAssigned(static_cast<uint32_t>(*selected_slot));
+  REXLOG_INFO(
+      "SDL_WHEEL_CONNECTED v=1 physical_slot={} vendor=0x{:04X} product=0x{:04X} "
+      "axes={} buttons={} hats={} haptic={}",
+      *selected_slot, vendor_id, product_id, axis_count, SDL_GetNumJoystickButtons(joystick),
+      SDL_GetNumJoystickHats(joystick), state.haptic ? 1 : 0);
+  if (!active_controller_index_) {
+    SelectActiveControllerLocked(*selected_slot, "first-connected-wheel");
+  }
+}
+
 void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+  const uint16_t vendor_id = SDL_GetJoystickVendorForID(event.gdevice.which);
+  const uint16_t product_id = SDL_GetJoystickProductForID(event.gdevice.which);
+  if (IsSupportedWheel(vendor_id, product_id, SDL_GetJoystickTypeForID(event.gdevice.which))) {
+    // SDL normally emits JOYSTICK_ADDED before GAMEPAD_ADDED, but do not rely
+    // on event ordering: T300 must stay on the raw wheel path in every mode.
+    OnJoystickDeviceAddedLocked(event);
+    return;
+  }
+  if (GetControllerIndexFromInstanceID(event.gdevice.which)) {
+    return;
+  }
   // Open the controller.
   const auto controller = SDL_OpenGamepad(event.gdevice.which);
   if (!controller) {
@@ -507,7 +964,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
       SDL_GetGamepadProduct(controller));
   uint32_t occupied_slot_mask = 0;
   for (uint32_t slot = 0; slot < controllers_.size(); ++slot) {
-    if (controllers_.at(slot).sdl)
+    if (IsControllerConnected(controllers_.at(slot)))
       occupied_slot_mask |= uint32_t(1) << slot;
   }
   const auto selected_slot =
@@ -516,7 +973,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {};
-    state.sdl = controller;
+    state.gamepad = controller;
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
@@ -539,22 +996,24 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
 
 void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   // Find the disconnected gamecontroller and close it.
-  auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
+  const SDL_JoystickID instance_id =
+      event.type == SDL_EVENT_JOYSTICK_REMOVED ? event.jdevice.which : event.gdevice.which;
+  auto idx = GetControllerIndexFromInstanceID(instance_id);
   if (idx) {
     const bool removed_active = active_controller_index_ == idx;
     internal::RecordInputSlotDeviceRemoved(static_cast<uint32_t>(*idx));
     internal::RecordControllerMatrixDeviceRemoved(static_cast<uint32_t>(*idx));
-    SDL_CloseGamepad(controllers_.at(*idx).sdl);
-    controllers_.at(*idx) = {};
+    const bool was_wheel = controllers_.at(*idx).is_wheel;
+    CloseController(controllers_.at(*idx));
     keystroke_states_.at(*idx) = {};
-    REXLOG_INFO("SDL OnControllerDeviceRemoved: Removed at player index {}.", *idx);
+    REXLOG_INFO("SDL {} removed from physical slot {}.", was_wheel ? "wheel" : "gamepad", *idx);
     if (removed_active) {
       active_controller_index_.reset();
       SelectFallbackControllerLocked("active-disconnected");
     }
   } else {
     // Can happen in case all slots where full previously.
-    REXLOG_WARN("SDL OnControllerDeviceRemoved: Ignored. Unused device.");
+    REXLOG_DEBUG("SDL device removal ignored because the instance is already unavailable.");
   }
 }
 
@@ -568,6 +1027,12 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     return;
   }
   auto& controller = controllers_.at(*idx);
+  if (controller.is_wheel) {
+    // A wheel may also have an SDL gamepad mapping. Its raw joystick events
+    // are authoritative; accepting both streams can remap the same physical
+    // axis twice and overwrite the configured wheel state.
+    return;
+  }
   const X_INPUT_GAMEPAD previous_pad = controller.state.gamepad;
   auto& pad = controller.state.gamepad;
   switch (event.gaxis.axis) {
@@ -600,6 +1065,94 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
   }
   internal::RecordControllerMatrixSdlAnalog(
       static_cast<uint32_t>(*idx), ClassifyControllerMatrixAnalog(controller.state.gamepad));
+}
+
+void SDLInputDriver::UpdateWheelAxisLocked(ControllerState& controller, uint8_t axis, int16_t value,
+                                           bool record_activity) {
+  const X_INPUT_GAMEPAD previous_pad = controller.state.gamepad;
+  auto& pad = controller.state.gamepad;
+  const WheelMapping mapping = GetConfiguredWheelMapping();
+  if (axis == mapping.steering_axis) {
+    pad.thumb_lx = WheelSteeringValue(value, mapping.steering_inverted);
+  } else if (axis == mapping.brake_axis) {
+    pad.left_trigger = WheelPedalToTrigger(value, mapping.brake_inverted);
+  } else if (axis == mapping.accelerator_axis) {
+    pad.right_trigger = WheelPedalToTrigger(value, mapping.accelerator_inverted);
+  } else {
+    return;
+  }
+  if (std::memcmp(&previous_pad, &pad, sizeof(pad)) == 0) {
+    return;
+  }
+  controller.state_changed = true;
+  if (record_activity && IsMeaningfulControllerAnalogActivity(previous_pad, pad)) {
+    controller.last_activity_sequence = ++controller_activity_sequence_;
+    const auto idx = GetControllerIndexFromInstanceID(SDL_GetJoystickID(controller.joystick));
+    if (idx) {
+      SelectActiveControllerLocked(*idx, "wheel-axis");
+    }
+  }
+}
+
+void SDLInputDriver::OnJoystickDeviceAxisMotionLocked(const SDL_Event& event) {
+  const auto idx = GetControllerIndexFromInstanceID(event.jaxis.which);
+  if (!idx || !controllers_.at(*idx).is_wheel) {
+    return;
+  }
+  auto& controller = controllers_.at(*idx);
+  UpdateWheelAxisLocked(controller, event.jaxis.axis, event.jaxis.value, true);
+}
+
+void SDLInputDriver::OnJoystickDeviceButtonChangedLocked(const SDL_Event& event) {
+  const auto idx = GetControllerIndexFromInstanceID(event.jbutton.which);
+  if (!idx || !controllers_.at(*idx).is_wheel) {
+    return;
+  }
+  const uint16_t xbutton = WheelButtonToXInput(event.jbutton.button, GetConfiguredWheelMapping());
+  if (!xbutton) {
+    return;
+  }
+
+  auto& controller = controllers_.at(*idx);
+  const uint16_t previous = controller.state.gamepad.buttons;
+  uint16_t buttons = previous;
+  if (event.jbutton.down) {
+    buttons |= xbutton;
+  } else {
+    buttons &= ~xbutton;
+  }
+  if (buttons == previous) {
+    return;
+  }
+  controller.state.gamepad.buttons = buttons;
+  controller.state_changed = true;
+  if (event.jbutton.down) {
+    controller.last_activity_sequence = ++controller_activity_sequence_;
+    SelectActiveControllerLocked(*idx, "wheel-button-down");
+  }
+}
+
+void SDLInputDriver::OnJoystickDeviceHatMotionLocked(const SDL_Event& event) {
+  const auto idx = GetControllerIndexFromInstanceID(event.jhat.which);
+  if (!idx || !controllers_.at(*idx).is_wheel || event.jhat.hat != 0) {
+    return;
+  }
+
+  auto& controller = controllers_.at(*idx);
+  uint16_t buttons = controller.state.gamepad.buttons;
+  constexpr uint16_t kDpadMask = X_INPUT_GAMEPAD_DPAD_UP | X_INPUT_GAMEPAD_DPAD_DOWN |
+                                 X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_RIGHT;
+  const uint16_t previous = buttons;
+  buttons = static_cast<uint16_t>((buttons & ~kDpadMask) | WheelHatToXInput(event.jhat.value));
+  if (buttons == previous) {
+    return;
+  }
+  controller.state.gamepad.buttons = buttons;
+  controller.state_changed = true;
+  if ((buttons & kDpadMask) != 0) {
+    controller.last_activity_sequence = ++controller_activity_sequence_;
+    SelectActiveControllerLocked(*idx, "wheel-hat");
+  }
 }
 
 void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
@@ -647,6 +1200,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     return;
   }
   auto& controller = controllers_.at(*idx);
+  if (controller.is_wheel) {
+    // Raw wheel button/hat events own this device for the same reason as axes.
+    return;
+  }
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
   // Lookup the XInput button code.
@@ -686,19 +1243,111 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
 std::optional<size_t> SDLInputDriver::GetControllerIndexFromInstanceID(SDL_JoystickID instance_id) {
   // Loop through our controllers and try to match the given ID.
   for (size_t i = 0; i < controllers_.size(); i++) {
-    auto controller = controllers_.at(i).sdl;
-    if (!controller) {
+    SDL_Joystick* joystick = GetControllerJoystick(controllers_.at(i));
+    if (!joystick) {
       continue;
     }
-    auto joystick = SDL_GetGamepadJoystick(controller);
-    assert(joystick);
     auto joy_instance_id = SDL_GetJoystickID(joystick);
-    assert(joy_instance_id >= 0);
     if (joy_instance_id == instance_id) {
       return i;
     }
   }
   return std::nullopt;
+}
+
+bool SDLInputDriver::IsControllerConnected(const ControllerState& state) const {
+  return state.gamepad || state.joystick;
+}
+
+SDL_Joystick* SDLInputDriver::GetControllerJoystick(const ControllerState& state) const {
+  if (state.gamepad) {
+    return SDL_GetGamepadJoystick(state.gamepad);
+  }
+  return state.joystick;
+}
+
+void SDLInputDriver::StopControllerFeedback(ControllerState& state, bool preserve_running) {
+  if (state.gamepad) {
+    SDL_RumbleGamepad(state.gamepad, 0, 0, 0);
+  }
+  if (state.haptic) {
+    std::array<bool, kWheelForceFeedbackEffectSlots> preserve_effect = {};
+    const bool status_supported = (SDL_GetHapticFeatures(state.haptic) & SDL_HAPTIC_STATUS) != 0;
+    if (preserve_running) {
+      for (size_t effect_slot = 0; effect_slot < state.force_feedback_effects.size();
+           ++effect_slot) {
+        const auto& effect = state.force_feedback_effects[effect_slot];
+        const bool status_playing = effect.running && status_supported && effect.effect_id >= 0 &&
+                                    SDL_GetHapticEffectStatus(state.haptic, effect.effect_id);
+        preserve_effect[effect_slot] =
+            ShouldPreserveWheelForceFeedback(effect.duration_ms, effect.resume_pending,
+                                             effect.running, status_supported, status_playing);
+      }
+    }
+    if (SDL_HapticRumbleSupported(state.haptic)) {
+      SDL_StopHapticRumble(state.haptic);
+    }
+    SDL_StopHapticEffects(state.haptic);
+    for (size_t effect_slot = 0; effect_slot < state.force_feedback_effects.size(); ++effect_slot) {
+      auto& effect = state.force_feedback_effects[effect_slot];
+      if (preserve_running) {
+        effect.resume_pending = preserve_effect[effect_slot];
+      } else {
+        effect.resume_pending = false;
+      }
+      effect.running = false;
+    }
+  }
+}
+
+void SDLInputDriver::ResumeControllerFeedback(ControllerState& state, const char* reason) {
+  if (!state.haptic || !has_focus_.load()) {
+    return;
+  }
+  for (size_t effect_slot = 0; effect_slot < state.force_feedback_effects.size(); ++effect_slot) {
+    auto& effect = state.force_feedback_effects[effect_slot];
+    if (!effect.resume_pending || effect.effect_id < 0) {
+      continue;
+    }
+    if (!SDL_RunHapticEffect(state.haptic, effect.effect_id, effect.iterations)) {
+      REXLOG_ERROR("SDL wheel FFB {} resume failed for slot {}: {}", reason, effect_slot + 1,
+                   SDL_GetError());
+      continue;
+    }
+    effect.running = true;
+    effect.resume_pending = false;
+    state.force_feedback_total_start_count++;
+    REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=resume slot={} type={} reason={}", effect_slot + 1,
+                GetWheelEffectTypeName(effect.type), reason);
+  }
+}
+
+void SDLInputDriver::CloseController(ControllerState& state) {
+  StopControllerFeedback(state);
+  if (state.haptic) {
+    uint32_t created_effects = 0;
+    for (auto& effect : state.force_feedback_effects) {
+      if (effect.effect_id >= 0) {
+        SDL_DestroyHapticEffect(state.haptic, effect.effect_id);
+        effect.effect_id = -1;
+        created_effects++;
+      }
+    }
+    if (created_effects || state.force_feedback_total_start_count ||
+        state.force_feedback_total_update_count) {
+      REXLOG_INFO(
+          "SDL_WHEEL_FFB_SUMMARY v=2 created_effects={} starts={} updates={} gain_percent={}",
+          created_effects, state.force_feedback_total_start_count,
+          state.force_feedback_total_update_count, REXCVAR_GET(wheel_force_feedback_gain));
+    }
+    SDL_CloseHaptic(state.haptic);
+  }
+  if (state.gamepad) {
+    SDL_CloseGamepad(state.gamepad);
+  } else if (state.joystick) {
+    SDL_CloseJoystick(state.joystick);
+  }
+  state = {};
 }
 
 SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(uint32_t user_index) {
@@ -707,7 +1356,7 @@ SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(uint32_t use
     return nullptr;
   }
   auto controller = &controllers_.at(*controller_index);
-  if (!controller->sdl) {
+  if (!IsControllerConnected(*controller)) {
     return nullptr;
   }
   return controller;
@@ -726,7 +1375,7 @@ std::optional<size_t> SDLInputDriver::ResolveControllerIndex(uint32_t user_index
 uint32_t SDLInputDriver::GetConnectedControllerMask() const {
   uint32_t mask = 0;
   for (uint32_t slot = 0; slot < controllers_.size(); ++slot) {
-    if (controllers_.at(slot).sdl) {
+    if (IsControllerConnected(controllers_.at(slot))) {
       mask |= uint32_t(1) << slot;
     }
   }
@@ -734,7 +1383,8 @@ uint32_t SDLInputDriver::GetConnectedControllerMask() const {
 }
 
 void SDLInputDriver::SelectActiveControllerLocked(size_t controller_index, const char* reason) {
-  if (controller_index >= controllers_.size() || !controllers_.at(controller_index).sdl ||
+  if (controller_index >= controllers_.size() ||
+      !IsControllerConnected(controllers_.at(controller_index)) ||
       active_controller_index_ == controller_index) {
     return;
   }
@@ -743,11 +1393,10 @@ void SDLInputDriver::SelectActiveControllerLocked(size_t controller_index, const
       active_controller_index_ ? static_cast<int>(*active_controller_index_) : -1;
   if (active_controller_index_) {
     auto& previous = controllers_.at(*active_controller_index_);
-    if (previous.sdl) {
-      SDL_RumbleGamepad(previous.sdl, 0, 0, 0);
-    }
+    StopControllerFeedback(previous, true);
   }
   active_controller_index_ = controller_index;
+  ResumeControllerFeedback(controllers_.at(controller_index), "active-controller");
   for (auto& keystroke_state : keystroke_states_) {
     keystroke_state = {};
   }
@@ -783,7 +1432,7 @@ bool SDLInputDriver::TestSDLVersion() const {
 }
 
 void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
-  assert(state.sdl);
+  assert(IsControllerConnected(state));
   uint16_t cap_flags = 0x0;
 
   // The RAWINPUT driver combines and enhances input from different APIs. For
@@ -793,41 +1442,56 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   // should not be a problem, when in doubt disable the RAWINPUT driver via hint
   // (env var).
 
-  if (SDL_GetJoystickConnectionState(SDL_GetGamepadJoystick(state.sdl)) ==
-      SDL_JOYSTICK_CONNECTION_WIRELESS) {
+  SDL_Joystick* joystick = GetControllerJoystick(state);
+  if (SDL_GetJoystickConnectionState(joystick) == SDL_JOYSTICK_CONNECTION_WIRELESS) {
     cap_flags |= X_INPUT_CAPS_WIRELESS;
   }
 
-  // Don't advertise the Xbox 360 force-feedback interface until the
-  // XInputdFF* exports are implemented. SDL rumble may still be used by the
-  // host-side diagnostic path, but exposing this flag makes titles enter an
-  // unsupported guest force-feedback path.
+  if (state.is_wheel && state.haptic && REXCVAR_GET(wheel_force_feedback) &&
+      (SDL_GetHapticFeatures(state.haptic) & kMclaWheelHapticFeatures) != 0) {
+    cap_flags |= X_INPUT_CAPS_FFB_SUPPORTED;
+  }
 
-  // Check if all navigational buttons are present
-  static constexpr std::array<SDL_GamepadButton, 6> nav_buttons = {
-      SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,      SDL_GAMEPAD_BUTTON_DPAD_UP,
-      SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
-  };
-  for (auto it = nav_buttons.begin(); it < nav_buttons.end(); it++) {
-    if (!SDL_GamepadHasButton(state.sdl, *it)) {
+  if (state.is_wheel) {
+    const WheelMapping mapping = GetConfiguredWheelMapping();
+    const bool has_dpad_hat = SDL_GetNumJoystickHats(joystick) >= 1;
+    const bool has_mapped_dpad = mapping.dpad_up_button >= 0 && mapping.dpad_down_button >= 0 &&
+                                 mapping.dpad_left_button >= 0 && mapping.dpad_right_button >= 0;
+    if ((!has_dpad_hat && !has_mapped_dpad) || mapping.start_button < 0 ||
+        mapping.back_button < 0) {
       cap_flags |= X_INPUT_CAPS_NO_NAVIGATION;
-      break;
+    }
+  } else {
+    // Check if all navigational buttons are present.
+    static constexpr std::array<SDL_GamepadButton, 6> nav_buttons = {
+        SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,      SDL_GAMEPAD_BUTTON_DPAD_UP,
+        SDL_GAMEPAD_BUTTON_DPAD_DOWN, SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
+    };
+    for (auto it = nav_buttons.begin(); it < nav_buttons.end(); it++) {
+      if (!SDL_GamepadHasButton(state.gamepad, *it)) {
+        cap_flags |= X_INPUT_CAPS_NO_NAVIGATION;
+        break;
+      }
     }
   }
 
   auto& c = state.caps;
-  c.type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
-  c.sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
+  c.type = 0x01;                              // XINPUT_DEVTYPE_GAMEPAD
+  c.sub_type = state.is_wheel ? 0x02 : 0x01;  // WHEEL or GAMEPAD
   c.flags = cap_flags;
-  c.gamepad.buttons = 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
+  c.gamepad.buttons =
+      state.is_wheel
+          ? 0xF3FF | (GetConfiguredWheelMapping().guide_button >= 0 ? X_INPUT_GAMEPAD_GUIDE : 0x0)
+          : 0xF3FF | (REXCVAR_GET(guide_button) ? X_INPUT_GAMEPAD_GUIDE : 0x0);
   c.gamepad.left_trigger = 0xFF;
   c.gamepad.right_trigger = 0xFF;
   c.gamepad.thumb_lx = static_cast<int16_t>(0xFFFFu);
-  c.gamepad.thumb_ly = static_cast<int16_t>(0xFFFFu);
-  c.gamepad.thumb_rx = static_cast<int16_t>(0xFFFFu);
-  c.gamepad.thumb_ry = static_cast<int16_t>(0xFFFFu);
-  c.vibration.left_motor_speed = 0xFFFFu;
-  c.vibration.right_motor_speed = 0xFFFFu;
+  c.gamepad.thumb_ly = state.is_wheel ? 0 : static_cast<int16_t>(0xFFFFu);
+  c.gamepad.thumb_rx = state.is_wheel ? 0 : static_cast<int16_t>(0xFFFFu);
+  c.gamepad.thumb_ry = state.is_wheel ? 0 : static_cast<int16_t>(0xFFFFu);
+  const uint16_t vibration_caps = state.is_wheel ? 0 : 0xFFFFu;
+  c.vibration.left_motor_speed = vibration_caps;
+  c.vibration.right_motor_speed = vibration_caps;
 }
 
 void SDLInputDriver::QueueControllerUpdate() {

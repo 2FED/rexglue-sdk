@@ -43,6 +43,12 @@ class InputSystem : public system::IInputSystem {
   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
+  uint32_t GetForceFeedbackMaxEffectSlots(uint32_t user_index);
+  X_RESULT SetForceFeedbackEffect(uint32_t user_index, const ForceFeedbackEffect& effect,
+                                  bool update);
+  X_RESULT SetForceFeedbackEffectRunning(uint32_t user_index, uint32_t effect_index, bool running,
+                                         uint32_t iterations);
+  X_RESULT ForceFeedbackDeviceControl(uint32_t user_index, uint32_t command);
 
  private:
   rex::ui::Window* window_ = nullptr;

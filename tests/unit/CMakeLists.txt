@@ -6,6 +6,7 @@ add_executable(unit_tests
     memory/heap_allocation_test.cpp
     input/sdl_slot_mapping_test.cpp
     input/sdl_controller_matrix_test.cpp
+    input/sdl_wheel_mapping_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
     kernel/offline_service_route_test.cpp
@@ -35,6 +36,14 @@ add_executable(unit_tests
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
+)
+
+add_executable(sdl_wheel_probe
+    input/sdl_wheel_probe.cpp
+)
+target_link_libraries(sdl_wheel_probe PRIVATE SDL3::SDL3)
+set_target_properties(sdl_wheel_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:rexruntime>
 )
 
 target_sources(unit_tests PRIVATE
