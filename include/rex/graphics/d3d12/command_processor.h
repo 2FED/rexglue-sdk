@@ -471,6 +471,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t performance_timestamp_submissions_[kQueueFrames] = {};
   uint64_t performance_timestamp_frames_[kQueueFrames] = {};
   bool performance_timestamp_begin_pending_ = false;
+  bool performance_timestamp_frame_active_ = false;
   std::chrono::steady_clock::time_point performance_cpu_frame_start_{};
 
   struct CommandAllocator {

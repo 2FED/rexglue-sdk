@@ -33,6 +33,14 @@ Latest SDK builds and releases are published on [GitHub Releases](https://github
 
 For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
 
+### Application-triggered performance audit
+
+D3D12 applications may call `rex::perf::ArmFrameAuditForDiagnostics()` after
+startup to emit one bounded 300-frame CPU/GPU, streaming, audio, shader, and
+pipeline telemetry window. The call returns `false` when an audit is already
+active or GPU timestamp resources are unavailable. Timestamp queries are
+submitted only while an audit is active.
+
 # **Disclaimer**
 ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 
 

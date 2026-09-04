@@ -64,6 +64,7 @@ struct Totals {
 std::mutex audit_mutex;
 bool audit_initialized = false;
 std::atomic<bool> audit_enabled = false;
+std::atomic<bool> audit_gpu_timing_available = false;
 uint64_t active_guest_frame = 0;
 uint64_t emitted_samples = 0;
 uint64_t marker_overflow = 0;
@@ -140,6 +141,31 @@ bool InitializeFrameAudit() {
 
 bool IsFrameAuditEnabled() {
   return audit_enabled.load(std::memory_order_acquire);
+}
+
+void SetFrameAuditGpuTimingAvailable(bool available) {
+  audit_gpu_timing_available.store(available, std::memory_order_release);
+}
+
+bool ArmFrameAuditForDiagnostics() {
+  std::lock_guard<std::mutex> lock(audit_mutex);
+  InitializeLocked();
+  if (audit_enabled.load(std::memory_order_relaxed) ||
+      !audit_gpu_timing_available.load(std::memory_order_acquire)) {
+    return false;
+  }
+  active_guest_frame = 0;
+  emitted_samples = 0;
+  marker_overflow = 0;
+  pending_frames.clear();
+  totals = {};
+  audit_enabled.store(true, std::memory_order_release);
+  REXLOG_INFO(
+      "REX_PERF_AUDIT_CONFIG v=1 enabled=1 backend=d3d12 sample_limit={} "
+      "streaming_stall_us={}",
+      kSampleLimit, kFrameAuditStreamingStallUs);
+  REXLOG_INFO("REX_PERF_AUDIT_TRIGGER v=1 source=application-diagnostics");
+  return true;
 }
 
 void BeginGuestFrame(uint64_t guest_frame) {

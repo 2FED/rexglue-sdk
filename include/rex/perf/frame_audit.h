@@ -26,6 +26,14 @@ constexpr uint64_t ConvertGpuTicksToMicroseconds(uint64_t ticks, uint64_t freque
 
 bool InitializeFrameAudit();
 bool IsFrameAuditEnabled();
+// Called by a graphics backend after the timestamp resources required for a
+// complete CPU/GPU audit have been created or destroyed.
+void SetFrameAuditGpuTimingAvailable(bool available);
+// Arms one bounded 300-frame audit after startup, for example from an
+// application diagnostic hotkey. Returns false while an audit is already
+// active or when GPU timing is unavailable, so an accidental repeated key
+// press can't discard an in-flight capture or start one that cannot finish.
+bool ArmFrameAuditForDiagnostics();
 void BeginGuestFrame(uint64_t guest_frame);
 void RecordCpuFrame(uint64_t guest_frame, uint64_t elapsed_us);
 void RecordGpuFrame(uint64_t guest_frame, uint64_t elapsed_us);

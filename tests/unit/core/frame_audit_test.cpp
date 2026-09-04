@@ -25,3 +25,13 @@ TEST_CASE("Performance telemetry converts D3D12 ticks without host floating poin
   CHECK(rex::perf::ConvertGpuTicksToMicroseconds(100000, 10000000) == 10000);
   CHECK(rex::perf::ConvertGpuTicksToMicroseconds(12345, 0) == 0);
 }
+
+TEST_CASE("Performance telemetry diagnostic trigger requires timing and cannot reset",
+          "[perf][frame-audit]") {
+  rex::perf::SetFrameAuditGpuTimingAvailable(false);
+  CHECK_FALSE(rex::perf::ArmFrameAuditForDiagnostics());
+  rex::perf::SetFrameAuditGpuTimingAvailable(true);
+  CHECK(rex::perf::ArmFrameAuditForDiagnostics());
+  CHECK(rex::perf::IsFrameAuditEnabled());
+  CHECK_FALSE(rex::perf::ArmFrameAuditForDiagnostics());
+}
