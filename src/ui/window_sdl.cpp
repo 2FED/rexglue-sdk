@@ -405,6 +405,24 @@ void WindowSDL::HandleDropEvent(SDL_Event& event) {
 }
 
 void WindowSDL::HandleKeyEvent(SDL_Event& event) {
+  const bool is_return =
+      event.key.scancode == SDL_SCANCODE_RETURN || event.key.scancode == SDL_SCANCODE_KP_ENTER;
+  if (is_return) {
+    if (event.type == SDL_EVENT_KEY_DOWN && (event.key.mod & SDL_KMOD_ALT) != 0) {
+      if (!event.key.repeat) {
+        const bool fullscreen = !IsFullscreen();
+        SetFullscreen(fullscreen);
+        suppress_alt_enter_key_up_ = true;
+        REXLOG_INFO("REX_WINDOW_FULLSCREEN_TOGGLE v=1 source=alt-enter fullscreen={}", fullscreen);
+      }
+      return;
+    }
+    if (event.type == SDL_EVENT_KEY_UP && suppress_alt_enter_key_up_) {
+      suppress_alt_enter_key_up_ = false;
+      return;
+    }
+  }
+
   VirtualKey virtual_key = TranslateSDLScancode(event.key.scancode);
   if (virtual_key == VirtualKey::kNone) {
     return;
@@ -464,6 +482,23 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
+      const bool is_left_button = event.button.button == SDL_BUTTON_LEFT;
+      if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && is_left_button && event.button.clicks >= 2 &&
+          (event.button.clicks % 2) == 0) {
+        const bool fullscreen = !IsFullscreen();
+        SetFullscreen(fullscreen);
+        suppress_double_click_mouse_up_ = true;
+        REXLOG_INFO(
+            "REX_WINDOW_FULLSCREEN_TOGGLE v=1 source=left-double-click "
+            "fullscreen={}",
+            fullscreen);
+        return;
+      }
+      if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && is_left_button &&
+          suppress_double_click_mouse_up_) {
+        suppress_double_click_mouse_up_ = false;
+        return;
+      }
       MouseEvent e(this, TranslateSDLMouseButton(event.button.button),
                    int32_t(event.button.x * density), int32_t(event.button.y * density));
       if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {

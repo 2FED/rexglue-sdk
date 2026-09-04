@@ -74,6 +74,8 @@ class WindowSDL final : public Window {
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
   std::atomic<bool> paint_pending_{false};
+  bool suppress_alt_enter_key_up_ = false;
+  bool suppress_double_click_mouse_up_ = false;
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;
 };
