@@ -33,6 +33,14 @@ Latest SDK builds and releases are published on [GitHub Releases](https://github
 
 For quick start guide, full CLI reference, and config file options, see the [wiki](https://github.com/rexglue/rexglue-sdk/wiki).
 
+### Runtime GPU backend selection
+
+When an SDK build contains more than one graphics backend, applications may
+select one at startup with `--gpu_backend=any|d3d12|vulkan`. `any` preserves
+the platform preference (D3D12 before Vulkan on Windows). Applications may also
+set `RuntimeConfig::gpu_backend` in `ReXApp::OnPreSetup`; an explicit command
+line or config-file value remains authoritative.
+
 ### Application-triggered performance audit
 
 D3D12 applications may call `rex::perf::ArmFrameAuditForDiagnostics()` after

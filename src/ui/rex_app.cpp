@@ -49,6 +49,9 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                       "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                       "GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "GPU backend requested from the plugin: any, d3d12, or vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 
@@ -307,6 +310,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
 
 bool ReXApp::SetupPresentation() {
   config_.gpu_plugin = REXCVAR_GET(gpu_plugin);
+  config_.gpu_backend = REXCVAR_GET(gpu_backend);
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
@@ -314,11 +318,13 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    config_.graphics =
+        rex::system::LoadGpuPlugin(config_.gpu_plugin, config_.gpu_backend);
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
-      auto msg =
-          fmt::format("Failed to load GPU plugin '{}'. See log for details.", config_.gpu_plugin);
+      auto msg = fmt::format(
+          "Failed to load GPU plugin '{}' with backend '{}'. See log for details.",
+          config_.gpu_plugin, config_.gpu_backend);
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
       return false;

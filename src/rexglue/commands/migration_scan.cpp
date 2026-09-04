@@ -84,7 +84,18 @@ void WalkProjectFiles(const fs::path& project_root, Accept accept, Visit visit) 
 
 bool IsPathTokenChar(char c) {
   unsigned char uc = static_cast<unsigned char>(c);
-  return std::isalnum(uc) != 0 || c == '_' || c == '-' || c == '.' || c == '/' || c == '\\';
+  return std::isalnum(uc) != 0 || c == '_' || c == '-' || c == '.';
+}
+
+std::string NormalizeLineEndings(std::string_view content) {
+  std::string normalized;
+  normalized.reserve(content.size());
+  for (std::size_t i = 0; i < content.size(); ++i) {
+    if (content[i] == '\r' && i + 1 < content.size() && content[i + 1] == '\n')
+      continue;
+    normalized.push_back(content[i]);
+  }
+  return normalized;
 }
 
 bool ReplaceAllPathTokens(std::string& haystack, std::string_view needle,
@@ -332,7 +343,7 @@ std::vector<OverwriteEntry> ScanSdkTemplateDrift(const fs::path& project_root,
   fs::path rexglue_cmake = project_root / "generated" / "rexglue.cmake";
   std::string rendered = RenderRexglueCmake(project_name, sdk_version, entrypoint_out_dir);
   std::string on_disk = fs::exists(rexglue_cmake) ? read_file(rexglue_cmake) : std::string{};
-  if (rendered != on_disk) {
+  if (NormalizeLineEndings(rendered) != NormalizeLineEndings(on_disk)) {
     plan.push_back({rexglue_cmake, std::move(rendered), OverwriteAction::Write, /*silent=*/true,
                     fmt::format("regenerate SDK helper for v{}", sdk_version)});
   }
@@ -385,8 +396,11 @@ std::vector<OverwriteEntry> ScanSourceIncludeRewrites(const fs::path& project_ro
 
     std::vector<std::string> lines;
     std::string buf;
+    const bool use_crlf = content.find("\r\n") != std::string::npos;
     for (char c : content) {
       if (c == '\n') {
+        if (!buf.empty() && buf.back() == '\r')
+          buf.pop_back();
         lines.push_back(std::move(buf));
         buf.clear();
       } else {
@@ -415,7 +429,7 @@ std::vector<OverwriteEntry> ScanSourceIncludeRewrites(const fs::path& project_ro
       auto append_line = [&](std::string_view payload) {
         out.append(payload);
         if (li + 1 < lines.size() || has_trailing_newline)
-          out.push_back('\n');
+          out.append(use_crlf ? "\r\n" : "\n");
       };
 
       if (!target || ToLower(ExtractIncludeBasename(*target)) != old_basename_lc) {

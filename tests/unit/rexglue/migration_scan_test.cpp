@@ -11,6 +11,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -23,7 +25,10 @@ namespace {
 struct TempProject {
   fs::path root;
   explicit TempProject(const std::string& tag = "migration_scan_test")
-      : root(fs::temp_directory_path() / tag) {
+      : root(fs::temp_directory_path() /
+             (tag + "_" +
+              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+              std::to_string(next_id.fetch_add(1, std::memory_order_relaxed)))) {
     fs::remove_all(root);
     fs::create_directories(root / "generated");
   }
@@ -39,6 +44,9 @@ struct TempProject {
     std::ofstream f(root / rel);
     f << content;
   }
+
+ private:
+  inline static std::atomic<uint64_t> next_id{0};
 };
 
 }  // namespace
