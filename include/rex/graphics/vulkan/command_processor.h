@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -129,6 +130,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   VulkanCommandProcessor(VulkanGraphicsSystem* graphics_system, system::KernelState* kernel_state);
   ~VulkanCommandProcessor();
+
+  GraphicsPerformanceDiagnosticSnapshot GetPerformanceDiagnosticSnapshot() const override;
 
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
@@ -541,6 +544,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
+  std::chrono::steady_clock::time_point performance_frame_start_{};
+  std::atomic<uint64_t> performance_guest_frames_opened_{0};
+  std::atomic<uint64_t> performance_guest_frames_closed_{0};
+  std::atomic<uint64_t> performance_issue_swap_calls_{0};
+  std::atomic<uint64_t> performance_guest_output_refresh_successes_{0};
+  std::atomic<uint64_t> performance_guest_output_refresh_failures_{0};
+  std::atomic<uint64_t> performance_async_placeholder_skips_{0};
+  std::atomic<uint64_t> performance_swap_source_missing_{0};
+  std::atomic<uint64_t> performance_submission_count_{0};
+  std::atomic<uint64_t> performance_frame_fence_wait_us_{0};
+  std::atomic<uint64_t> performance_pipeline_end_submission_us_{0};
+  std::atomic<uint64_t> performance_deferred_execute_us_{0};
+  std::atomic<uint64_t> performance_queue_submit_us_{0};
+  std::atomic<uint64_t> performance_guest_frame_wall_us_{0};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

@@ -74,6 +74,33 @@ enum class GammaRampType {
   kPWL,
 };
 
+// Monotonic, lock-free counters intended for an application-owned diagnostic
+// snapshot. Values are totals since graphics backend initialization so two
+// snapshots from the same process can be differenced without pausing the GPU
+// command thread.
+struct GraphicsPerformanceDiagnosticSnapshot {
+  enum class Backend : uint32_t {
+    kUnknown = 0,
+    kD3D12 = 1,
+    kVulkan = 2,
+  };
+
+  Backend backend = Backend::kUnknown;
+  uint64_t guest_frames_opened = 0;
+  uint64_t guest_frames_closed = 0;
+  uint64_t issue_swap_calls = 0;
+  uint64_t guest_output_refresh_successes = 0;
+  uint64_t guest_output_refresh_failures = 0;
+  uint64_t async_placeholder_skips = 0;
+  uint64_t swap_source_missing = 0;
+  uint64_t submission_count = 0;
+  uint64_t frame_fence_wait_us = 0;
+  uint64_t pipeline_end_submission_us = 0;
+  uint64_t deferred_execute_us = 0;
+  uint64_t queue_submit_us = 0;
+  uint64_t guest_frame_wall_us = 0;
+};
+
 class CommandProcessor {
  public:
   enum class SwapPostEffect {
@@ -109,6 +136,11 @@ class CommandProcessor {
   // for instance).
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
+
+  virtual GraphicsPerformanceDiagnosticSnapshot
+  GetPerformanceDiagnosticSnapshot() const {
+    return {};
+  }
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -597,6 +598,36 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
 }
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+
+GraphicsPerformanceDiagnosticSnapshot
+VulkanCommandProcessor::GetPerformanceDiagnosticSnapshot() const {
+  GraphicsPerformanceDiagnosticSnapshot snapshot;
+  snapshot.backend = GraphicsPerformanceDiagnosticSnapshot::Backend::kVulkan;
+  snapshot.guest_frames_opened =
+      performance_guest_frames_opened_.load(std::memory_order_relaxed);
+  snapshot.guest_frames_closed =
+      performance_guest_frames_closed_.load(std::memory_order_relaxed);
+  snapshot.issue_swap_calls = performance_issue_swap_calls_.load(std::memory_order_relaxed);
+  snapshot.guest_output_refresh_successes =
+      performance_guest_output_refresh_successes_.load(std::memory_order_relaxed);
+  snapshot.guest_output_refresh_failures =
+      performance_guest_output_refresh_failures_.load(std::memory_order_relaxed);
+  snapshot.async_placeholder_skips =
+      performance_async_placeholder_skips_.load(std::memory_order_relaxed);
+  snapshot.swap_source_missing =
+      performance_swap_source_missing_.load(std::memory_order_relaxed);
+  snapshot.submission_count = performance_submission_count_.load(std::memory_order_relaxed);
+  snapshot.frame_fence_wait_us =
+      performance_frame_fence_wait_us_.load(std::memory_order_relaxed);
+  snapshot.pipeline_end_submission_us =
+      performance_pipeline_end_submission_us_.load(std::memory_order_relaxed);
+  snapshot.deferred_execute_us =
+      performance_deferred_execute_us_.load(std::memory_order_relaxed);
+  snapshot.queue_submit_us = performance_queue_submit_us_.load(std::memory_order_relaxed);
+  snapshot.guest_frame_wall_us =
+      performance_guest_frame_wall_us_.load(std::memory_order_relaxed);
+  return snapshot;
+}
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
@@ -2285,6 +2316,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  performance_issue_swap_calls_.fetch_add(1, std::memory_order_relaxed);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2306,6 +2338,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
+    performance_async_placeholder_skips_.fetch_add(1, std::memory_order_relaxed);
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
       skipped_incomplete_frame_logged = true;
@@ -2329,7 +2362,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    performance_swap_source_missing_.fetch_add(1, std::memory_order_relaxed);
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+    EndSubmission(true);
     return;
   }
   // The swap gamma / FXAA pass samples source texels by pixel index, but swap
@@ -2421,7 +2456,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool guest_output_refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
@@ -2936,6 +2971,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+
+  if (guest_output_refreshed) {
+    performance_guest_output_refresh_successes_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    performance_guest_output_refresh_failures_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -5144,7 +5185,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+  auto fence_wait_start = std::chrono::steady_clock::now();
   CheckSubmissionFenceAndDeviceLoss(await_submission);
+  if (is_opening_frame) {
+    performance_frame_fence_wait_us_.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - fence_wait_start)
+                     .count()),
+        std::memory_order_relaxed);
+  }
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
@@ -5198,6 +5247,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    performance_frame_start_ = std::chrono::steady_clock::now();
+    performance_guest_frames_opened_.fetch_add(1, std::memory_order_relaxed);
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -5343,7 +5394,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     EndRenderPass();
 
+    auto pipeline_end_start = std::chrono::steady_clock::now();
     pipeline_cache_->EndSubmission();
+    performance_pipeline_end_submission_us_.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - pipeline_end_start)
+                     .count()),
+        std::memory_order_relaxed);
 
     render_target_cache_->EndSubmission();
 
@@ -5418,7 +5475,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    auto deferred_execute_start = std::chrono::steady_clock::now();
     deferred_command_buffer_.Execute(command_buffer.buffer);
+    performance_deferred_execute_us_.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - deferred_execute_start)
+                     .count()),
+        std::memory_order_relaxed);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;
@@ -5447,11 +5510,17 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       return false;
     }
     VkResult submit_result;
+    auto queue_submit_start = std::chrono::steady_clock::now();
     {
       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
     }
+    performance_queue_submit_us_.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - queue_submit_start)
+                     .count()),
+        std::memory_order_relaxed);
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
@@ -5473,6 +5542,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
     fences_free_.pop_back();
+    performance_submission_count_.fetch_add(1, std::memory_order_relaxed);
 
     submission_open_ = false;
   }
@@ -5482,6 +5552,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
     frame_open_ = false;
+    performance_guest_frames_closed_.fetch_add(1, std::memory_order_relaxed);
+    performance_guest_frame_wall_us_.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - performance_frame_start_)
+                     .count()),
+        std::memory_order_relaxed);
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 

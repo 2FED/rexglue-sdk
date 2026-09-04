@@ -49,6 +49,17 @@ pipeline telemetry window. The call returns `false` when an audit is already
 active or GPU timestamp resources are unavailable. Timestamp queries are
 submitted only while an audit is active.
 
+### Lightweight graphics performance snapshots
+
+Applications may call
+`CommandProcessor::GetPerformanceDiagnosticSnapshot()` to read monotonic,
+lock-free backend counters without pausing the graphics command thread. The
+Vulkan snapshot distinguishes guest-frame cadence, swap/output outcomes,
+frame-fence waits, pipeline finalization, deferred command replay, and queue
+submission time. Applications should difference two snapshots from the same
+process; the default implementation reports an unknown backend with zero
+counters.
+
 # **Disclaimer**
 ReXGlue is not affiliated with nor endorsed by Microsoft or Xbox. It is an independent project created for educational and development purposes. All trademarks and copyrights belong to their respective owners. 
 
