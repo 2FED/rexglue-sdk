@@ -599,14 +599,12 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
-GraphicsPerformanceDiagnosticSnapshot
-VulkanCommandProcessor::GetPerformanceDiagnosticSnapshot() const {
+GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiagnosticSnapshot()
+    const {
   GraphicsPerformanceDiagnosticSnapshot snapshot;
   snapshot.backend = GraphicsPerformanceDiagnosticSnapshot::Backend::kVulkan;
-  snapshot.guest_frames_opened =
-      performance_guest_frames_opened_.load(std::memory_order_relaxed);
-  snapshot.guest_frames_closed =
-      performance_guest_frames_closed_.load(std::memory_order_relaxed);
+  snapshot.guest_frames_opened = performance_guest_frames_opened_.load(std::memory_order_relaxed);
+  snapshot.guest_frames_closed = performance_guest_frames_closed_.load(std::memory_order_relaxed);
   snapshot.issue_swap_calls = performance_issue_swap_calls_.load(std::memory_order_relaxed);
   snapshot.guest_output_refresh_successes =
       performance_guest_output_refresh_successes_.load(std::memory_order_relaxed);
@@ -614,18 +612,14 @@ VulkanCommandProcessor::GetPerformanceDiagnosticSnapshot() const {
       performance_guest_output_refresh_failures_.load(std::memory_order_relaxed);
   snapshot.async_placeholder_skips =
       performance_async_placeholder_skips_.load(std::memory_order_relaxed);
-  snapshot.swap_source_missing =
-      performance_swap_source_missing_.load(std::memory_order_relaxed);
+  snapshot.swap_source_missing = performance_swap_source_missing_.load(std::memory_order_relaxed);
   snapshot.submission_count = performance_submission_count_.load(std::memory_order_relaxed);
-  snapshot.frame_fence_wait_us =
-      performance_frame_fence_wait_us_.load(std::memory_order_relaxed);
+  snapshot.frame_fence_wait_us = performance_frame_fence_wait_us_.load(std::memory_order_relaxed);
   snapshot.pipeline_end_submission_us =
       performance_pipeline_end_submission_us_.load(std::memory_order_relaxed);
-  snapshot.deferred_execute_us =
-      performance_deferred_execute_us_.load(std::memory_order_relaxed);
+  snapshot.deferred_execute_us = performance_deferred_execute_us_.load(std::memory_order_relaxed);
   snapshot.queue_submit_us = performance_queue_submit_us_.load(std::memory_order_relaxed);
-  snapshot.guest_frame_wall_us =
-      performance_guest_frame_wall_us_.load(std::memory_order_relaxed);
+  snapshot.guest_frame_wall_us = performance_guest_frame_wall_us_.load(std::memory_order_relaxed);
   return snapshot;
 }
 

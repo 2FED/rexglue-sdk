@@ -137,8 +137,7 @@ class CommandProcessor {
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
 
-  virtual GraphicsPerformanceDiagnosticSnapshot
-  GetPerformanceDiagnosticSnapshot() const {
+  virtual GraphicsPerformanceDiagnosticSnapshot GetPerformanceDiagnosticSnapshot() const {
     return {};
   }
 
