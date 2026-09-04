@@ -450,6 +450,11 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+runtime::MemoryAccessDiagnosticSnapshot Memory::GetAccessDiagnosticSnapshot() const {
+  return mmio_handler_ ? mmio_handler_->GetAccessDiagnosticSnapshot()
+                       : runtime::MemoryAccessDiagnosticSnapshot{};
+}
+
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                      void* host_address, bool is_write) {
   // Access via physical_membase_ is special, when need to bypass everything

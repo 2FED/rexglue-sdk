@@ -39,6 +39,15 @@ class ImGuiDialog {
 
   void Draw();
 
+  // UI thread only. Hidden persistent dialogs must not keep the presenter
+  // repainting unchanged guest output just to poll for future notifications.
+  void SetVisible(bool visible);
+  bool is_visible() const { return visible_; }
+
+  // May be called from any thread while this dialog is alive. Pending work
+  // becomes a no-op if the dialog is destroyed before the UI queue runs.
+  void RequestVisibility(bool visible);
+
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);
 
@@ -54,6 +63,8 @@ class ImGuiDialog {
 
  private:
   ImGuiDrawer* imgui_drawer_ = nullptr;
+  bool visible_ = false;
+  std::shared_ptr<ImGuiDialog*> visibility_target_;
   bool has_close_pending_ = false;
   std::vector<rex::thread::Fence*> waiting_fences_;
 };

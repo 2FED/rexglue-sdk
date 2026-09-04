@@ -1,0 +1,7 @@
+id: no-unbounded-diagnostic-copy
+valid:
+  - memcpy(destination, source, size);
+  - strcpy_s(destination, capacity, source);
+invalid:
+  - strcpy(destination, source);
+  - std::strcpy(destination, source);

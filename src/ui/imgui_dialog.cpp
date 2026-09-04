@@ -18,15 +18,39 @@
 namespace rex {
 namespace ui {
 
-ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer) : imgui_drawer_(imgui_drawer) {
-  imgui_drawer_->AddDialog(this);
+ImGuiDialog::ImGuiDialog(ImGuiDrawer* imgui_drawer)
+    : imgui_drawer_(imgui_drawer), visibility_target_(std::make_shared<ImGuiDialog*>(this)) {
+  SetVisible(true);
 }
 
 ImGuiDialog::~ImGuiDialog() {
-  imgui_drawer_->RemoveDialog(this);
+  visibility_target_.reset();
+  SetVisible(false);
   for (auto fence : waiting_fences_) {
     fence->Signal();
   }
+}
+
+void ImGuiDialog::SetVisible(bool visible) {
+  assert_true(imgui_drawer_->window()->app_context().IsInUIThread());
+  if (visible_ == visible) {
+    return;
+  }
+  visible_ = visible;
+  if (visible) {
+    imgui_drawer_->AddDialog(this);
+  } else {
+    imgui_drawer_->RemoveDialog(this);
+  }
+}
+
+void ImGuiDialog::RequestVisibility(bool visible) {
+  std::weak_ptr<ImGuiDialog*> target = visibility_target_;
+  imgui_drawer_->window()->app_context().CallInUIThreadDeferred([target, visible]() {
+    if (auto alive = target.lock()) {
+      (*alive)->SetVisible(visible);
+    }
+  });
 }
 
 void ImGuiDialog::Then(rex::thread::Fence* fence) {

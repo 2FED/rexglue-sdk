@@ -20,13 +20,18 @@ namespace rex::ui {
 AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
                                                ImmediateDrawer* immediate_drawer,
                                                rex::Runtime* runtime)
-    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {}
+    : AchievementNotificationDialog(drawer), icon_cache_(immediate_drawer, runtime) {
+  SetVisible(false);
+}
 
 AchievementToastDialog::~AchievementToastDialog() {}
 
 void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  queue_.push_back({event, std::chrono::steady_clock::now()});
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    queue_.push_back({event, std::chrono::steady_clock::now()});
+  }
+  RequestVisibility(true);
 }
 
 void AchievementToastDialog::OnDraw(ImGuiIO& io) {
@@ -48,6 +53,7 @@ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
       }
     }
     if (queue_.empty()) {
+      SetVisible(false);
       return;
     }
     toast = queue_.front();

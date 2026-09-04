@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/system/xmemory.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
@@ -115,6 +117,19 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
 }
 
 CommandProcessor::~CommandProcessor() = default;
+
+GraphicsPerformanceDiagnosticSnapshot CommandProcessor::GetPerformanceDiagnosticSnapshot() const {
+  GraphicsPerformanceDiagnosticSnapshot snapshot;
+  snapshot.command_ring_idle_us = performance_command_ring_idle_us_.load(std::memory_order_relaxed);
+  snapshot.command_wait_reg_mem_us =
+      performance_command_wait_reg_mem_us_.load(std::memory_order_relaxed);
+  if (memory_) {
+    const auto memory_snapshot = memory_->GetAccessDiagnosticSnapshot();
+    snapshot.memory_non_mmio_write_fault_count = memory_snapshot.non_mmio_write_fault_count;
+    snapshot.memory_non_mmio_write_fault_us = memory_snapshot.non_mmio_write_fault_us;
+  }
+  return snapshot;
+}
 
 bool CommandProcessor::Initialize() {
   // Initialize the gamma ramps to their default (linear) values - taken from
@@ -290,6 +305,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
+      const auto idle_begin = std::chrono::steady_clock::now();
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
@@ -306,6 +322,11 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      performance_command_ring_idle_us_.fetch_add(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - idle_begin)
+                                    .count()),
+          std::memory_order_relaxed);
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -1127,6 +1148,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
+  // Immediately satisfied packets need no clock reads. A waited packet records
+  // one completed episode, not a clock read on each polling iteration.
+  bool wait_started = false;
+  std::chrono::steady_clock::time_point wait_begin;
+  const auto record_wait = [&]() {
+    if (wait_started) {
+      performance_command_wait_reg_mem_us_.fetch_add(
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - wait_begin)
+                                    .count()),
+          std::memory_order_relaxed);
+    }
+  };
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1169,6 +1203,10 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      if (!wait_started) {
+        wait_begin = std::chrono::steady_clock::now();
+        wait_started = true;
+      }
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1183,6 +1221,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
         if (!worker_running_) {
           // Short-circuited exit.
+          record_wait();
           return false;
         }
       } else {
@@ -1191,6 +1230,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
+  record_wait();
   return true;
 }
 

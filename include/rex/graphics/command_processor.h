@@ -99,6 +99,13 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   uint64_t deferred_execute_us = 0;
   uint64_t queue_submit_us = 0;
   uint64_t guest_frame_wall_us = 0;
+  // Completed command-thread wait episodes, including yield/sleep time.
+  uint64_t command_ring_idle_us = 0;
+  uint64_t command_wait_reg_mem_us = 0;
+  // Successfully handled non-MMIO write faults across all guest threads.
+  // These times may overlap each other and command-thread frame wall time.
+  uint64_t memory_non_mmio_write_fault_count = 0;
+  uint64_t memory_non_mmio_write_fault_us = 0;
 };
 
 class CommandProcessor {
@@ -137,9 +144,7 @@ class CommandProcessor {
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
 
-  virtual GraphicsPerformanceDiagnosticSnapshot GetPerformanceDiagnosticSnapshot() const {
-    return {};
-  }
+  virtual GraphicsPerformanceDiagnosticSnapshot GetPerformanceDiagnosticSnapshot() const;
 
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
@@ -311,6 +316,9 @@ class CommandProcessor {
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+
+  std::atomic<uint64_t> performance_command_ring_idle_us_{0};
+  std::atomic<uint64_t> performance_command_wait_reg_mem_us_{0};
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

@@ -601,7 +601,7 @@ VulkanCommandProcessor::~VulkanCommandProcessor() = default;
 
 GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiagnosticSnapshot()
     const {
-  GraphicsPerformanceDiagnosticSnapshot snapshot;
+  auto snapshot = CommandProcessor::GetPerformanceDiagnosticSnapshot();
   snapshot.backend = GraphicsPerformanceDiagnosticSnapshot::Backend::kVulkan;
   snapshot.guest_frames_opened = performance_guest_frames_opened_.load(std::memory_order_relaxed);
   snapshot.guest_frames_closed = performance_guest_frames_closed_.load(std::memory_order_relaxed);

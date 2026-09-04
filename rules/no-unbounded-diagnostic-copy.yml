@@ -1,0 +1,13 @@
+id: no-unbounded-diagnostic-copy
+language: Cpp
+severity: error
+message: Use bounded copying in dialog and runtime diagnostic paths.
+files:
+  - src/ui/imgui_dialog.cpp
+  - src/ui/overlay/achievement_toast.cpp
+  - src/system/mmio_handler.cpp
+  - src/graphics/command_processor.cpp
+rule:
+  any:
+    - pattern: strcpy($DESTINATION, $SOURCE)
+    - pattern: std::strcpy($DESTINATION, $SOURCE)

@@ -395,6 +395,8 @@ class Memory {
   // Gets the defined MMIO range for the given virtual address, if any.
   runtime::MMIORange* LookupVirtualMappedRange(uint32_t virtual_address);
 
+  runtime::MemoryAccessDiagnosticSnapshot GetAccessDiagnosticSnapshot() const;
+
   // Physical memory access callbacks, two types of them.
   //
   // This is simple per-system-page protection without reference counting or

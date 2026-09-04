@@ -41,6 +41,21 @@ rex::memory::BaseHeap* MutableHeap(const rex::memory::BaseHeap* heap) {
 // Size and Alignment Rounding Tests
 // =============================================================================
 
+TEST_CASE("Memory diagnostic snapshot is safe before initialization", "[memory][diagnostics]") {
+  rex::memory::Memory memory;
+  const auto snapshot = memory.GetAccessDiagnosticSnapshot();
+  CHECK(snapshot.non_mmio_write_fault_count == 0);
+  CHECK(snapshot.non_mmio_write_fault_us == 0);
+}
+
+TEST_CASE("Reading memory diagnostics does not change fault counters", "[memory][diagnostics]") {
+  auto& memory = GetTestMemory();
+  const auto first = memory.GetAccessDiagnosticSnapshot();
+  const auto second = memory.GetAccessDiagnosticSnapshot();
+  CHECK(second.non_mmio_write_fault_count == first.non_mmio_write_fault_count);
+  CHECK(second.non_mmio_write_fault_us == first.non_mmio_write_fault_us);
+}
+
 TEST_CASE("Heap allocation rounds size up to page size", "[memory][heap]") {
   auto& memory = GetTestMemory();
   auto* heap = MutableHeap(memory.LookupHeap(0x10000000));  // v00000000, 4KB pages

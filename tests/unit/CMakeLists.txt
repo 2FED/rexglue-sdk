@@ -36,6 +36,7 @@ add_executable(unit_tests
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
+    ui/imgui_dialog_test.cpp
 )
 
 add_executable(sdl_wheel_probe

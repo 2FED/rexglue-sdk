@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -29,6 +30,13 @@ MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
 MMIOHandler* MMIOHandler::global_handler() {
   return global_handler_;
+}
+
+MemoryAccessDiagnosticSnapshot MMIOHandler::GetAccessDiagnosticSnapshot() const {
+  MemoryAccessDiagnosticSnapshot snapshot;
+  snapshot.non_mmio_write_fault_count = non_mmio_write_fault_count_.load(std::memory_order_relaxed);
+  snapshot.non_mmio_write_fault_us = non_mmio_write_fault_us_.load(std::memory_order_relaxed);
+  return snapshot;
 }
 
 std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
@@ -402,6 +410,23 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
   }
   if (!range) {
+    // Count only successful write-fault recovery, including a watch another
+    // thread already cleared. This is deliberately not called pure write-watch
+    // time: recovery may also reconcile stale protection. Totals span threads
+    // and exclude the OS/Wine exception dispatch before this handler.
+    const auto fault_begin = is_write ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+    const auto record_handled_fault = [&](bool handled) {
+      if (handled && is_write) {
+        non_mmio_write_fault_us_.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - fault_begin)
+                                      .count()),
+            std::memory_order_relaxed);
+        non_mmio_write_fault_count_.fetch_add(1, std::memory_order_relaxed);
+      }
+      return handled;
+    };
     // Recheck if the pages are still protected (race condition - another thread
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
@@ -412,13 +437,13 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     if (cur_access != memory::PageAccess::kNoAccess &&
         (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
       // Another thread has cleared this watch. Abort.
-      return true;
+      return record_handled_fault(true);
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      return record_handled_fault(access_violation_callback_(
+          std::move(lock), access_violation_callback_context_, fault_host_address, is_write));
     }
     return false;
   }

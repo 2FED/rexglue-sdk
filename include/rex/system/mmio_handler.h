@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -36,6 +38,11 @@ struct MMIORange {
   void* callback_context;
   MMIOReadCallback read;
   MMIOWriteCallback write;
+};
+
+struct MemoryAccessDiagnosticSnapshot {
+  uint64_t non_mmio_write_fault_count = 0;
+  uint64_t non_mmio_write_fault_us = 0;
 };
 
 // NOTE: only one can exist at a time!
@@ -66,6 +73,10 @@ class MMIOHandler {
   bool CheckLoad(uint32_t virtual_address, uint32_t* out_value);
   bool CheckStore(uint32_t virtual_address, uint32_t value);
 
+  // Relaxed totals of successfully handled non-MMIO write faults. Includes
+  // lock contention and watch recovery, but not OS exception delivery time.
+  MemoryAccessDiagnosticSnapshot GetAccessDiagnosticSnapshot() const;
+
  protected:
   MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
               HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_virtual_context,
@@ -92,6 +103,9 @@ class MMIOHandler {
   rex::thread::global_critical_region global_critical_region_;
 
  private:
+  std::atomic<uint64_t> non_mmio_write_fault_count_{0};
+  std::atomic<uint64_t> non_mmio_write_fault_us_{0};
+
   struct DecodedLoadStore {
     // Matches the Xn/Wn register number for 0 reads and ignored writes in many
     // usage cases.
