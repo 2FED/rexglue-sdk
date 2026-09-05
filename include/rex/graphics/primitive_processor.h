@@ -797,10 +797,10 @@ class PrimitiveProcessor {
   // long time.
   // If during the conversion the region currently being converted is
   // invalidated, the current entry will not be added to the cache.
-  // Modified by the processor, read by the invalidation callback.
+  // Modified by the processor and the invalidation callback under cache_mutex_.
   uint32_t cache_currently_processing_base_ = 0;
-  // 0 if not in a cache transaction that hasn't found an existing entry
-  // currently.
+  // 0 if there is no reusable pending conversion, including when the callback
+  // invalidated the current transaction before its result could be inserted.
   uint32_t cache_currently_processing_size_bytes_ = 0;
   // Modified by both the processor and the invalidation callback.
   size_t cache_bucket_free_first_entry_ = SIZE_MAX;

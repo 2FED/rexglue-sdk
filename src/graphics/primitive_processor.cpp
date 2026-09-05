@@ -37,7 +37,10 @@ REXCVAR_DEFINE_BOOL(force_convert_quad_lists_to_triangle_lists, false, "GPU",
 REXCVAR_DEFINE_BOOL(force_convert_triangle_fans_to_lists, false, "GPU",
                     "Force convert triangle fans to lists");
 
-REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 0, "GPU",
+// Caching small conversions can cost more in insertion, protection and faults
+// than repeating them. Restore the 4096-index eligibility boundary; this affects only
+// CPU conversion reuse, not SharedMemory uploads or GPU coherency watches.
+REXCVAR_DEFINE_INT32(primitive_processor_cache_min_indices, 4096, "GPU",
                      "Minimum indices for primitive processor cache")
     .range(0, 1000000);
 
@@ -1384,10 +1387,11 @@ PrimitiveProcessor::CacheTransaction::~CacheTransaction() {
 
   std::lock_guard<std::mutex> cache_lock(processor_.cache_mutex_);
 
+  const bool range_still_valid = processor_.cache_currently_processing_size_bytes_ != 0;
   processor_.cache_currently_processing_base_ = 0;
   processor_.cache_currently_processing_size_bytes_ = 0;
 
-  if (result_type_ == ResultType::kNewSet) {
+  if (result_type_ == ResultType::kNewSet && range_still_valid) {
     size_t new_entry_index;
     if (processor_.cache_bucket_free_first_entry_ != SIZE_MAX) {
       new_entry_index = processor_.cache_bucket_free_first_entry_;
@@ -1448,7 +1452,6 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
     physical_address_start &= ~(kCacheBucketSizeBytes - 1);
     physical_address_end = rex::align(physical_address_end, kCacheBucketSizeBytes);
   }
-  bool any_invalidated = false;
   uint32_t bucket_index_first = physical_address_start >> kCacheBucketSizeBytesLog2;
   uint32_t bucket_index_last = (physical_address_end - 1) >> kCacheBucketSizeBytesLog2;
   uint32_t bucket_l1_bits_index_first = bucket_index_first >> 6;
@@ -1456,6 +1459,15 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
   uint32_t bucket_l2_bits_index_first = bucket_index_first >> 12;
   uint32_t bucket_l2_bits_index_last = bucket_index_last >> 12;
   std::lock_guard<std::mutex> cache_lock(cache_mutex_);
+  // A conversion runs outside this lock. If its watched range was modified,
+  // the current draw may finish but its result must not enter the reuse cache.
+  // Use the expanded range for a fault: the whole inspected bucket is unwatched.
+  if (cache_currently_processing_size_bytes_ &&
+      cache_currently_processing_base_ < physical_address_end &&
+      cache_currently_processing_base_ + cache_currently_processing_size_bytes_ >
+          physical_address_start) {
+    cache_currently_processing_size_bytes_ = 0;
+  }
   for (uint32_t bucket_l2_bits_index = bucket_l2_bits_index_first;
        bucket_l2_bits_index <= bucket_l2_bits_index_last; ++bucket_l2_bits_index) {
     uint64_t bucket_l2_bits_mask = UINT64_MAX;
@@ -1513,9 +1525,8 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
           // the specified range.
           if (entry_key.base < physical_address_end) {
             uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
+            if (entry_end > physical_address_start) {
               // Invalidate the entry.
-              any_invalidated = true;
               // Remove the entry from the cache map.
               auto entry_map_it = cache_map_.find(entry_key);
               assert_true(entry_map_it != cache_map_.end());
@@ -1565,9 +1576,10 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
       }
     }
   }
-  return any_invalidated
-             ? std::make_pair(physical_address_start, physical_address_end - physical_address_start)
-             : std::make_pair(uint32_t(0), UINT32_MAX);
+  // Even a no-hit callback must not authorize unwatching other buckets that
+  // may still contain cached indices or an in-progress conversion. Do not rely
+  // on another memory client (such as SharedMemory) to constrain our reply.
+  return std::make_pair(physical_address_start, physical_address_end - physical_address_start);
 }
 
 std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallbackThunk(

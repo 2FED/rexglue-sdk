@@ -6,13 +6,35 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
+The v0.16.1.0 delta repairs the CPU primitive-conversion cache's half-open
+invalidation overlap, cancels insertion after overlapping invalidation during
+conversion, and bounds its unwatch reply to the inspected buckets even on a
+no-hit callback. It restores the 4096-index cache threshold instead of caching
+every nonempty conversion. Small inputs are processed fresh; SharedMemory GPU
+uploads, GPU watches, guest rights and timing remain unchanged. The threshold
+is a Deck throughput candidate, not a measured title-specific optimization yet.
+
+The pre-fix CPU-only fixture failed 6/9 cases. Final coverage is 12 cases / 800
+assertions using real Process and Memory paths with CPU-backed index outputs:
+threshold 4095/4096/zero, mutation, exact/containing/partial/adjacent ranges,
+non-exact invalidation, no-hit unwatch bounds, real A/C/E fault/rearm, per-frame
+clear, invalidation during conversion, disjoint active-range retention, and a
+two-bucket entry. Both complete all-target RelWithDebInfo and Release suites
+pass 1,834 tests plus four known BitStream skips (1,838 registered). Independent
+review found and corrected a contradictory crossing-fixture assertion before
+final gates. No production blockers remain. Coverage does not establish atomic
+current-draw reads during concurrent guest writes or exhaust 32-bit/multi-entry
+list behavior; deterministic reentrancy is not a concurrency stress test.
+
 The v0.16.0.0 delta splits Windows physical RAM into one 512 MiB SEC_COMMIT
 section while virtual guest backing stays SEC_RESERVE. All five physical
 views retain their offsets, independent protections, and existing watches.
 The already-present full physical precommit means no increase in final
 committed capacity. POSIX retains the old backing layout. This avoids the
-reserved-range wineserver query in Proton 9.0-4; Deck throughput is pending,
-not inferred from source. Mapping retry clears unmapped pointers and stops
+reserved-range wineserver query in Proton 9.0-4. Returned Deck arm/disarm means
+fell from 64-71 us to about 17 us, but 12.13 guest outputs/s is still not usable
+performance. Routes differ, so this is not a controlled A/B FPS claim.
+Mapping retry clears unmapped pointers and stops
 on cleanup failure. Five native regression cases / 79 assertions pass;
 both full all-target configurations pass 1,822 tests plus four known skips
 (1,826 registered). Review found no blockers. Actual allocation/unmap API

@@ -23,6 +23,7 @@ add_executable(unit_tests
     core/filesystem_test.cpp
     core/frame_audit_test.cpp
     core/graphics_performance_diagnostic_test.cpp
+    graphics/primitive_processor_cache_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp
@@ -51,6 +52,12 @@ set_target_properties(sdl_wheel_probe PROPERTIES
 )
 
 target_sources(unit_tests PRIVATE
+    # Exercise the real CPU index conversion/cache without exporting or loading
+    # the renderer plugin (which has private symbols and no link consumers).
+    ${PROJECT_SOURCE_DIR}/src/graphics/primitive_processor.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/shared_memory.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/register_file.cpp
+    ${PROJECT_SOURCE_DIR}/src/graphics/trace_writer.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/commands/migration_scan.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
@@ -64,6 +71,7 @@ target_include_directories(unit_tests PRIVATE
 target_link_libraries(unit_tests PRIVATE
     rexcodegen
     rexruntime
+    snappy
     Catch2::Catch2WithMain
 )
 
