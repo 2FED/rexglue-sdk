@@ -76,6 +76,7 @@ TEST_CASE("Nested graphics diagnostic scopes keep independent inclusive totals",
 TEST_CASE("Graphics command diagnostic snapshot defaults do not imply executed work",
           "[graphics][performance-diagnostic]") {
   const GraphicsPerformanceDiagnosticSnapshot snapshot;
+  CHECK(snapshot.backend == GraphicsPerformanceDiagnosticSnapshot::Backend::kUnknown);
   CHECK(snapshot.command_primary_buffer_count == 0);
   CHECK(snapshot.command_primary_buffer_us == 0);
   CHECK(snapshot.command_draw_packet_count == 0);
@@ -86,6 +87,13 @@ TEST_CASE("Graphics command diagnostic snapshot defaults do not imply executed w
   CHECK(snapshot.command_interrupt_packet_us == 0);
   CHECK(snapshot.vulkan_fence_call_count == 0);
   CHECK(snapshot.vulkan_fence_call_us == 0);
+  CHECK(snapshot.vulkan_resolve_count == 0);
+  CHECK(snapshot.vulkan_resolve_us == 0);
+  CHECK(snapshot.vulkan_resolve_readback_copy_count == 0);
+  CHECK(snapshot.vulkan_resolve_readback_bytes == 0);
+  CHECK(snapshot.vulkan_resolve_readback_copy_us == 0);
+  CHECK(snapshot.vulkan_resolve_readback_wait_count == 0);
+  CHECK(snapshot.vulkan_resolve_readback_wait_us == 0);
 }
 
 }  // namespace rex::graphics::test

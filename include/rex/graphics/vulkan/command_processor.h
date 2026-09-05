@@ -560,6 +560,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<uint64_t> performance_guest_frame_wall_us_{0};
   std::atomic<uint64_t> performance_vulkan_fence_call_count_{0};
   std::atomic<uint64_t> performance_vulkan_fence_call_us_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_count_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_us_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_readback_copy_count_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_readback_bytes_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_readback_copy_us_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_count_{0};
+  std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_us_{0};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

@@ -6,6 +6,25 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
+The v0.17.0.0 delta adds seven Vulkan resolve diagnostic snapshot fields:
+completed IssueCopy count/inclusive time, actual resolve-to-guest memcpy count,
+bytes/time, and four-path explicit readback wait count/time. Disabled/no-op and
+failed IssueCopy calls are counted; memexport waits are excluded. Copy time
+includes handled write faults but excludes mapped-memory invalidation. These
+relaxed cumulative totals overlap/nest and are not a transactional frame budget.
+No readback/coherency policy, cache threshold, scheduling or timing is changed.
+Physical pause-versus-gameplay attribution remains pending on the Deck.
+
+Review and both full all-target configurations pass 1,834 tests plus four known
+BitStream skips (1,838 registered). Seven saved-game fixtures additionally pass
+five repetitions in each configuration. The first parallel run exposed a
+pre-existing test-only temporary-directory collision: separate test processes
+could delete each other's fixture files. TempContentRoot now atomically reserves
+a random candidate, never removes an unsuccessful candidate and cleans only
+its owned directory. No production save handling or owner profile changed.
+The graphics fixture covers initialized counters and RAII early-return/unwind/
+nested timing, not actual Vulkan branch counts; both backend builds compile.
+
 The v0.16.1.0 delta repairs the CPU primitive-conversion cache's half-open
 invalidation overlap, cancels insertion after overlapping invalidation during
 conversion, and bounds its unwatch reply to the inspected buckets even on a

@@ -121,6 +121,21 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   // errors. Excludes surrounding submission, bookkeeping and resource cleanup.
   uint64_t vulkan_fence_call_count = 0;
   uint64_t vulkan_fence_call_us = 0;
+  // Completed Vulkan IssueCopy calls, including no-op and early-failure paths.
+  // Inclusive time overlaps draw/frame/submission, readback and fence totals.
+  uint64_t vulkan_resolve_count = 0;
+  uint64_t vulkan_resolve_us = 0;
+  // Actual resolve readback memcpy operations into guest physical memory.
+  // Copy time includes handled write faults; bytes count only completed copies.
+  uint64_t vulkan_resolve_readback_copy_count = 0;
+  uint64_t vulkan_resolve_readback_bytes = 0;
+  uint64_t vulkan_resolve_readback_copy_us = 0;
+  // Completed explicit resolve readback waits (full/cold/resource resize),
+  // including unsuccessful waits.
+  // Includes queue submission and cleanup, unlike native fence-call time above.
+  // Memexport readback waits are not included. These are nontransactional totals.
+  uint64_t vulkan_resolve_readback_wait_count = 0;
+  uint64_t vulkan_resolve_readback_wait_us = 0;
   // Successfully handled non-MMIO write faults across all guest threads.
   // These times may overlap each other and command-thread frame wall time.
   uint64_t memory_non_mmio_write_fault_count = 0;

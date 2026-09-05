@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 
 #include <catch2/catch_test_macros.hpp>
@@ -27,11 +28,24 @@ class TempContentRoot {
  public:
   TempContentRoot() {
     static std::atomic<uint64_t> sequence{0};
-    path_ =
-        fs::temp_directory_path() / ("rex-xam-content-persistence-" + std::to_string(++sequence));
-    std::error_code error;
-    fs::remove_all(path_, error);
-    REQUIRE(fs::create_directories(path_));
+    // CTest runs cases in separate processes. A process-local counter alone
+    // let one fixture delete another fixture's live save. Reserve a fresh
+    // directory atomically; never clean up a path this instance did not create.
+    std::random_device random;
+    const auto parent = fs::temp_directory_path();
+    for (uint32_t attempt = 0; attempt < 128; ++attempt) {
+      const auto candidate = parent / ("rex-xam-content-persistence-" +
+          std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+          std::to_string(++sequence));
+      std::error_code error;
+      const bool created = fs::create_directory(candidate, error);
+      REQUIRE_FALSE(error);
+      if (created) {
+        path_ = candidate;
+        return;
+      }
+    }
+    FAIL("Could not reserve a unique content fixture directory");
   }
 
   ~TempContentRoot() {

@@ -624,6 +624,19 @@ GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiag
       performance_vulkan_fence_call_count_.load(std::memory_order_relaxed);
   snapshot.vulkan_fence_call_us =
       performance_vulkan_fence_call_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_count =
+      performance_vulkan_resolve_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_us = performance_vulkan_resolve_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_readback_copy_count =
+      performance_vulkan_resolve_readback_copy_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_readback_bytes =
+      performance_vulkan_resolve_readback_bytes_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_readback_copy_us =
+      performance_vulkan_resolve_readback_copy_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_readback_wait_count =
+      performance_vulkan_resolve_readback_wait_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_resolve_readback_wait_us =
+      performance_vulkan_resolve_readback_wait_us_.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -4434,6 +4447,8 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
 }
 
 bool VulkanCommandProcessor::IssueCopy() {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_vulkan_resolve_count_,
+                                                     performance_vulkan_resolve_us_);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4476,6 +4491,15 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     return true;
   }
 
+  // Count only explicit waits in this resolve-readback path, including resource
+  // replacement/growth as well as full/cold readback consumption. Nested native
+  // fence calls are measured separately and must not be added to this total.
+  const auto await_resolve_readback = [this]() {
+    const ScopedPerformanceDiagnostic diagnostic_scope(
+        performance_vulkan_resolve_readback_wait_count_,
+        performance_vulkan_resolve_readback_wait_us_);
+    return AwaitAllQueueOperationsCompletion();
+  };
   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
         readback.mapped_data[index] != nullptr) {
@@ -4500,7 +4524,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!await_resolve_readback()) {
         dfn.vkUnmapMemory(device, new_memory);
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
@@ -4585,7 +4609,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       if (resolve_downscale_buffer_ != VK_NULL_HANDLE ||
           resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
-        if (!AwaitAllQueueOperationsCompletion()) {
+        if (!await_resolve_readback()) {
           dfn.vkDestroyBuffer(device, new_buffer, nullptr);
           dfn.vkFreeMemory(device, new_memory, nullptr);
           return true;
@@ -4706,7 +4730,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
+  } else if (!await_resolve_readback()) {
     return true;
   }
 
@@ -4716,7 +4740,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                            readback.mapped_data[read_index] == nullptr)) {
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    if (!await_resolve_readback()) {
       return true;
     }
   }
@@ -4733,7 +4757,14 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
-      std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      {
+        const ScopedPerformanceDiagnostic diagnostic_scope(
+            performance_vulkan_resolve_readback_copy_count_,
+            performance_vulkan_resolve_readback_copy_us_);
+        std::memcpy(destination, readback.mapped_data[read_index], written_length);
+      }
+      performance_vulkan_resolve_readback_bytes_.fetch_add(written_length,
+                                                          std::memory_order_relaxed);
     }
   }
 
