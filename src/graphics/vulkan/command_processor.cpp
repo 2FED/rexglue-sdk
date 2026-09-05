@@ -637,6 +637,12 @@ GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiag
       performance_vulkan_resolve_readback_wait_count_.load(std::memory_order_relaxed);
   snapshot.vulkan_resolve_readback_wait_us =
       performance_vulkan_resolve_readback_wait_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_binding_update_count = performance_vulkan_binding_update_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_binding_update_us = performance_vulkan_binding_update_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_texture_descriptor_reuse_count = performance_vulkan_texture_descriptor_reuse_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_texture_descriptor_write_count = performance_vulkan_texture_descriptor_write_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_descriptor_update_count = performance_vulkan_descriptor_update_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_descriptor_update_us = performance_vulkan_descriptor_update_us_.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -3600,6 +3606,8 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
   current_external_graphics_pipeline_ = pipeline;
   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
+  InvalidateTextureBindingSnapshots();
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
 }
 
 void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
@@ -3944,26 +3952,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // current_guest_graphics_pipeline_layout_.
   auto pipeline_layout = static_cast<const PipelineLayout*>(pipeline_layout_provider);
   if (current_guest_graphics_pipeline_layout_ != pipeline_layout) {
-    if (current_guest_graphics_pipeline_layout_) {
-      // Keep descriptor set layouts for which the new pipeline layout is
-      // compatible with the previous one (pipeline layouts are compatible for
-      // set N if set layouts 0 through N are compatible).
-      uint32_t descriptor_sets_kept = uint32_t(SpirvShaderTranslator::kDescriptorSetCount);
-      if (current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref() !=
-          pipeline_layout->descriptor_set_layout_textures_vertex_ref()) {
-        descriptor_sets_kept = std::min(
-            descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-      }
-      if (current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref() !=
-          pipeline_layout->descriptor_set_layout_textures_pixel_ref()) {
-        descriptor_sets_kept = std::min(
-            descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-      }
-    } else {
-      // No or unknown pipeline layout previously bound - all bindings are in an
-      // indeterminate state.
-      current_graphics_descriptor_sets_bound_up_to_date_ = 0;
-    }
+    // Conservative epoch boundary, including A -> B -> A and external draws.
+    // The old compatible-prefix calculation never applied its result. Always
+    // rebind all sets when the layout changes; unchanged constant values may
+    // still be used, but texture snapshots may not cross this boundary.
+    InvalidateTextureBindingSnapshots();
+    current_graphics_descriptor_sets_bound_up_to_date_ = 0;
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
 
@@ -5224,6 +5218,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   auto fence_wait_start = std::chrono::steady_clock::now();
   CheckSubmissionFenceAndDeviceLoss(await_submission);
   if (is_opening_frame) {
+    InvalidateTextureBindingSnapshots();
     performance_frame_fence_wait_us_.fetch_add(
         uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                      std::chrono::steady_clock::now() - fence_wait_start)
@@ -5273,6 +5268,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;
     current_guest_graphics_pipeline_layout_ = nullptr;
+    InvalidateTextureBindingSnapshots();
     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
 
     primitive_processor_->BeginSubmission();
@@ -5634,6 +5630,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 }
 
 void VulkanCommandProcessor::ClearTransientDescriptorPools() {
+  InvalidateTextureBindingSnapshots();
   texture_transient_descriptor_sets_free_.clear();
   texture_transient_descriptor_sets_used_.clear();
   transient_descriptor_allocator_textures_.Reset();
@@ -6506,6 +6503,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
+  const ScopedPerformanceDiagnostic binding_diagnostic(performance_vulkan_binding_update_count_,
+                                                      performance_vulkan_binding_update_us_);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6704,26 +6703,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // RequestTextures and UseSampler still run for every draw before reaching
+  // here: uploads, barriers and usage/lifetime marks are never cached away.
+  // Materialize the actual current handles, even on a potential reuse hit.
+  bool write_vertex_textures = texture_count_vertex || sampler_count_vertex;
+  bool write_pixel_textures = texture_count_pixel || sampler_count_pixel;
   descriptor_write_image_info_.clear();
   descriptor_write_image_info_.reserve(
       (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
@@ -6769,7 +6753,43 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
 
-  // Write the new descriptor sets.
+  const auto all_image_infos = std::span<const VkDescriptorImageInfo>(descriptor_write_image_info_);
+  const auto vertex_infos = all_image_infos.subspan(
+      vertex_texture_image_info_offset, texture_count_vertex + sampler_count_vertex);
+  const auto pixel_infos = all_image_infos.subspan(
+      pixel_texture_image_info_offset, texture_count_pixel + sampler_count_pixel);
+  const TextureBindingSnapshot::Context vertex_context{
+      frame_current_, GetCurrentSubmission(), current_guest_graphics_pipeline_layout_,
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_vertex_ref()};
+  const TextureBindingSnapshot::Context pixel_context{
+      frame_current_, GetCurrentSubmission(), current_guest_graphics_pipeline_layout_,
+      current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref()};
+  constexpr uint32_t vertex_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+  constexpr uint32_t pixel_bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+  const bool reuse_vertex = texture_binding_snapshot_vertex_.Matches(
+      vertex_context,
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
+      (current_graphics_descriptor_set_values_up_to_date_ & vertex_bit) != 0,
+      vertex_infos, texture_count_vertex);
+  const bool reuse_pixel = texture_binding_snapshot_pixel_.Matches(
+      pixel_context,
+      current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel],
+      (current_graphics_descriptor_set_values_up_to_date_ & pixel_bit) != 0,
+      pixel_infos, texture_count_pixel);
+  if (!reuse_vertex) {
+    texture_binding_snapshot_vertex_.Invalidate();
+    current_graphics_descriptor_set_values_up_to_date_ &= ~vertex_bit;
+  }
+  if (!reuse_pixel) {
+    texture_binding_snapshot_pixel_.Invalidate();
+    current_graphics_descriptor_set_values_up_to_date_ &= ~pixel_bit;
+  }
+  write_vertex_textures &= !reuse_vertex;
+  write_pixel_textures &= !reuse_pixel;
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  // Write fresh sets on misses; never overwrite an issued set on a hit.
 
   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
   // identical stage flags, but for the constants they vary. Plus vertex and
@@ -6827,6 +6847,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
         descriptor_write_image_info_.data() + vertex_sampler_image_info_offset, write_textures);
     if (!texture_descriptor_set_write_count) {
+      InvalidateTextureBindingSnapshots();
       return false;
     }
     write_descriptor_set_count += texture_descriptor_set_write_count;
@@ -6844,6 +6865,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
         descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, write_textures);
     if (!texture_descriptor_set_write_count) {
+      InvalidateTextureBindingSnapshots();
       return false;
     }
     write_descriptor_set_count += texture_descriptor_set_write_count;
@@ -6853,12 +6875,38 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   // Write.
   if (write_descriptor_set_count) {
+    const ScopedPerformanceDiagnostic write_diagnostic(performance_vulkan_descriptor_update_count_,
+                                                       performance_vulkan_descriptor_update_us_);
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
   }
   // Only make valid if all descriptor sets have been allocated and written
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
+  // Stage counts, not individual image/sampler descriptors. Count only a
+  // completed transaction; driver-update count/time also includes constants.
+  if (reuse_vertex || reuse_pixel) {
+    performance_vulkan_texture_descriptor_reuse_count_.fetch_add(
+        uint64_t(reuse_vertex) + uint64_t(reuse_pixel), std::memory_order_relaxed);
+  }
+  if (write_vertex_textures || write_pixel_textures) {
+    performance_vulkan_texture_descriptor_write_count_.fetch_add(
+        uint64_t(write_vertex_textures) + uint64_t(write_pixel_textures), std::memory_order_relaxed);
+  }
+  // Publish snapshots only once BOTH stages were allocated and all descriptor
+  // writes completed. A failed PS allocation after VS allocation cannot hit.
+  if (write_vertex_textures) {
+    texture_binding_snapshot_vertex_.Commit(
+        vertex_context,
+        current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex],
+        vertex_infos, texture_count_vertex);
+  }
+  if (write_pixel_textures) {
+    texture_binding_snapshot_pixel_.Commit(
+        pixel_context,
+        current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel],
+        pixel_infos, texture_count_pixel);
+  }
 
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;

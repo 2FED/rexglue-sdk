@@ -28,6 +28,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/descriptor_binding_snapshot.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
@@ -567,6 +568,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<uint64_t> performance_vulkan_resolve_readback_copy_us_{0};
   std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_count_{0};
   std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_us_{0};
+  std::atomic<uint64_t> performance_vulkan_binding_update_count_{0};
+  std::atomic<uint64_t> performance_vulkan_binding_update_us_{0};
+  std::atomic<uint64_t> performance_vulkan_texture_descriptor_reuse_count_{0};
+  std::atomic<uint64_t> performance_vulkan_texture_descriptor_write_count_{0};
+  std::atomic<uint64_t> performance_vulkan_descriptor_update_count_{0};
+  std::atomic<uint64_t> performance_vulkan_descriptor_update_us_{0};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -844,6 +851,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
+  using TextureBindingSnapshot =
+      DescriptorBindingSnapshot<VkDescriptorImageInfo, VkDescriptorSet, VkDescriptorSetLayout>;
+  TextureBindingSnapshot texture_binding_snapshot_vertex_;
+  TextureBindingSnapshot texture_binding_snapshot_pixel_;
+  void InvalidateTextureBindingSnapshots() {
+    texture_binding_snapshot_vertex_.Invalidate();
+    texture_binding_snapshot_pixel_.Invalidate();
+  }
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
   // up-to-date data.
   uint32_t current_graphics_descriptor_set_values_up_to_date_;

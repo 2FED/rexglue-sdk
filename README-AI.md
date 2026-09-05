@@ -6,7 +6,31 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The v0.17.1.0 delta emits one `simde_mm_pause()` for each exact decoded
+The current v0.18.0.0 delta reuses the immediately retained Vulkan vertex/pixel
+texture descriptor sets only when actual ordered image views/layouts/samplers,
+current set/validity, pipeline/stage layout, frame and submission match.
+Texture/sampler requests, uploads, barriers and usage marks remain unconditional.
+Layout/external/frame/submission/pool boundaries invalidate; misses allocate
+fresh sets and snapshots commit only after all stage writes succeed. An unused
+layout-compatible-prefix calculation is replaced by conservative full rebind.
+No update-after-bind or cross-frame resource cache is introduced.
+
+Six public snapshot counters measure completed UpdateBindings inclusive calls/
+time, successfully reused/written texture STAGE sets, and actual native
+vkUpdateDescriptorSets calls/time (including constants). They are relaxed,
+overlapping totals, not a transactional or exclusive budget. This public
+surface advances the CMake compatibility floor to 0.18.0. No addresses/logging
+are added to normal per-draw work. Native/Deck reuse rate and benefit remain
+integration gates, not consequences of source review or helper tests.
+
+Independent review, AST scan/one fixture and both all-target configurations
+pass: 1,843 executed plus four known BitStream skips (1,847 registered).
+Five new helper cases / 37 assertions cover ordered fields, counts, nulls,
+epochs, invalidation, partial-stage publication and scratch deep-copy.
+They do not inject actual Vulkan allocation/eviction failures or execute the
+renderer upload/barrier paths; their integration is source-reviewed.
+
+The preceding v0.17.1.0 delta emits one `simde_mm_pause()` for each exact decoded
 `db16cyc` (0x7ffffb78). This restores a host spin hint to the sampled guest
 poll path without Sleep, OS yields, changed guest registers/memory, synchronization
 primitives or game-clock policy. It is NOT exact 16-cycle emulation. SIMDe
@@ -32,7 +56,8 @@ No readback/coherency policy, cache threshold, scheduling or timing is changed.
 Accepted Deck comparison: 12.14 outputs/s gameplay and 10.02 in pause, with
 zero resolve readback waits during pause. Resolve memcpy alone does not
 explain the overall slowdown. The sampled guest polling path and redundant
-Vulkan descriptor updates are separate leads; the latter is not changed here.
+Vulkan descriptor updates are separate leads; the latter is addressed by
+current v0.18.0.0, not by v0.17.0.0.
 
 Review and both full all-target configurations pass 1,834 tests plus four known
 BitStream skips (1,838 registered). Seven saved-game fixtures additionally pass

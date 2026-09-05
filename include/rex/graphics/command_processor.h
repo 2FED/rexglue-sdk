@@ -136,6 +136,15 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   // Memexport readback waits are not included. These are nontransactional totals.
   uint64_t vulkan_resolve_readback_wait_count = 0;
   uint64_t vulkan_resolve_readback_wait_us = 0;
+  uint64_t vulkan_binding_update_count = 0;
+  // Whole UpdateBindings scope, including constants, failed calls and nested
+  // vkUpdateDescriptorSets. Reuse/write count successfully retained/written
+  // texture STAGE sets, not individual descriptors. Relaxed, not additive.
+  uint64_t vulkan_binding_update_us = 0;
+  uint64_t vulkan_texture_descriptor_reuse_count = 0;
+  uint64_t vulkan_texture_descriptor_write_count = 0;
+  uint64_t vulkan_descriptor_update_count = 0;
+  uint64_t vulkan_descriptor_update_us = 0;
   // Successfully handled non-MMIO write faults across all guest threads.
   // These times may overlap each other and command-thread frame wall time.
   uint64_t memory_non_mmio_write_fault_count = 0;

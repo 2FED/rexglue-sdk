@@ -94,6 +94,12 @@ TEST_CASE("Graphics command diagnostic snapshot defaults do not imply executed w
   CHECK(snapshot.vulkan_resolve_readback_copy_us == 0);
   CHECK(snapshot.vulkan_resolve_readback_wait_count == 0);
   CHECK(snapshot.vulkan_resolve_readback_wait_us == 0);
+  CHECK(snapshot.vulkan_binding_update_count == 0);
+  CHECK(snapshot.vulkan_binding_update_us == 0);
+  CHECK(snapshot.vulkan_texture_descriptor_reuse_count == 0);
+  CHECK(snapshot.vulkan_texture_descriptor_write_count == 0);
+  CHECK(snapshot.vulkan_descriptor_update_count == 0);
+  CHECK(snapshot.vulkan_descriptor_update_us == 0);
 }
 
 }  // namespace rex::graphics::test
