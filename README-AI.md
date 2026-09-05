@@ -6,14 +6,33 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The v0.17.0.0 delta adds seven Vulkan resolve diagnostic snapshot fields:
+The v0.17.1.0 delta emits one `simde_mm_pause()` for each exact decoded
+`db16cyc` (0x7ffffb78). This restores a host spin hint to the sampled guest
+poll path without Sleep, OS yields, changed guest registers/memory, synchronization
+primitives or game-clock policy. It is NOT exact 16-cycle emulation. SIMDe
+uses PAUSE on x86; other host architectures differ and are not physically tested.
+The neighboring record-form OR and ordinary OR remain unchanged. Consumers
+must regenerate guest code with this SDK; relinking old generated code alone
+does not apply the fix. Never hand-edit generated guest sources.
+
+Independent source review, AST scan/1 fixture and both full all-target builds
+pass 1,838 executed tests plus four known BitStream skips (1,842 registered).
+Three new PPC cases cover CR/XER/r31/memory preservation, bounded looping and
+neighbor OR semantics. The generated-stream check was red before the fix
+(zero of nine required hints), then green. No throughput gain is established
+by those tests: host spin latency and SMT benefit require physical evidence.
+
+The preceding v0.17.0.0 delta adds seven Vulkan resolve diagnostic snapshot fields:
 completed IssueCopy count/inclusive time, actual resolve-to-guest memcpy count,
 bytes/time, and four-path explicit readback wait count/time. Disabled/no-op and
 failed IssueCopy calls are counted; memexport waits are excluded. Copy time
 includes handled write faults but excludes mapped-memory invalidation. These
 relaxed cumulative totals overlap/nest and are not a transactional frame budget.
 No readback/coherency policy, cache threshold, scheduling or timing is changed.
-Physical pause-versus-gameplay attribution remains pending on the Deck.
+Accepted Deck comparison: 12.14 outputs/s gameplay and 10.02 in pause, with
+zero resolve readback waits during pause. Resolve memcpy alone does not
+explain the overall slowdown. The sampled guest polling path and redundant
+Vulkan descriptor updates are separate leads; the latter is not changed here.
 
 Review and both full all-target configurations pass 1,834 tests plus four known
 BitStream skips (1,838 registered). Seven saved-game fixtures additionally pass

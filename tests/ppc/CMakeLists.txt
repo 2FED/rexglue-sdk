@@ -100,6 +100,11 @@ target_compile_options(ppc_tests PRIVATE
 )
 
 include(Catch)
+add_test(NAME ppc.delay_hint_emission
+    COMMAND ${CMAKE_COMMAND}
+        "-DGENERATED_FUNCTIONS=${PPC_GEN_DIR}/ppc_test_functions.cpp"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/verify_delay_hint.cmake")
+set_tests_properties(ppc.delay_hint_emission PROPERTIES LABELS "ppc;codegen" TIMEOUT 60)
 catch_discover_tests(ppc_tests
     TEST_PREFIX "ppc."
     PROPERTIES

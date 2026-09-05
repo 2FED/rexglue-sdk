@@ -49,8 +49,10 @@ bool build_eieio(BuilderContext& ctx) {
 }
 
 bool build_db16cyc(BuilderContext& ctx) {
-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
-  (void)ctx;
+  // Preserve a bounded host spin hint instead of deleting the guest's delay.
+  // This is not cycle-accurate: SIMDe uses PAUSE on x86, with host-specific
+  // alternatives elsewhere. Do not sleep/yield to the OS or modify PPC state.
+  ctx.println("\tsimde_mm_pause();");
   return true;
 }
 
