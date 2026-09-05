@@ -6,11 +6,14 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The v0.14.0.0 delta detaches empty persistent overlays and exposes four
-completed-wait/non-MMIO-write-fault counters. Pre-tag dual-backend
-RelWithDebInfo build/install and CTest pass: 1,809 executed, four known skips,
-zero failures (1,813 registered), including seven new UI/memory cases.
-Physical Deck speed and audio recovery remain unverified.
+The v0.15.0.0 delta adds 21 address-free command/memory diagnostic counters:
+inclusive completed primary/draw/swap/interrupt scopes, actual Vulkan fence
+calls, physical-watch protection calls/lock waits, and handled write-fault
+lock/query/callback phases. It changes no protection, scheduling or GPU
+commands. Pre-tag dual-backend RelWithDebInfo compile and CTest pass:
+1,817 executed, four known skips, zero failures (1,821 registered), including
+eight new memory/graphics cases. Physical Deck throughput/audio remain
+blocked; the prior empty-overlay correction fixed reported presentation FPS.
 
 ## Architecture and safety
 
@@ -30,6 +33,12 @@ Physical Deck speed and audio recovery remain unverified.
   frame transactions. Command-wait episodes can straddle F10 boundaries.
   Memory fault time aggregates threads and excludes OS exception delivery;
   never add it to, or subtract it from, graphics frame-wall measurements.
+  Primary and packet scopes include nested backend work; fence timing measures
+  native calls only (including polls/errors), not cleanup. Memory fault phases
+  share the successful-write denominator. Watch arm/disarm timings span all
+  callers/aliases; arming lock wait is separate. Safe-gap counts only observe
+  fragmentation, never coalesce protection or alter callbacks. Snapshot reads
+  may straddle completion; use same-process intervals, not exact stage sums.
 - Do not disable protection/coherency or change scheduling based only on
   CPU/GPU utilization. Preserve saves, raw dumps, maps and logs privately.
 

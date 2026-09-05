@@ -41,8 +41,26 @@ struct MMIORange {
 };
 
 struct MemoryAccessDiagnosticSnapshot {
+  // Relaxed cumulative samples, not an atomic transaction. Durations can
+  // overlap across threads. Fault phases count successful non-MMIO write
+  // recovery only and exclude OS exception delivery before our handler.
   uint64_t non_mmio_write_fault_count = 0;
   uint64_t non_mmio_write_fault_us = 0;
+  uint64_t write_fault_lock_wait_us = 0;
+  uint64_t write_fault_query_us = 0;
+  uint64_t write_fault_callback_us = 0;
+  uint64_t write_fault_already_cleared_count = 0;
+  // Watch protection calls include attempts that fail. Memory fills these
+  // fields; a standalone MMIOHandler snapshot leaves them zero.
+  uint64_t watch_arm_calls = 0;
+  uint64_t watch_arm_us = 0;
+  // Entry lock wait for each nonempty alias arming range, including unchanged
+  // ranges. Nested callback/protection timing must not be summed as CPU time.
+  uint64_t watch_arm_lock_wait_us = 0;
+  uint64_t watch_disarm_calls = 0;
+  uint64_t watch_disarm_us = 0;
+  uint64_t watch_protect_failures = 0;
+  uint64_t watch_arm_gap_splits = 0;
 };
 
 // NOTE: only one can exist at a time!
@@ -105,6 +123,10 @@ class MMIOHandler {
  private:
   std::atomic<uint64_t> non_mmio_write_fault_count_{0};
   std::atomic<uint64_t> non_mmio_write_fault_us_{0};
+  std::atomic<uint64_t> write_fault_lock_wait_us_{0};
+  std::atomic<uint64_t> write_fault_query_us_{0};
+  std::atomic<uint64_t> write_fault_callback_us_{0};
+  std::atomic<uint64_t> write_fault_already_cleared_count_{0};
 
   struct DecodedLoadStore {
     // Matches the Xn/Wn register number for 0 reads and ignored writes in many

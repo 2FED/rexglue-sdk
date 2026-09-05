@@ -558,6 +558,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<uint64_t> performance_deferred_execute_us_{0};
   std::atomic<uint64_t> performance_queue_submit_us_{0};
   std::atomic<uint64_t> performance_guest_frame_wall_us_{0};
+  std::atomic<uint64_t> performance_vulkan_fence_call_count_{0};
+  std::atomic<uint64_t> performance_vulkan_fence_call_us_{0};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

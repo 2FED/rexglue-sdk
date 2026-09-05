@@ -620,6 +620,10 @@ GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiag
   snapshot.deferred_execute_us = performance_deferred_execute_us_.load(std::memory_order_relaxed);
   snapshot.queue_submit_us = performance_queue_submit_us_.load(std::memory_order_relaxed);
   snapshot.guest_frame_wall_us = performance_guest_frame_wall_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_fence_call_count =
+      performance_vulkan_fence_call_count_.load(std::memory_order_relaxed);
+  snapshot.vulkan_fence_call_us =
+      performance_vulkan_fence_call_us_.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -5032,15 +5036,22 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
+  // Measure only the native call, not the cleanup below or an EndSubmission
+  // performed before it. This also covers mid-frame waits and zero-timeout polls
+  // that aren't represented by the opening-frame fence diagnostic.
+  const auto wait_for_fences = [&](uint32_t count, const VkFence* fences, uint64_t timeout) {
+    const ScopedPerformanceDiagnostic diagnostic_scope(performance_vulkan_fence_call_count_,
+                                                       performance_vulkan_fence_call_us_);
+    return dfn.vkWaitForFences(device, count, fences, VK_TRUE, timeout);
+  };
   if (await_submission > submission_completed_) {
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    VkResult wait_result = wait_for_fences(uint32_t(await_submission - submission_completed_),
+                                         submissions_in_flight_fences_.data(), UINT64_MAX);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5055,7 +5066,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
   // that for simplicity.
   while (fences_awaited < fences_total) {
     VkResult fence_status =
-        dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
+        wait_for_fences(1, &submissions_in_flight_fences_[fences_awaited], 0);
     if (fence_status != VK_SUCCESS) {
       if (fence_status == VK_ERROR_DEVICE_LOST) {
         device_lost_ = true;

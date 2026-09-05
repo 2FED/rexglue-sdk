@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -451,8 +452,32 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
 }
 
 runtime::MemoryAccessDiagnosticSnapshot Memory::GetAccessDiagnosticSnapshot() const {
-  return mmio_handler_ ? mmio_handler_->GetAccessDiagnosticSnapshot()
-                       : runtime::MemoryAccessDiagnosticSnapshot{};
+  auto snapshot = mmio_handler_ ? mmio_handler_->GetAccessDiagnosticSnapshot()
+                                : runtime::MemoryAccessDiagnosticSnapshot{};
+  snapshot.watch_arm_calls = watch_arm_calls_.load(std::memory_order_relaxed);
+  snapshot.watch_arm_us = watch_arm_us_.load(std::memory_order_relaxed);
+  snapshot.watch_arm_lock_wait_us = watch_arm_lock_wait_us_.load(std::memory_order_relaxed);
+  snapshot.watch_disarm_calls = watch_disarm_calls_.load(std::memory_order_relaxed);
+  snapshot.watch_disarm_us = watch_disarm_us_.load(std::memory_order_relaxed);
+  snapshot.watch_protect_failures = watch_protect_failures_.load(std::memory_order_relaxed);
+  snapshot.watch_arm_gap_splits = watch_arm_gap_splits_.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+bool Memory::ProtectWatchRange(void* host_address, size_t length, rex::memory::PageAccess access) {
+  // Time only actual protection calls, never individual page-loop iterations.
+  const auto begin = std::chrono::steady_clock::now();
+  const bool protected_range = rex::memory::Protect(host_address, length, access);
+  const auto elapsed_us = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin)
+          .count());
+  const bool arm = access != rex::memory::PageAccess::kReadWrite;
+  (arm ? watch_arm_calls_ : watch_disarm_calls_).fetch_add(1, std::memory_order_relaxed);
+  (arm ? watch_arm_us_ : watch_disarm_us_).fetch_add(elapsed_us, std::memory_order_relaxed);
+  if (!protected_range) {
+    watch_protect_failures_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return protected_range;
 }
 
 bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
@@ -1820,7 +1845,14 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
+  bool pending_safe_gap = false;
+  const auto lock_begin = std::chrono::steady_clock::now();
   auto global_lock = global_critical_region_.Acquire();
+  memory_->watch_arm_lock_wait_us_.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - lock_begin)
+                                .count()),
+      std::memory_order_relaxed);
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
     //
@@ -1849,6 +1881,10 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
         rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
     rex::memory::PageAccess current_page_access =
         ToPageAccess(page_table_[guest_page_number].current_protect);
+    const bool safe_watched_gap =
+        !enable_data_providers && current_page_access == rex::memory::PageAccess::kReadWrite &&
+        (page_table_[guest_page_number].state & memory::kMemoryAllocationCommit) != 0 &&
+        (page_flags_block.notify_on_invalidation & page_flags_bit) != 0;
     bool protect_system_page = false;
     // Don't do anything with inaccessible pages - don't protect, don't enable
     // callbacks - because real access violations are needed there. And don't
@@ -1868,21 +1904,30 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     }
     if (protect_system_page) {
+      if (pending_safe_gap) {
+        memory_->watch_arm_gap_splits_.fetch_add(1, std::memory_order_relaxed);
+        pending_safe_gap = false;
+      }
       if (protect_system_page_first == UINT32_MAX) {
         protect_system_page_first = i;
       }
     } else {
+      if (!safe_watched_gap) {
+        pending_safe_gap = false;
+      } else if (protect_system_page_first != UINT32_MAX) {
+        pending_safe_gap = true;
+      }
       if (protect_system_page_first != UINT32_MAX) {
-        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                             (i - protect_system_page_first) * system_page_size_, protect_access);
+        memory_->ProtectWatchRange(protect_base + protect_system_page_first * system_page_size_,
+                                   (i - protect_system_page_first) * system_page_size_, protect_access);
         protect_system_page_first = UINT32_MAX;
       }
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
-    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                         (system_page_last + 1 - protect_system_page_first) * system_page_size_,
-                         protect_access);
+    memory_->ProtectWatchRange(protect_base + protect_system_page_first * system_page_size_,
+                               (system_page_last + 1 - protect_system_page_first) * system_page_size_,
+                               protect_access);
   }
 }
 
@@ -2014,17 +2059,17 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
         }
       } else {
         if (unprotect_system_page_first != UINT32_MAX) {
-          rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                               (i - unprotect_system_page_first) * system_page_size_,
-                               rex::memory::PageAccess::kReadWrite);
+          memory_->ProtectWatchRange(protect_base + unprotect_system_page_first * system_page_size_,
+                                     (i - unprotect_system_page_first) * system_page_size_,
+                                     rex::memory::PageAccess::kReadWrite);
           unprotect_system_page_first = UINT32_MAX;
         }
       }
     }
     if (unprotect_system_page_first != UINT32_MAX) {
-      rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                           (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
-                           rex::memory::PageAccess::kReadWrite);
+      memory_->ProtectWatchRange(protect_base + unprotect_system_page_first * system_page_size_,
+                                 (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
+                                 rex::memory::PageAccess::kReadWrite);
     }
   }
 

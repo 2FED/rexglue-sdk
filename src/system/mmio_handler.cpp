@@ -36,6 +36,11 @@ MemoryAccessDiagnosticSnapshot MMIOHandler::GetAccessDiagnosticSnapshot() const 
   MemoryAccessDiagnosticSnapshot snapshot;
   snapshot.non_mmio_write_fault_count = non_mmio_write_fault_count_.load(std::memory_order_relaxed);
   snapshot.non_mmio_write_fault_us = non_mmio_write_fault_us_.load(std::memory_order_relaxed);
+  snapshot.write_fault_lock_wait_us = write_fault_lock_wait_us_.load(std::memory_order_relaxed);
+  snapshot.write_fault_query_us = write_fault_query_us_.load(std::memory_order_relaxed);
+  snapshot.write_fault_callback_us = write_fault_callback_us_.load(std::memory_order_relaxed);
+  snapshot.write_fault_already_cleared_count =
+      write_fault_already_cleared_count_.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -416,6 +421,10 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // and exclude the OS/Wine exception dispatch before this handler.
     const auto fault_begin = is_write ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
+    uint64_t lock_wait_us = 0;
+    uint64_t query_us = 0;
+    uint64_t callback_us = 0;
+    bool already_cleared = false;
     const auto record_handled_fault = [&](bool handled) {
       if (handled && is_write) {
         non_mmio_write_fault_us_.fetch_add(
@@ -424,26 +433,56 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
                                       .count()),
             std::memory_order_relaxed);
         non_mmio_write_fault_count_.fetch_add(1, std::memory_order_relaxed);
+        write_fault_lock_wait_us_.fetch_add(lock_wait_us, std::memory_order_relaxed);
+        write_fault_query_us_.fetch_add(query_us, std::memory_order_relaxed);
+        write_fault_callback_us_.fetch_add(callback_us, std::memory_order_relaxed);
+        if (already_cleared) {
+          write_fault_already_cleared_count_.fetch_add(1, std::memory_order_relaxed);
+        }
       }
       return handled;
     };
     // Recheck if the pages are still protected (race condition - another thread
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
+    const auto lock_begin = is_write ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     auto lock = global_critical_region_.Acquire();
+    const auto lock_acquired = is_write ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+    if (is_write) {
+      lock_wait_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(lock_acquired - lock_begin).count());
+    }
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
+    const auto query_begin = is_write ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
     memory::QueryProtect(fault_host_address, page_length, cur_access);
+    if (is_write) {
+      query_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - query_begin)
+                                          .count());
+    }
     if (cur_access != memory::PageAccess::kNoAccess &&
         (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
       // Another thread has cleared this watch. Abort.
+      already_cleared = true;
       return record_handled_fault(true);
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return record_handled_fault(access_violation_callback_(
-          std::move(lock), access_violation_callback_context_, fault_host_address, is_write));
+      const auto callback_begin = is_write ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+      const bool handled = access_violation_callback_(
+          std::move(lock), access_violation_callback_context_, fault_host_address, is_write);
+      if (is_write) {
+        callback_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - callback_begin)
+                                               .count());
+      }
+      return record_handled_fault(handled);
     }
     return false;
   }

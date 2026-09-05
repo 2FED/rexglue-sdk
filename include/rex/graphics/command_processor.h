@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -102,10 +103,39 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   // Completed command-thread wait episodes, including yield/sleep time.
   uint64_t command_ring_idle_us = 0;
   uint64_t command_wait_reg_mem_us = 0;
+  // Completed inclusive command scopes, not CPU execution time. Primary-buffer
+  // time includes its indirect buffers, packet handlers and end-of-buffer
+  // submission, but indirect buffers are not added to the primary total again.
+  // Packet scopes include backend COPY-mode draws, waits, and synchronous guest
+  // interrupt execution. Predicated-out packets never enter their handlers.
+  // These totals overlap frame/submission/wait totals and must not be summed.
+  uint64_t command_primary_buffer_count = 0;
+  uint64_t command_primary_buffer_us = 0;
+  uint64_t command_draw_packet_count = 0;
+  uint64_t command_draw_packet_us = 0;
+  uint64_t command_swap_packet_count = 0;
+  uint64_t command_swap_packet_us = 0;
+  uint64_t command_interrupt_packet_count = 0;
+  uint64_t command_interrupt_packet_us = 0;
+  // Actual completed vkWaitForFences calls, including zero-timeout polls and
+  // errors. Excludes surrounding submission, bookkeeping and resource cleanup.
+  uint64_t vulkan_fence_call_count = 0;
+  uint64_t vulkan_fence_call_us = 0;
   // Successfully handled non-MMIO write faults across all guest threads.
   // These times may overlap each other and command-thread frame wall time.
   uint64_t memory_non_mmio_write_fault_count = 0;
   uint64_t memory_non_mmio_write_fault_us = 0;
+  uint64_t memory_write_fault_lock_wait_us = 0;
+  uint64_t memory_write_fault_query_us = 0;
+  uint64_t memory_write_fault_callback_us = 0;
+  uint64_t memory_write_fault_already_cleared_count = 0;
+  uint64_t memory_watch_arm_calls = 0;
+  uint64_t memory_watch_arm_us = 0;
+  uint64_t memory_watch_disarm_calls = 0;
+  uint64_t memory_watch_disarm_us = 0;
+  uint64_t memory_watch_protect_failures = 0;
+  uint64_t memory_watch_arm_gap_splits = 0;
+  uint64_t memory_watch_arm_lock_wait_us = 0;
 };
 
 class CommandProcessor {
@@ -180,6 +210,33 @@ class CommandProcessor {
   bool Restore(::rex::stream::ByteStream* stream);
 
  protected:
+  // Stack-only diagnostic scope: no allocation, logging or per-iteration
+  // clock reads. Completion is recorded on early returns and unwinding too.
+  // Separate relaxed counters are intentionally not a transactional snapshot;
+  // a sample may straddle a completion, and an in-flight scope appears later.
+  class ScopedPerformanceDiagnostic {
+   public:
+    ScopedPerformanceDiagnostic(std::atomic<uint64_t>& completed_count,
+                                std::atomic<uint64_t>& elapsed_us) noexcept
+        : completed_count_(completed_count),
+          elapsed_us_(elapsed_us),
+          start_(std::chrono::steady_clock::now()) {}
+    ~ScopedPerformanceDiagnostic() noexcept {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - start_)
+                               .count();
+      elapsed_us_.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+      completed_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ScopedPerformanceDiagnostic(const ScopedPerformanceDiagnostic&) = delete;
+    ScopedPerformanceDiagnostic& operator=(const ScopedPerformanceDiagnostic&) = delete;
+
+   private:
+    std::atomic<uint64_t>& completed_count_;
+    std::atomic<uint64_t>& elapsed_us_;
+    const std::chrono::steady_clock::time_point start_;
+  };
+
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
     xenos::Endian endianness = xenos::Endian::kNone;
@@ -319,6 +376,14 @@ class CommandProcessor {
 
   std::atomic<uint64_t> performance_command_ring_idle_us_{0};
   std::atomic<uint64_t> performance_command_wait_reg_mem_us_{0};
+  std::atomic<uint64_t> performance_command_primary_buffer_count_{0};
+  std::atomic<uint64_t> performance_command_primary_buffer_us_{0};
+  std::atomic<uint64_t> performance_command_draw_packet_count_{0};
+  std::atomic<uint64_t> performance_command_draw_packet_us_{0};
+  std::atomic<uint64_t> performance_command_swap_packet_count_{0};
+  std::atomic<uint64_t> performance_command_swap_packet_us_{0};
+  std::atomic<uint64_t> performance_command_interrupt_packet_count_{0};
+  std::atomic<uint64_t> performance_command_interrupt_packet_us_{0};
 
   // Some titles submit writes beyond the emulated register file range in PM4
   // packets. Preserve these values so dependent packet logic can still observe

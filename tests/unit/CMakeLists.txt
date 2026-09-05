@@ -3,6 +3,7 @@
 add_executable(unit_tests
     audio/sdl_audio_config_test.cpp
     audio/audio_route_audit_test.cpp
+    memory/access_diagnostics_test.cpp
     memory/heap_allocation_test.cpp
     input/sdl_slot_mapping_test.cpp
     input/sdl_controller_matrix_test.cpp
@@ -20,6 +21,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/frame_audit_test.cpp
+    core/graphics_performance_diagnostic_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

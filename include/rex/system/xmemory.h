@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -530,6 +531,15 @@ class Memory {
   static bool AccessViolationCallbackThunk(
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
+
+  bool ProtectWatchRange(void* host_address, size_t length, rex::memory::PageAccess access);
+  std::atomic<uint64_t> watch_arm_calls_{0};
+  std::atomic<uint64_t> watch_arm_us_{0};
+  std::atomic<uint64_t> watch_arm_lock_wait_us_{0};
+  std::atomic<uint64_t> watch_disarm_calls_{0};
+  std::atomic<uint64_t> watch_disarm_us_{0};
+  std::atomic<uint64_t> watch_protect_failures_{0};
+  std::atomic<uint64_t> watch_arm_gap_splits_{0};
 
   std::filesystem::path file_name_;
   uint32_t system_page_size_ = 0;

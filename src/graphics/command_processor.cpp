@@ -123,10 +123,37 @@ GraphicsPerformanceDiagnosticSnapshot CommandProcessor::GetPerformanceDiagnostic
   snapshot.command_ring_idle_us = performance_command_ring_idle_us_.load(std::memory_order_relaxed);
   snapshot.command_wait_reg_mem_us =
       performance_command_wait_reg_mem_us_.load(std::memory_order_relaxed);
+  snapshot.command_primary_buffer_count =
+      performance_command_primary_buffer_count_.load(std::memory_order_relaxed);
+  snapshot.command_primary_buffer_us =
+      performance_command_primary_buffer_us_.load(std::memory_order_relaxed);
+  snapshot.command_draw_packet_count =
+      performance_command_draw_packet_count_.load(std::memory_order_relaxed);
+  snapshot.command_draw_packet_us =
+      performance_command_draw_packet_us_.load(std::memory_order_relaxed);
+  snapshot.command_swap_packet_count =
+      performance_command_swap_packet_count_.load(std::memory_order_relaxed);
+  snapshot.command_swap_packet_us =
+      performance_command_swap_packet_us_.load(std::memory_order_relaxed);
+  snapshot.command_interrupt_packet_count =
+      performance_command_interrupt_packet_count_.load(std::memory_order_relaxed);
+  snapshot.command_interrupt_packet_us =
+      performance_command_interrupt_packet_us_.load(std::memory_order_relaxed);
   if (memory_) {
     const auto memory_snapshot = memory_->GetAccessDiagnosticSnapshot();
     snapshot.memory_non_mmio_write_fault_count = memory_snapshot.non_mmio_write_fault_count;
     snapshot.memory_non_mmio_write_fault_us = memory_snapshot.non_mmio_write_fault_us;
+    snapshot.memory_write_fault_lock_wait_us = memory_snapshot.write_fault_lock_wait_us;
+    snapshot.memory_write_fault_query_us = memory_snapshot.write_fault_query_us;
+    snapshot.memory_write_fault_callback_us = memory_snapshot.write_fault_callback_us;
+    snapshot.memory_write_fault_already_cleared_count = memory_snapshot.write_fault_already_cleared_count;
+    snapshot.memory_watch_arm_calls = memory_snapshot.watch_arm_calls;
+    snapshot.memory_watch_arm_us = memory_snapshot.watch_arm_us;
+    snapshot.memory_watch_disarm_calls = memory_snapshot.watch_disarm_calls;
+    snapshot.memory_watch_disarm_us = memory_snapshot.watch_disarm_us;
+    snapshot.memory_watch_protect_failures = memory_snapshot.watch_protect_failures;
+    snapshot.memory_watch_arm_gap_splits = memory_snapshot.watch_arm_gap_splits;
+    snapshot.memory_watch_arm_lock_wait_us = memory_snapshot.watch_arm_lock_wait_us;
   }
   return snapshot;
 }
@@ -710,6 +737,8 @@ void CommandProcessor::PrepareForWait() {
 void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_command_primary_buffer_count_,
+                                                     performance_command_primary_buffer_us_);
   SCOPE_profile_cpu_f("gpu");
 
   // If we have a pending trace stream open it now. That way we ensure we get
@@ -1071,6 +1100,8 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_command_interrupt_packet_count_,
+                                                     performance_command_interrupt_packet_us_);
   SCOPE_profile_cpu_f("gpu");
 
   // generate interrupt from the command stream
@@ -1087,6 +1118,8 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_command_swap_packet_count_,
+                                                     performance_command_swap_packet_us_);
   SCOPE_profile_cpu_f("gpu");
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -1590,6 +1623,8 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_command_draw_packet_count_,
+                                                     performance_command_draw_packet_us_);
   // "initiate fetch of index buffer and draw"
   // Generally used by Xbox 360 Direct3D 9 for kDMA and kAutoIndex sources.
   // With a viz query token as the first one.
@@ -1607,6 +1642,8 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader, uint32_t packet,
                                                       uint32_t count) {
+  const ScopedPerformanceDiagnostic diagnostic_scope(performance_command_draw_packet_count_,
+                                                     performance_command_draw_packet_us_);
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
   // No viz query token.
