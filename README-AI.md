@@ -6,7 +6,19 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The v0.15.0.0 delta adds 21 address-free command/memory diagnostic counters:
+The v0.16.0.0 delta splits Windows physical RAM into one 512 MiB SEC_COMMIT
+section while virtual guest backing stays SEC_RESERVE. All five physical
+views retain their offsets, independent protections, and existing watches.
+The already-present full physical precommit means no increase in final
+committed capacity. POSIX retains the old backing layout. This avoids the
+reserved-range wineserver query in Proton 9.0-4; Deck throughput is pending,
+not inferred from source. Mapping retry clears unmapped pointers and stops
+on cleanup failure. Five native regression cases / 79 assertions pass;
+both full all-target configurations pass 1,822 tests plus four known skips
+(1,826 registered). Review found no blockers. Actual allocation/unmap API
+failure injection is not covered; partial-address collision cleanup is.
+
+The preceding v0.15.0.0 delta adds 21 address-free command/memory diagnostic counters:
 inclusive completed primary/draw/swap/interrupt scopes, actual Vulkan fence
 calls, physical-watch protection calls/lock waits, and handled write-fault
 lock/query/callback phases. It changes no protection, scheduling or GPU
@@ -50,7 +62,7 @@ the Visual Studio C++ SDK, and the existing CMake multi-config build tree:
 ```
 ast-grep scan --config third_party/rexglue-sdk/sgconfig.yml
 ast-grep test --config third_party/rexglue-sdk/sgconfig.yml
-cmake --build third_party/rexglue-sdk/out/build/win-amd64 --config RelWithDebInfo --target unit_tests --parallel 8
+cmake --build third_party/rexglue-sdk/out/build/win-amd64 --config RelWithDebInfo --parallel 8
 ctest --test-dir third_party/rexglue-sdk/out/build/win-amd64 -C RelWithDebInfo --output-on-failure
 cmake --build third_party/rexglue-sdk/out/build/win-amd64 --config Release --target install --parallel 8
 ```
@@ -60,6 +72,10 @@ Expand rules and fixtures with new architectural constraints; reusable rules
 belong in `utils/` once needed. Parent AST gates remain required as well.
 Tests under `[ui][dialog]` need no native window, SDL initialization or GPU.
 The four known skipped BitStream cases are not passing physical-game tests.
+Build all targets before a full CTest run: `--target unit_tests` alone leaves
+the separate PPC runner stale after runtime/header ABI changes. For this
+delta, the initial Release PPC run failed against a stale runner; rebuilding
+all consumers fixed it and both complete suites were rerun successfully.
 
 Review and test code before a four-part version/tag change. Any public SDK
 surface change advances the CMake major/minor floor; the immutable four-part

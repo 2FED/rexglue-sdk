@@ -522,7 +522,8 @@ class Memory {
 
  private:
   int MapViews(uint8_t* mapping_base);
-  void UnmapViews();
+  bool UnmapViews();
+  void ReleaseMappings();
 
   static uint32_t HostToGuestVirtualThunk(const void* context, const void* host_address);
 
@@ -557,6 +558,11 @@ class Memory {
   mutable std::mutex function_tables_mutex_;
 
   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
+  // Windows physical RAM is already fully committed. Keep it in its own
+  // SEC_COMMIT section so Wine need not query the server for reserved ranges
+  // on every protection change. Virtual guest memory remains demand-committed.
+  rex::memory::FileMappingHandle physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
+  std::filesystem::path physical_file_name_;
   uint8_t* mapping_base_ = nullptr;
   union {
     struct {

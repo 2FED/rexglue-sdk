@@ -117,13 +117,20 @@ Memory::~Memory() {
   heaps_.physical.Dispose();
 
   // Unmap all views and close mapping.
+  ReleaseMappings();
+}
+
+void Memory::ReleaseMappings() {
+  UnmapViews();
   if (mapping_ != rex::memory::kFileMappingHandleInvalid) {
-    UnmapViews();
     rex::memory::CloseFileMappingHandle(mapping_, file_name_);
-    mapping_base_ = nullptr;
     mapping_ = rex::memory::kFileMappingHandleInvalid;
   }
-
+  if (physical_mapping_ != rex::memory::kFileMappingHandleInvalid) {
+    rex::memory::CloseFileMappingHandle(physical_mapping_, physical_file_name_);
+    physical_mapping_ = rex::memory::kFileMappingHandleInvalid;
+  }
+  mapping_base_ = nullptr;
   virtual_membase_ = nullptr;
   physical_membase_ = nullptr;
 }
@@ -143,18 +150,42 @@ bool Memory::Initialize() {
     return false;
   }
 
+#if REX_PLATFORM_WIN32
+  // Physical RAM was already pre-committed in full below. Use a separate
+  // committed section rather than SEC_RESERVE + MEM_COMMIT: in Proton 9.0-4
+  // get_committed_size queries wineserver for every SEC_RESERVE protect/query,
+  // even for fully committed pages. All physical views still share one
+  // backing and retain their independent page protections and write watches.
+  // Keep the POSIX view layout unchanged (its E alias may have a 4 KiB offset).
+  physical_file_name_ = file_name_;
+  physical_file_name_ += "_physical";
+  physical_mapping_ = rex::memory::CreateFileMappingHandle(
+      physical_file_name_, 0x20000000, rex::memory::PageAccess::kReadWrite, true);
+  if (physical_mapping_ == rex::memory::kFileMappingHandleInvalid) {
+    REXSYS_ERROR("Unable to commit the 512mb physical backing.");
+    ReleaseMappings();
+    return false;
+  }
+#endif
+
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
-    if (!MapViews(mapping_base)) {
+    int map_result = MapViews(mapping_base);
+    if (!map_result) {
       mapping_base_ = mapping_base;
+      break;
+    }
+    if (map_result == 2) {
+      // A failed unmap must not be hidden by retrying with stale view pointers.
       break;
     }
   }
   if (!mapping_base_) {
     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
+    ReleaseMappings();
     assert_always();
     return false;
   }
@@ -298,26 +329,43 @@ int Memory::MapViews(uint8_t* mapping_base) {
   // side if system allocation granularity is bigger than 4 KB.
   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
   for (size_t n = 0; n < rex::countof(map_info); n++) {
+    auto mapping = mapping_;
+    uint64_t target_address = map_info[n].target_address;
+    if (physical_mapping_ != rex::memory::kFileMappingHandleInvalid &&
+        target_address >= 0x100000000ull) {
+      mapping = physical_mapping_;
+      target_address -= 0x100000000ull;
+    }
     views_.all_views[n] = reinterpret_cast<uint8_t*>(rex::memory::MapFileView(
-        mapping_, mapping_base + map_info[n].virtual_address_start,
+        mapping, mapping_base + map_info[n].virtual_address_start,
         map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
-        rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
+        rex::memory::PageAccess::kReadWrite, target_address & granularity_mask));
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
-      UnmapViews();
-      return 1;
+      return UnmapViews() ? 1 : 2;
     }
   }
   return 0;
 }
 
-void Memory::UnmapViews() {
+bool Memory::UnmapViews() {
+  bool success = true;
   for (size_t n = 0; n < rex::countof(views_.all_views); n++) {
     if (views_.all_views[n]) {
       size_t length = map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
-      rex::memory::UnmapFileView(mapping_, views_.all_views[n], length);
+      auto mapping = physical_mapping_ != rex::memory::kFileMappingHandleInvalid &&
+                             map_info[n].target_address >= 0x100000000ull
+                         ? physical_mapping_
+                         : mapping_;
+      if (rex::memory::UnmapFileView(mapping, views_.all_views[n], length)) {
+        views_.all_views[n] = nullptr;
+      } else {
+        REXSYS_ERROR("Unable to unmap guest memory view {}.", n);
+        success = false;
+      }
     }
   }
+  return success;
 }
 
 void Memory::Reset() {
