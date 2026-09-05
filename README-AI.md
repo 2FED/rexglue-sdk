@@ -6,7 +6,17 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The current v0.18.0.0 delta reuses the immediately retained Vulkan vertex/pixel
+The current v0.18.0.1 retains v0.18.0.0 descriptor reuse and corrects its two
+short-call timers: accumulate nanoseconds internally, convert once on snapshot
+read to the unchanged public microsecond fields. Per-call us truncation made
+millions of native calls appear almost free; first native control counts/reuse
+remain valid, but its timing totals are underestimates. No rendering/cache
+policy change. Independent follow-up review and both full configurations pass
+1,845 executed plus four skips (1,849 registered). Five diagnostic-scope cases /
+53 assertions include an independently timed enclosed-workload unit check and
+early return/unwind. Timer resolution/overhead still depends on the platform.
+
+The preceding v0.18.0.0 delta reuses the immediately retained Vulkan vertex/pixel
 texture descriptor sets only when actual ordered image views/layouts/samplers,
 current set/validity, pipeline/stage layout, frame and submission match.
 Texture/sampler requests, uploads, barriers and usage marks remain unconditional.

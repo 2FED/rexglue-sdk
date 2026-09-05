@@ -29,6 +29,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/descriptor_binding_snapshot.h>
+#include <rex/graphics/util/nanosecond_diagnostic_scope.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
@@ -569,11 +570,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_count_{0};
   std::atomic<uint64_t> performance_vulkan_resolve_readback_wait_us_{0};
   std::atomic<uint64_t> performance_vulkan_binding_update_count_{0};
-  std::atomic<uint64_t> performance_vulkan_binding_update_us_{0};
+  std::atomic<uint64_t> performance_vulkan_binding_update_ns_{0};
   std::atomic<uint64_t> performance_vulkan_texture_descriptor_reuse_count_{0};
   std::atomic<uint64_t> performance_vulkan_texture_descriptor_write_count_{0};
   std::atomic<uint64_t> performance_vulkan_descriptor_update_count_{0};
-  std::atomic<uint64_t> performance_vulkan_descriptor_update_us_{0};
+  std::atomic<uint64_t> performance_vulkan_descriptor_update_ns_{0};
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;

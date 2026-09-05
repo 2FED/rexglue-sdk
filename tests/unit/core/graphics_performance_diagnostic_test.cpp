@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/util/nanosecond_diagnostic_scope.h>
 
 namespace rex::graphics::test {
 namespace {
@@ -18,6 +19,8 @@ class DiagnosticScopeAccess : public CommandProcessor {
 };
 
 using DiagnosticScope = DiagnosticScopeAccess::ScopedPerformanceDiagnostic;
+static_assert(!std::is_copy_constructible_v<ScopedNanosecondDiagnostic>);
+static_assert(!std::is_move_constructible_v<ScopedNanosecondDiagnostic>);
 static_assert(!std::is_copy_constructible_v<DiagnosticScope>);
 static_assert(!std::is_move_constructible_v<DiagnosticScope>);
 
@@ -100,6 +103,56 @@ TEST_CASE("Graphics command diagnostic snapshot defaults do not imply executed w
   CHECK(snapshot.vulkan_texture_descriptor_write_count == 0);
   CHECK(snapshot.vulkan_descriptor_update_count == 0);
   CHECK(snapshot.vulkan_descriptor_update_us == 0);
+}
+
+TEST_CASE("Short graphics diagnostic scopes retain nanoseconds until snapshot conversion",
+          "[graphics][performance-diagnostic]") {
+  std::atomic<uint64_t> count{0}, elapsed_ns{999}, outer_count{0}, outer_ns{0};
+  {
+    const ScopedNanosecondDiagnostic outer(outer_count, outer_ns);
+    for (unsigned i = 0; i < 1000; ++i) {
+      const ScopedNanosecondDiagnostic inner(count, elapsed_ns);
+    }
+  }
+  CHECK(count.load() == 1000);
+  CHECK(outer_count.load() == 1);
+  CHECK(elapsed_ns.load() >= 999);
+  CHECK(elapsed_ns.load() - 999 <= outer_ns.load());
+  CHECK(outer_ns.load() > 0);
+  // Conversion is once per cumulative snapshot, preserving sub-us remainder.
+  CHECK(elapsed_ns.load() / 1000 <= (outer_ns.load() + 999) / 1000);
+  // An independently timed inner workload gives a deterministic unit check:
+  // microseconds mislabeled as ns cannot cover this enclosed ns interval.
+  std::atomic<uint64_t> work{0}, measured_count{0}, measured_ns{0};
+  uint64_t enclosed_ns;
+  {
+    const ScopedNanosecondDiagnostic scope(measured_count, measured_ns);
+    const auto begin = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < 10000; ++i) work.fetch_add(1, std::memory_order_relaxed);
+    enclosed_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count());
+  }
+  CHECK(enclosed_ns > 0);
+  CHECK(measured_ns.load() >= enclosed_ns);
+  CHECK(measured_count.load() == 1);
+}
+
+TEST_CASE("Nanosecond diagnostics complete on early return and unwind",
+          "[graphics][performance-diagnostic]") {
+  std::atomic<uint64_t> count{0}, elapsed_ns{123};
+  const auto fail = [&]() {
+    const ScopedNanosecondDiagnostic scope(count, elapsed_ns);
+    return false;
+  };
+  CHECK_FALSE(fail());
+  CHECK(count.load() == 1);
+  const auto raise = [&]() {
+    const ScopedNanosecondDiagnostic scope(count, elapsed_ns);
+    throw std::runtime_error("fixture");
+  };
+  CHECK_THROWS_AS(raise(), std::runtime_error);
+  CHECK(count.load() == 2);
+  CHECK(elapsed_ns.load() >= 123);
 }
 
 }  // namespace rex::graphics::test

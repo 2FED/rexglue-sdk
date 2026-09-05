@@ -638,11 +638,11 @@ GraphicsPerformanceDiagnosticSnapshot VulkanCommandProcessor::GetPerformanceDiag
   snapshot.vulkan_resolve_readback_wait_us =
       performance_vulkan_resolve_readback_wait_us_.load(std::memory_order_relaxed);
   snapshot.vulkan_binding_update_count = performance_vulkan_binding_update_count_.load(std::memory_order_relaxed);
-  snapshot.vulkan_binding_update_us = performance_vulkan_binding_update_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_binding_update_us = performance_vulkan_binding_update_ns_.load(std::memory_order_relaxed) / 1000;
   snapshot.vulkan_texture_descriptor_reuse_count = performance_vulkan_texture_descriptor_reuse_count_.load(std::memory_order_relaxed);
   snapshot.vulkan_texture_descriptor_write_count = performance_vulkan_texture_descriptor_write_count_.load(std::memory_order_relaxed);
   snapshot.vulkan_descriptor_update_count = performance_vulkan_descriptor_update_count_.load(std::memory_order_relaxed);
-  snapshot.vulkan_descriptor_update_us = performance_vulkan_descriptor_update_us_.load(std::memory_order_relaxed);
+  snapshot.vulkan_descriptor_update_us = performance_vulkan_descriptor_update_ns_.load(std::memory_order_relaxed) / 1000;
   return snapshot;
 }
 
@@ -6503,8 +6503,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
-  const ScopedPerformanceDiagnostic binding_diagnostic(performance_vulkan_binding_update_count_,
-                                                      performance_vulkan_binding_update_us_);
+  const ScopedNanosecondDiagnostic binding_diagnostic(performance_vulkan_binding_update_count_,
+                                                       performance_vulkan_binding_update_ns_);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6875,8 +6875,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   }
   // Write.
   if (write_descriptor_set_count) {
-    const ScopedPerformanceDiagnostic write_diagnostic(performance_vulkan_descriptor_update_count_,
-                                                       performance_vulkan_descriptor_update_us_);
+    const ScopedNanosecondDiagnostic write_diagnostic(performance_vulkan_descriptor_update_count_,
+                                                        performance_vulkan_descriptor_update_ns_);
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
   }
