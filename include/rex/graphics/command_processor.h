@@ -159,6 +159,8 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   uint64_t memory_watch_disarm_us = 0;
   uint64_t memory_watch_protect_failures = 0;
   uint64_t memory_watch_arm_gap_splits = 0;
+  uint64_t memory_watch_disarm_safe_gap_splits = 0;
+  uint64_t memory_watch_disarm_gap_lock_misses = 0;
   uint64_t memory_watch_arm_lock_wait_us = 0;
 };
 

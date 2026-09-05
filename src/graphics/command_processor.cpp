@@ -153,6 +153,8 @@ GraphicsPerformanceDiagnosticSnapshot CommandProcessor::GetPerformanceDiagnostic
     snapshot.memory_watch_disarm_us = memory_snapshot.watch_disarm_us;
     snapshot.memory_watch_protect_failures = memory_snapshot.watch_protect_failures;
     snapshot.memory_watch_arm_gap_splits = memory_snapshot.watch_arm_gap_splits;
+    snapshot.memory_watch_disarm_safe_gap_splits = memory_snapshot.watch_disarm_safe_gap_splits;
+    snapshot.memory_watch_disarm_gap_lock_misses = memory_snapshot.watch_disarm_gap_lock_misses;
     snapshot.memory_watch_arm_lock_wait_us = memory_snapshot.watch_arm_lock_wait_us;
   }
   return snapshot;

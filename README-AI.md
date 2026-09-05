@@ -6,7 +6,26 @@ privacy, exact-pin and release decisions. Read `docs/rexglue-sdk.md` in the
 parent for current and historical deltas. Never update or push this fork
 independently of those gates.
 
-The current v0.18.0.1 retains v0.18.0.0 descriptor reuse and corrects its two
+The current v0.19.0.0 adds two address-free disarm-fragmentation counters:
+safe gaps between complete committed guest-RW runs and metadata-lock misses.
+Native protection arguments/call order, watch bits, callback bounds, guest
+rights and readback policy remain unchanged. Classification tries heap_mutex_
+without blocking after callbacks; contention preserves legacy watched-only
+reads and records one skipped range. Do not infer exhaustive absence of
+opportunities from an interval with misses, nor any saved-time/throughput PASS.
+The public snapshot extension advances the CMake API floor to0.19.0.
+
+Independent review caught an initial unsynchronized gap-metadata read before
+deployment; the accepted nonblocking remedy avoids a global->heap blocking
+lock edge. Both all-target configurations and complete suites pass1,856 tests
+plus four known BitStream skips (1,860 registered). Eleven GPU-free cases /
+479 assertions cover rights/commit state, complete runs, callback/alias/cap
+bounds, unchanged native calls, aggregation, contention/resumption and
+recursive ownership. Instrumentation overhead, larger host pages and real
+Deck opportunity counts remain integration gates, not consequences of tests.
+Pre-existing watched-page metadata synchronization is outside this delta.
+
+The preceding v0.18.0.1 retains v0.18.0.0 descriptor reuse and corrects its two
 short-call timers: accumulate nanoseconds internally, convert once on snapshot
 read to the unchanged public microsecond fields. Per-call us truncation made
 millions of native calls appear almost free; first native control counts/reuse

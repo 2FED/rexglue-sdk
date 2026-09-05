@@ -61,6 +61,13 @@ struct MemoryAccessDiagnosticSnapshot {
   uint64_t watch_disarm_us = 0;
   uint64_t watch_protect_failures = 0;
   uint64_t watch_arm_gap_splits = 0;
+  // Gaps between complete committed guest-RW disarm runs within one approved
+  // alias range. Gap pages are unwatched, committed and guest-RW. This counts
+  // structural opportunities only; native protection calls are unchanged.
+  uint64_t watch_disarm_safe_gap_splits = 0;
+  // Unprotect episodes whose optional gap classification could not acquire the
+  // alias heap mutex immediately. Legacy protection behavior still executes.
+  uint64_t watch_disarm_gap_lock_misses = 0;
 };
 
 // NOTE: only one can exist at a time!

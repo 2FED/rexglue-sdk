@@ -509,6 +509,10 @@ runtime::MemoryAccessDiagnosticSnapshot Memory::GetAccessDiagnosticSnapshot() co
   snapshot.watch_disarm_us = watch_disarm_us_.load(std::memory_order_relaxed);
   snapshot.watch_protect_failures = watch_protect_failures_.load(std::memory_order_relaxed);
   snapshot.watch_arm_gap_splits = watch_arm_gap_splits_.load(std::memory_order_relaxed);
+  snapshot.watch_disarm_safe_gap_splits =
+      watch_disarm_safe_gap_splits_.load(std::memory_order_relaxed);
+  snapshot.watch_disarm_gap_lock_misses =
+      watch_disarm_gap_lock_misses_.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -2089,28 +2093,62 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   if (unprotect) {
     uint8_t* protect_base = membase_ + heap_base_;
     uint32_t unprotect_system_page_first = UINT32_MAX;
+    // Allocation writes page metadata under heap_mutex_ without the global
+    // region lock. Never block on that mutex while holding the global lock:
+    // an allocating thread may itself fault and need the global lock. Acquire
+    // only after callbacks, so arbitrary callback code gains no new lock edge.
+    std::unique_lock<std::recursive_mutex> diagnostic_heap_lock(heap_mutex_, std::try_to_lock);
+    const bool classify_gaps = diagnostic_heap_lock.owns_lock();
+    if (!classify_gaps) {
+      memory_->watch_disarm_gap_lock_misses_.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Observe gaps without extending any protection call. A bridge is counted
+    // only after its entire right-hand run is known to be committed guest-RW;
+    // the legacy disarm predicate itself intentionally remains unchanged.
+    uint64_t safe_gap_splits = 0;
+    bool preceding_run_and_gap_safe = false;
+    bool run_has_safe_gap = false;
+    bool run_committed_read_write = false;
     for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
       // Check if need to allow writing to this page.
-      bool unprotect_page =
+      const bool watched_page =
           (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
-      if (unprotect_page) {
-        uint32_t guest_page_number =
+      bool guest_read_write = false;
+      bool committed_read_write = false;
+      if (watched_page || classify_gaps) {
+        const uint32_t guest_page_number =
             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
-            rex::memory::PageAccess::kReadWrite) {
-          unprotect_page = false;
+        guest_read_write = ToPageAccess(page_table_[guest_page_number].current_protect) ==
+                           rex::memory::PageAccess::kReadWrite;
+        // On lock contention retain exactly the legacy watched-only protection
+        // read. No unwatched PageEntry or allocation-state read is added there.
+        if (classify_gaps) {
+          committed_read_write =
+              guest_read_write &&
+              (page_table_[guest_page_number].state & memory::kMemoryAllocationCommit) != 0;
         }
       }
+      const bool unprotect_page = watched_page && guest_read_write;
       if (unprotect_page) {
         if (unprotect_system_page_first == UINT32_MAX) {
           unprotect_system_page_first = i;
+          run_has_safe_gap = preceding_run_and_gap_safe;
+          run_committed_read_write = true;
         }
+        run_committed_read_write &= committed_read_write;
       } else {
         if (unprotect_system_page_first != UINT32_MAX) {
           memory_->ProtectWatchRange(protect_base + unprotect_system_page_first * system_page_size_,
                                      (i - unprotect_system_page_first) * system_page_size_,
                                      rex::memory::PageAccess::kReadWrite);
           unprotect_system_page_first = UINT32_MAX;
+          if (run_has_safe_gap && run_committed_read_write) {
+            ++safe_gap_splits;
+          }
+          preceding_run_and_gap_safe = run_committed_read_write;
+        }
+        if (watched_page || !committed_read_write) {
+          preceding_run_and_gap_safe = false;
         }
       }
     }
@@ -2118,6 +2156,12 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       memory_->ProtectWatchRange(protect_base + unprotect_system_page_first * system_page_size_,
                                  (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
                                  rex::memory::PageAccess::kReadWrite);
+      if (run_has_safe_gap && run_committed_read_write) {
+        ++safe_gap_splits;
+      }
+    }
+    if (safe_gap_splits) {
+      memory_->watch_disarm_safe_gap_splits_.fetch_add(safe_gap_splits, std::memory_order_relaxed);
     }
   }
 

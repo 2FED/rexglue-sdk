@@ -541,6 +541,8 @@ class Memory {
   std::atomic<uint64_t> watch_disarm_us_{0};
   std::atomic<uint64_t> watch_protect_failures_{0};
   std::atomic<uint64_t> watch_arm_gap_splits_{0};
+  std::atomic<uint64_t> watch_disarm_safe_gap_splits_{0};
+  std::atomic<uint64_t> watch_disarm_gap_lock_misses_{0};
 
   std::filesystem::path file_name_;
   uint32_t system_page_size_ = 0;
