@@ -32,7 +32,6 @@ namespace xam {
 
 static const char* kThumbnailFileName = "__thumbnail.png";
 
-static const char* kGameUserContentDirName = "profile";
 
 static const char* kGameContentHeaderDirName = "Headers";
 static constexpr std::string_view kTransactionBackupSuffix = ".rexbackup";
@@ -679,17 +678,11 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
 }
 
 std::filesystem::path ContentManager::ResolveGameUserContentPath() {
-  auto title_id = fmt::format("{:08X}", kernel_state_->title_id());
-  auto user_name = rex::to_path(kernel_state_->user_profile()->name());
-
-  // Per-game per-profile data location:
-  // content_root/title_id/profile/user_name
-  return root_path_ / title_id / kGameUserContentDirName / user_name;
+  return kernel_state_->user_profile()->TitleProfilePath(root_path_, kernel_state_->title_id());
 }
 
 std::filesystem::path ContentManager::ResolveGlobalUserProfilePath() {
-  auto user_name = rex::to_path(kernel_state_->user_profile()->name());
-  return root_path_ / kGameUserContentDirName / user_name;
+  return kernel_state_->user_profile()->GlobalProfilePath(root_path_);
 }
 
 std::unordered_map<string::string_key_case, ContentPackage*,

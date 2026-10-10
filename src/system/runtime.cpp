@@ -26,6 +26,7 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
+#include <rex/system/xam/user_profile.h>
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
@@ -92,6 +93,14 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
   if (instance_ != nullptr) {
     REXSYS_ERROR("Runtime::Setup() called but global instance already exists");
     return X_STATUS_UNSUCCESSFUL;
+  }
+  // Validate the final CLI -> environment -> TOML value before creating any
+  // runtime/profile state. An invalid local name is an ordinary setup failure,
+  // not a truncation, silent fallback to User, or an unhandled exception.
+  if (!system::xam::UserProfile::IsValidDisplayName(
+          cvar::GetFlagByName("local_user_display_name"))) {
+    REXSYS_ERROR("Invalid local_user_display_name: use 1-15 ASCII letters, digits, spaces, _ or -, without leading/trailing spaces");
+    return X_STATUS_INVALID_PARAMETER;
   }
   instance_ = this;
 

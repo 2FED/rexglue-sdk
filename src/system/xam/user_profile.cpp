@@ -14,12 +14,21 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 
 #include <fmt/format.h>
 
 #include <rex/logging.h>
+#include <rex/cvar.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DEFINE_STRING(local_user_display_name, "User", "XAM",
+                     "Local display name: 1-15 ASCII letters, digits, spaces, _ or -; restart required")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Runtime::Setup validates the final CLI -> environment -> TOML value before
+// creating a profile. A generic CVar validator would only warn on invalid TOML
+// and silently keep the previous/default name, so do not use that fallback.
 
 namespace rex {
 namespace system {
@@ -71,12 +80,37 @@ void RecoverPersistentSettingFile(const std::filesystem::path& file_path) {
 
 }  // namespace
 
-UserProfile::UserProfile(uint32_t signin_state) : signin_state_(signin_state == 2 ? 2 : 1) {
+bool UserProfile::IsValidDisplayName(std::string_view name) {
+  if (name.empty() || name.size() > 15 || name.front() == ' ' || name.back() == ' ') {
+    return false;
+  }
+  return std::all_of(name.begin(), name.end(), [](unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == ' ' || c == '_' || c == '-';
+  });
+}
+
+std::filesystem::path UserProfile::GlobalProfilePath(const std::filesystem::path& root) const {
+  return root / "profile" / storage_key();
+}
+
+std::filesystem::path UserProfile::TitleProfilePath(const std::filesystem::path& root,
+                                                   uint32_t title_id) const {
+  return root / fmt::format("{:08X}", title_id) / "profile" / storage_key();
+}
+
+UserProfile::UserProfile(uint32_t signin_state, std::string_view display_name)
+    : signin_state_(signin_state == 2 ? 2 : 1) {
+  // Command-line/environment startup setters may bypass generic CVar
+  // constraints, so validate again before creating or loading any profile.
+  if (!IsValidDisplayName(display_name)) {
+    throw std::invalid_argument("local_user_display_name must contain 1-15 ASCII letters, digits, spaces, _ or -, without leading/trailing spaces");
+  }
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
   // if non-zero, it prevents the user from playing the game.
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
-  name_ = "User";
+  name_ = display_name;
   REXSYS_INFO("XAM_USER_SIGNIN_CONFIG v=1 state={} mode={}", signin_state_,
               signin_state_ == 2 ? "online-compatible" : "local");
 

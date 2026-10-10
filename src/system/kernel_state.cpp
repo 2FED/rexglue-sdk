@@ -43,6 +43,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
 
+REXCVAR_DECLARE(std::string, local_user_display_name);
+
 namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
@@ -71,7 +73,8 @@ KernelState::KernelState(Runtime* emulator)
 
   app_manager_ = std::make_unique<xam::AppManager>();
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
-  user_profile_ = std::make_unique<xam::UserProfile>(REXCVAR_GET(xam_user_signin_state));
+  user_profile_ = std::make_unique<xam::UserProfile>(REXCVAR_GET(xam_user_signin_state),
+                                                 REXCVAR_GET(local_user_display_name));
   user_profile_->set_kernel_state(this);
   user_profile_->SetPersistenceRoot(content_manager_->ResolveGlobalUserProfilePath());
 

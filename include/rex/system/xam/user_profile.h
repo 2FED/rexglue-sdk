@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -303,7 +304,15 @@ class UserProfile {
     }
   };
 
-  explicit UserProfile(uint32_t signin_state = 1);
+  explicit UserProfile(uint32_t signin_state = 1, std::string_view display_name = "User");
+
+  // Display identity is independent of the legacy on-disk profile key.
+  // Invalid names are rejected, never truncated into another identity.
+  static bool IsValidDisplayName(std::string_view name);
+  std::string_view storage_key() const { return "User"; }
+  std::filesystem::path GlobalProfilePath(const std::filesystem::path& root) const;
+  std::filesystem::path TitleProfilePath(const std::filesystem::path& root,
+                                       uint32_t title_id) const;
 
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
