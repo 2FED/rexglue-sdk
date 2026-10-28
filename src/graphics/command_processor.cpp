@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
@@ -39,7 +40,7 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -479,7 +480,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // GetRegisterInfo is a large switch; it only feeds this debug message, so
+  // look the result up in a table built once instead of on every write.
+  static const auto known_registers = [] {
+    std::array<bool, RegisterFile::kRegisterCount> known{};
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      known[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
+    }
+    return known;
+  }();
+  if (!known_registers[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -859,10 +869,15 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+  if (write_one_reg) {
+    for (uint32_t m = 0; m < count; m++) {
+      WriteRegister(base_index, reader->ReadAndSwap<uint32_t>());
+    }
+  } else {
+    // Range writes (mostly shader constants) use the bulk path, which copies
+    // whole constant ranges at once and falls back to per-register writes for
+    // anything else.
+    WriteRegisterRangeFromRing(reader, base_index, count);
   }
 
   trace_writer_.WritePacketEnd();

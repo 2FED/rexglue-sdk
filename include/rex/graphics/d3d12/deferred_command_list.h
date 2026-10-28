@@ -12,8 +12,14 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <rex/assert.h>
@@ -31,9 +37,19 @@ class DeferredCommandList {
  public:
   DeferredCommandList(const D3D12CommandProcessor& command_processor,
                       size_t initial_size_bytes = 1_MiB);
+  ~DeferredCommandList();
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+
+  // Streaming replay: after Reset, a worker thread replays the commands into
+  // the (already reset) command list while they are being written.
+  // FinishStreaming returns once every written command has been replayed; the
+  // caller then closes and executes the command list as with Execute.
+  void BeginStreaming(ID3D12GraphicsCommandList* command_list,
+                      ID3D12GraphicsCommandList1* command_list_1);
+  void FinishStreaming();
+  bool IsStreaming() const { return streaming_; }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -640,10 +656,51 @@ class DeferredCommandList {
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
+  struct ReplayState {
+    ID3D12GraphicsCommandList* command_list = nullptr;
+    ID3D12GraphicsCommandList1* command_list_1 = nullptr;
+    ID3D12PipelineState* current_pipeline_state = nullptr;
+  };
+  void Replay(const uintmax_t* stream, size_t stream_remaining, ReplayState& state);
+
   const D3D12CommandProcessor& command_processor_;
 
+  // The command stream is stored in blocks that are never reallocated while in
+  // use, so the streaming worker can read commands while new ones are written.
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
-  std::vector<uintmax_t> command_stream_;
+  static constexpr size_t kBlockElements = 64 * 1024;
+  static constexpr size_t kMaxBlocks = 4096;
+  struct Block {
+    std::unique_ptr<uintmax_t[]> data;
+    size_t capacity = 0;
+    // Final element count, valid once the writer has moved past the block.
+    std::atomic<size_t> used{0};
+  };
+  void EnsureBlock(size_t index, size_t min_elements);
+  void Publish();
+  std::array<std::unique_ptr<Block>, kMaxBlocks> blocks_;
+  size_t write_block_ = 0;
+  size_t write_used_ = 0;
+  // Commands written since the last publish; publishing is batched to keep the
+  // cache line the worker polls from bouncing on every command.
+  static constexpr uint32_t kPublishBatchCommands = 32;
+  uint32_t unpublished_commands_ = 0;
+  // (block << 32) | elements: everything before this position is complete.
+  // Kept on its own cache line, apart from the writer-only state above.
+  alignas(64) std::atomic<uint64_t> published_{0};
+
+  enum class WorkerState { kIdle, kStreaming, kStop };
+  void WorkerMain();
+  bool streaming_ = false;
+  std::thread worker_;
+  std::mutex worker_mutex_;
+  std::condition_variable worker_cond_;
+  std::condition_variable worker_done_cond_;
+  WorkerState worker_state_ = WorkerState::kIdle;
+  alignas(64) std::atomic<bool> worker_sleeping_{false};
+  std::atomic<bool> worker_finish_requested_{false};
+  ID3D12GraphicsCommandList* worker_command_list_ = nullptr;
+  ID3D12GraphicsCommandList1* worker_command_list_1_ = nullptr;
 };
 
 }  // namespace rex::graphics::d3d12

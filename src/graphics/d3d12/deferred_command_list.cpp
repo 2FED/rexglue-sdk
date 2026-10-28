@@ -7,6 +7,7 @@
  ******************************************************************************
  *
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    MCLA-R, 2026 - Chunked stream and streaming replay worker
  */
 
 #include <rex/assert.h>
@@ -14,18 +15,156 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
 #include <rex/graphics/flags.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <string>
+#include <utility>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+// Replay statistics, reported once a minute. Commands are replayed by one
+// thread at a time (the command processor thread, or the streaming worker
+// while the command processor thread is not replaying).
+struct ReplayStats {
+  std::array<uint64_t, 64> command_count{};
+  uint64_t barrier_count = 0;
+  uint64_t submissions = 0;
+  uint64_t streamed_submissions = 0;
+  uint64_t replay_us = 0;
+  uint64_t finish_wait_us = 0;
+  uint64_t worker_sleeps = 0;
+  std::chrono::steady_clock::time_point next_report{};
+};
+ReplayStats g_replay_stats;
+
+void ReportReplayStats() {
+  ReplayStats& s = g_replay_stats;
+  const auto now = std::chrono::steady_clock::now();
+  if (s.next_report.time_since_epoch().count() == 0) {
+    s.next_report = now + std::chrono::seconds(60);
+    return;
+  }
+  if (now < s.next_report) {
+    return;
+  }
+  s.next_report = now + std::chrono::seconds(60);
+  std::array<std::pair<uint64_t, size_t>, 64> sorted;
+  uint64_t total = 0;
+  for (size_t i = 0; i < sorted.size(); ++i) {
+    sorted[i] = {s.command_count[i], i};
+    total += s.command_count[i];
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+  std::string top;
+  for (size_t i = 0; i < 12 && sorted[i].first; ++i) {
+    top += " " + std::to_string(sorted[i].second) + ":" + std::to_string(sorted[i].first);
+  }
+  REXGPU_INFO(
+      "MCLA replay/min: submissions {} (streamed {}), replay {} us, end-of-submission wait {} us, "
+      "worker sleeps {}, commands {}, barriers {}; by id{}",
+      s.submissions, s.streamed_submissions, s.replay_us, s.finish_wait_us, s.worker_sleeps, total,
+      s.barrier_count, top);
+  s.command_count.fill(0);
+  s.barrier_count = s.submissions = s.streamed_submissions = 0;
+  s.replay_us = s.finish_wait_us = s.worker_sleeps = 0;
+}
+
+inline void SpinPause() {
+#if defined(_M_X64) || defined(__x86_64__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+}  // namespace
 
 DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_processor,
                                          size_t initial_size)
     : command_processor_(command_processor) {
-  command_stream_.reserve(initial_size / sizeof(uintmax_t));
+  EnsureBlock(0, std::max(initial_size / sizeof(uintmax_t), kBlockElements));
+}
+
+DeferredCommandList::~DeferredCommandList() {
+  if (worker_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      worker_state_ = WorkerState::kStop;
+    }
+    worker_cond_.notify_all();
+    worker_.join();
+  }
+}
+
+void DeferredCommandList::EnsureBlock(size_t index, size_t min_elements) {
+  assert_true(index < kMaxBlocks);
+  std::unique_ptr<Block>& block = blocks_[index];
+  if (!block) {
+    block = std::make_unique<Block>();
+  }
+  if (block->capacity < min_elements) {
+    block->data = std::make_unique<uintmax_t[]>(min_elements);
+    block->capacity = min_elements;
+  }
+  block->used.store(0, std::memory_order_relaxed);
 }
 
 void DeferredCommandList::Reset() {
-  command_stream_.clear();
+  assert_false(streaming_);
+  write_block_ = 0;
+  write_used_ = 0;
+  unpublished_commands_ = 0;
+  blocks_[0]->used.store(0, std::memory_order_relaxed);
+  published_.store(0, std::memory_order_relaxed);
+}
+
+void DeferredCommandList::Publish() {
+  // Everything up to the current write position is complete. The fence pairs
+  // with the worker's seq_cst store of worker_sleeping_ before it re-checks the
+  // published position, so a wake-up cannot be lost.
+  unpublished_commands_ = 0;
+  published_.store((uint64_t(write_block_) << 32) | uint64_t(write_used_),
+                   std::memory_order_release);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (streaming_ && worker_sleeping_.load(std::memory_order_relaxed)) {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    worker_cond_.notify_all();
+  }
+}
+
+void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
+  size_t arguments_size_elements =
+      (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+  size_t command_size_elements = kCommandHeaderSizeElements + arguments_size_elements;
+  // The previous commands' arguments have been fully written by their callers
+  // by now - make them visible to the streaming worker every few commands.
+  if (streaming_ && ++unpublished_commands_ >= kPublishBatchCommands) {
+    Publish();
+  }
+  Block* block = blocks_[write_block_].get();
+  if (write_used_ + command_size_elements > block->capacity) {
+    // Seal the current block before moving to the next one.
+    block->used.store(write_used_, std::memory_order_release);
+    EnsureBlock(write_block_ + 1, std::max(kBlockElements, command_size_elements));
+    ++write_block_;
+    write_used_ = 0;
+    block = blocks_[write_block_].get();
+  }
+  uintmax_t* command_data = block->data.get() + write_used_;
+  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_data);
+  header.command = command;
+  header.arguments_size_elements = uint32_t(arguments_size_elements);
+  write_used_ += command_size_elements;
+  return command_data + kCommandHeaderSizeElements;
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -33,13 +172,156 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
-  ID3D12PipelineState* current_pipeline_state = nullptr;
+  assert_false(streaming_);
+  const auto replay_begin = std::chrono::steady_clock::now();
+  ReplayState state;
+  state.command_list = command_list;
+  state.command_list_1 = command_list_1;
+  for (size_t i = 0; i <= write_block_; ++i) {
+    size_t used =
+        i < write_block_ ? blocks_[i]->used.load(std::memory_order_relaxed) : write_used_;
+    Replay(blocks_[i]->data.get(), used, state);
+  }
+  ++g_replay_stats.submissions;
+  g_replay_stats.replay_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - replay_begin)
+                                           .count());
+  ReportReplayStats();
+}
+
+void DeferredCommandList::BeginStreaming(ID3D12GraphicsCommandList* command_list,
+                                         ID3D12GraphicsCommandList1* command_list_1) {
+  assert_false(streaming_);
+  if (!worker_.joinable()) {
+    worker_ = std::thread([this] { WorkerMain(); });
+  }
+  {
+    std::lock_guard<std::mutex> lock(worker_mutex_);
+    assert_true(worker_state_ == WorkerState::kIdle);
+    worker_command_list_ = command_list;
+    worker_command_list_1_ = command_list_1;
+    worker_finish_requested_.store(false, std::memory_order_relaxed);
+    worker_state_ = WorkerState::kStreaming;
+  }
+  streaming_ = true;
+  // Commands written before streaming started (after Reset) become visible.
+  Publish();
+  worker_cond_.notify_all();
+}
+
+void DeferredCommandList::FinishStreaming() {
+  assert_true(streaming_);
+  const auto wait_begin = std::chrono::steady_clock::now();
+  blocks_[write_block_]->used.store(write_used_, std::memory_order_release);
+  Publish();
+  {
+    std::unique_lock<std::mutex> lock(worker_mutex_);
+    worker_finish_requested_.store(true, std::memory_order_seq_cst);
+    worker_cond_.notify_all();
+    worker_done_cond_.wait(lock, [this] { return worker_state_ == WorkerState::kIdle; });
+  }
+  streaming_ = false;
+  g_replay_stats.finish_wait_us +=
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - wait_begin)
+                   .count());
+  ++g_replay_stats.submissions;
+  ++g_replay_stats.streamed_submissions;
+  ReportReplayStats();
+}
+
+void DeferredCommandList::WorkerMain() {
+  while (true) {
+    ReplayState state;
+    {
+      std::unique_lock<std::mutex> lock(worker_mutex_);
+      worker_cond_.wait(lock, [this] { return worker_state_ != WorkerState::kIdle; });
+      if (worker_state_ == WorkerState::kStop) {
+        return;
+      }
+      state.command_list = worker_command_list_;
+      state.command_list_1 = worker_command_list_1_;
+    }
+    size_t cursor_block = 0;
+    size_t cursor_offset = 0;
+    uint64_t replay_ns = 0;
+    uint32_t idle_spins = 0;
+    while (true) {
+      uint64_t published = published_.load(std::memory_order_acquire);
+      size_t published_block = size_t(published >> 32);
+      size_t published_offset = size_t(published & UINT32_MAX);
+      if (cursor_block < published_block) {
+        // The block was sealed before the position moved past it.
+        size_t block_end = blocks_[cursor_block]->used.load(std::memory_order_acquire);
+        if (cursor_offset < block_end) {
+          auto begin = std::chrono::steady_clock::now();
+          Replay(blocks_[cursor_block]->data.get() + cursor_offset, block_end - cursor_offset,
+                 state);
+          replay_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - begin)
+                                    .count());
+        }
+        ++cursor_block;
+        cursor_offset = 0;
+        idle_spins = 0;
+        continue;
+      }
+      if (cursor_offset < published_offset) {
+        auto begin = std::chrono::steady_clock::now();
+        Replay(blocks_[cursor_block]->data.get() + cursor_offset,
+               published_offset - cursor_offset, state);
+        replay_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count());
+        cursor_offset = published_offset;
+        idle_spins = 0;
+        continue;
+      }
+      // Caught up with the writer.
+      if (worker_finish_requested_.load(std::memory_order_seq_cst)) {
+        // FinishStreaming publishes the final position before requesting the
+        // finish, so if nothing new is visible now, everything is replayed.
+        if (published_.load(std::memory_order_acquire) == published) {
+          break;
+        }
+        continue;
+      }
+      if (++idle_spins < 4096) {
+        SpinPause();
+        continue;
+      }
+      idle_spins = 0;
+      std::unique_lock<std::mutex> lock(worker_mutex_);
+      worker_sleeping_.store(true, std::memory_order_seq_cst);
+      if (published_.load(std::memory_order_seq_cst) == published &&
+          !worker_finish_requested_.load(std::memory_order_seq_cst)) {
+        ++g_replay_stats.worker_sleeps;
+        worker_cond_.wait(lock, [this, published] {
+          return published_.load(std::memory_order_seq_cst) != published ||
+                 worker_finish_requested_.load(std::memory_order_seq_cst);
+        });
+      }
+      worker_sleeping_.store(false, std::memory_order_relaxed);
+    }
+    {
+      std::lock_guard<std::mutex> lock(worker_mutex_);
+      g_replay_stats.replay_us += replay_ns / 1000;
+      worker_state_ = WorkerState::kIdle;
+    }
+    worker_done_cond_.notify_all();
+  }
+}
+
+void DeferredCommandList::Replay(const uintmax_t* stream, size_t stream_remaining,
+                                 ReplayState& state) {
+  ID3D12GraphicsCommandList* command_list = state.command_list;
+  ID3D12GraphicsCommandList1* command_list_1 = state.command_list_1;
+  ID3D12PipelineState*& current_pipeline_state = state.current_pipeline_state;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
+    ++g_replay_stats.command_count[size_t(header.command) & 63];
     switch (header.command) {
       case Command::kD3DClearDepthStencilView: {
         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
@@ -146,6 +428,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kD3DResourceBarrier: {
         static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
+        g_replay_stats.barrier_count += *reinterpret_cast<const UINT*>(stream);
         command_list->ResourceBarrier(
             *reinterpret_cast<const UINT*>(stream),
             reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(
@@ -275,17 +558,6 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
-}
-
-void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
-  size_t arguments_size_elements =
-      (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
-  header.command = command;
-  header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
 }
 
 }  // namespace rex::graphics::d3d12

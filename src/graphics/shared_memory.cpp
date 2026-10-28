@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
@@ -20,7 +23,119 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
+#include <rex/logging.h>
+
 namespace rex::graphics {
+
+namespace {
+// Write-tracking statistics, reported once a minute. All members are only
+// touched with the global critical region held.
+struct WatchStats {
+  std::vector<uint32_t> page_valid_count;
+  uint64_t valid_calls = 0;
+  uint64_t valid_pages = 0;
+  uint64_t gpu_valid_calls = 0;
+  uint64_t gpu_valid_pages = 0;
+  uint64_t invalidate_calls = 0;
+  uint64_t invalidate_pages = 0;
+  uint64_t invalidate_exact_calls = 0;
+  std::chrono::steady_clock::time_point next_report{};
+  runtime::MemoryAccessDiagnosticSnapshot last_memory{};
+};
+WatchStats g_watch_stats;
+
+void CountValidPagesLocked(memory::Memory& memory, uint32_t page_first, uint32_t page_last,
+                           bool written_by_gpu, uint32_t page_count_total,
+                           uint32_t page_size_log2) {
+  WatchStats& s = g_watch_stats;
+  if (s.page_valid_count.size() != page_count_total) {
+    s.page_valid_count.assign(page_count_total, 0);
+  }
+  ++s.valid_calls;
+  s.valid_pages += page_last - page_first + 1;
+  if (written_by_gpu) {
+    ++s.gpu_valid_calls;
+    s.gpu_valid_pages += page_last - page_first + 1;
+  } else {
+    // The per-page histogram covers CPU-to-GPU uploads only.
+    for (uint32_t i = page_first; i <= page_last && i < page_count_total; ++i) {
+      ++s.page_valid_count[i];
+    }
+  }
+  if ((s.valid_calls & 1023) != 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (s.next_report.time_since_epoch().count() == 0) {
+    s.next_report = now + std::chrono::seconds(60);
+    return;
+  }
+  if (now < s.next_report) {
+    return;
+  }
+  s.next_report = now + std::chrono::seconds(60);
+  uint64_t distinct = 0, hot60 = 0, hot600 = 0, hot1800 = 0;
+  uint64_t arms600 = 0, arms1800 = 0;
+  uint32_t top_block[3] = {0, 0, 0};
+  uint64_t top_block_count[3] = {0, 0, 0};
+  uint64_t block_sum = 0;
+  for (uint32_t i = 0; i < page_count_total; ++i) {
+    const uint32_t c = s.page_valid_count[i];
+    block_sum += c;
+    if (c) {
+      ++distinct;
+      if (c >= 60) ++hot60;
+      if (c >= 600) { ++hot600; arms600 += c; }
+      if (c >= 1800) { ++hot1800; arms1800 += c; }
+    }
+    if ((i & 63) == 63) {
+      for (int k = 0; k < 3; ++k) {
+        if (block_sum > top_block_count[k]) {
+          for (int m = 2; m > k; --m) {
+            top_block_count[m] = top_block_count[m - 1];
+            top_block[m] = top_block[m - 1];
+          }
+          top_block_count[k] = block_sum;
+          top_block[k] = (i >> 6) << (6 + page_size_log2);
+          break;
+        }
+      }
+      block_sum = 0;
+    }
+  }
+  REXGPU_INFO(
+      "MCLA watch stats/min: valid calls {} (gpu {}, gpu pages {}) pages {}; invalidations {} (exact {}) "
+      "pages {}; distinct pages {}, >=60 {}, >=600 {} ({} of page-validations), >=1800 {} ({}); "
+      "top 256KB blocks {:08X}:{} {:08X}:{} {:08X}:{}",
+      s.valid_calls, s.gpu_valid_calls, s.gpu_valid_pages, s.valid_pages, s.invalidate_calls,
+      s.invalidate_exact_calls, s.invalidate_pages, distinct, hot60, hot600, arms600, hot1800,
+      arms1800, top_block[0], top_block_count[0], top_block[1], top_block_count[1], top_block[2],
+      top_block_count[2]);
+  const runtime::MemoryAccessDiagnosticSnapshot m = memory.GetAccessDiagnosticSnapshot();
+  const runtime::MemoryAccessDiagnosticSnapshot& p = s.last_memory;
+  REXGPU_INFO(
+      "MCLA watch protect/min: arm calls {} ({} us, lock wait {} us), disarm calls {} ({} us)",
+      m.watch_arm_calls - p.watch_arm_calls, m.watch_arm_us - p.watch_arm_us,
+      m.watch_arm_lock_wait_us - p.watch_arm_lock_wait_us,
+      m.watch_disarm_calls - p.watch_disarm_calls, m.watch_disarm_us - p.watch_disarm_us);
+  s.last_memory = m;
+  std::fill(s.page_valid_count.begin(), s.page_valid_count.end(), 0);
+  s.valid_calls = s.valid_pages = s.gpu_valid_calls = s.gpu_valid_pages = 0;
+  s.invalidate_calls = s.invalidate_pages = s.invalidate_exact_calls = 0;
+}
+uint32_t InvalidateWidenPages() {
+  static const uint32_t pages = [] {
+    const char* value = std::getenv("MCLA_INVALIDATE_WIDEN_PAGES");
+    uint32_t parsed = value ? uint32_t(std::strtoul(value, nullptr, 10)) : 64;
+    if (parsed < 1 || parsed > 64 || (parsed & (parsed - 1)) != 0) {
+      parsed = 64;
+    }
+    REXGPU_INFO("MCLA shared memory: invalidation widening {} pages", parsed);
+    return parsed;
+  }();
+  return pages;
+}
+}  // namespace
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -371,6 +486,8 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         dirty_blocks_.fetch_or(uint32_t(1) << (i >> 6), std::memory_order_relaxed);
       }
     }
+    CountValidPagesLocked(memory(), valid_page_first, valid_page_last, written_by_gpu,
+                          kBufferSize >> page_size_log2_, page_size_log2_);
   }
 
   if (memory_invalidation_callback_handle_) {
@@ -408,7 +525,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  // Called for every draw and texture request: reuse per-thread storage
+  // instead of allocating a new vector each time.
+  thread_local std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  merged_ranges.clear();
   merged_ranges.reserve(count);
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
@@ -600,6 +720,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   auto global_lock = global_critical_region_.Acquire();
 
   if (!exact_range) {
+    const uint32_t widen_pages = InvalidateWidenPages();
+    const uint32_t requested_page_first = page_first;
+    const uint32_t requested_page_last = page_last;
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
     // invalidated since it's not in sync with CPU memory and can't be
@@ -618,6 +741,10 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
+    }
+    if (widen_pages < 64) {
+      page_first = std::max(page_first, requested_page_first & ~(widen_pages - 1));
+      page_last = std::min(page_last, requested_page_last | (widen_pages - 1));
     }
   }
 
@@ -639,6 +766,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
   dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
+
+  ++g_watch_stats.invalidate_calls;
+  g_watch_stats.invalidate_pages += page_last - page_first + 1;
+  if (exact_range) {
+    ++g_watch_stats.invalidate_exact_calls;
+  }
 
   FireWatches(page_first, page_last, false);
 

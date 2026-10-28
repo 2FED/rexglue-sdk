@@ -46,6 +46,10 @@ namespace rex::graphics {
 
 class CommandProcessor;
 
+// Reports the number of draws in the guest frame that just ended (command
+// processor thread). Light frames (UI screens) keep the stock vblank rate.
+void MclaReportGuestFrameDraws(uint32_t draw_count);
+
 class GraphicsSystem : public system::IGraphicsSystem {
  public:
   virtual ~GraphicsSystem();

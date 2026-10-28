@@ -38,6 +38,11 @@
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(d3d12_streaming_replay, true, "GPU/D3D12",
+                    "Replay recorded commands into the Direct3D 12 command list on a worker "
+                    "thread while they are being recorded")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2427,12 +2432,18 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+namespace {
+// Draws issued in the current guest frame (command processor thread only).
+uint32_t g_mcla_frame_draws = 0;
+}  // namespace
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  ++g_mcla_frame_draws;
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
@@ -3365,7 +3376,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
-  bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+  bool should_copy = true;
+  if (readback_mode == ReadbackResolveMode::kSome) {
+    should_copy = is_cache_miss || ++rb.resolves_since_copy >= kReadbackSomeRefreshInterval;
+    if (should_copy) {
+      rb.resolves_since_copy = 0;
+    }
+  }
   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
@@ -3423,6 +3440,10 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return;
+  }
+
+  if (submission_timestamp_mapping_) {
+    CollectSubmissionTimestamps();
   }
 
   // Reclaim command allocators.
@@ -3588,6 +3609,27 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // fulfilled).
     deferred_command_list_.Reset();
 
+    // With streaming replay, the real command list is reset now and the
+    // commands are replayed into it by a worker while being recorded. Draws
+    // whose pipelines are still being created are skipped at record time, so
+    // the replay never waits for pipeline creation.
+    streaming_submission_ = false;
+    if (REXCVAR_GET(d3d12_streaming_replay) && EnsureWritableCommandAllocator()) {
+      ID3D12CommandAllocator* command_allocator =
+          command_allocator_writable_first_->command_allocator;
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      if (performance_timestamp_begin_pending_ && performance_timestamp_query_heap_) {
+        command_list_->EndQuery(performance_timestamp_query_heap_.Get(),
+                                D3D12_QUERY_TYPE_TIMESTAMP,
+                                uint32_t(frame_current_ % kQueueFrames) * 2);
+        performance_timestamp_begin_pending_ = false;
+      }
+      WriteSubmissionStartTimestamp();
+      deferred_command_list_.BeginStreaming(command_list_, command_list_1_);
+      streaming_submission_ = true;
+    }
+
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
     ff_scissor_update_needed_ = true;
@@ -3664,24 +3706,32 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   return true;
 }
 
+bool D3D12CommandProcessor::EnsureWritableCommandAllocator() {
+  if (command_allocator_writable_first_) {
+    return true;
+  }
+  ID3D12CommandAllocator* command_allocator;
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandAllocator(
+          D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
+    REXGPU_ERROR("Failed to create a command allocator");
+    return false;
+  }
+  command_allocator_writable_first_ = new CommandAllocator;
+  command_allocator_writable_first_->command_allocator = command_allocator;
+  command_allocator_writable_first_->last_usage_submission = 0;
+  command_allocator_writable_first_->next = nullptr;
+  command_allocator_writable_last_ = command_allocator_writable_first_;
+  return true;
+}
+
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
   // Make sure there is a command allocator to write commands to.
-  if (submission_open_ && !command_allocator_writable_first_) {
-    ID3D12CommandAllocator* command_allocator;
-    if (FAILED(provider.GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                            IID_PPV_ARGS(&command_allocator)))) {
-      REXGPU_ERROR("Failed to create a command allocator");
-      // Try to submit later. Completely dropping the submission is not
-      // permitted because resources would be left in an undefined state.
-      return false;
-    }
-    command_allocator_writable_first_ = new CommandAllocator;
-    command_allocator_writable_first_->command_allocator = command_allocator;
-    command_allocator_writable_first_->last_usage_submission = 0;
-    command_allocator_writable_first_->next = nullptr;
-    command_allocator_writable_last_ = command_allocator_writable_first_;
+  // Try to submit later if this fails. Completely dropping the submission is
+  // not permitted because resources would be left in an undefined state.
+  if (submission_open_ && !EnsureWritableCommandAllocator()) {
+    return false;
   }
 
   bool is_closing_frame = is_swap && frame_open_;
@@ -3714,17 +3764,26 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
     // UAV and aliasing barrier, and subsystems of the emulator assume it
     // happens between Xenia submissions.
-    ID3D12CommandAllocator* command_allocator =
-        command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
     const uint32_t performance_slot = uint32_t(frame_current_ % kQueueFrames);
-    if (performance_timestamp_begin_pending_ && performance_timestamp_query_heap_) {
-      command_list_->EndQuery(performance_timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                              performance_slot * 2);
-      performance_timestamp_begin_pending_ = false;
+    if (streaming_submission_) {
+      // The command list was reset with this allocator in BeginSubmission, and
+      // the allocator stays at the head of the writable list until here.
+      deferred_command_list_.FinishStreaming();
+      streaming_submission_ = false;
+    } else {
+      ID3D12CommandAllocator* command_allocator =
+          command_allocator_writable_first_->command_allocator;
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      if (performance_timestamp_begin_pending_ && performance_timestamp_query_heap_) {
+        command_list_->EndQuery(performance_timestamp_query_heap_.Get(),
+                                D3D12_QUERY_TYPE_TIMESTAMP, performance_slot * 2);
+        performance_timestamp_begin_pending_ = false;
+      }
+      WriteSubmissionStartTimestamp();
+      deferred_command_list_.Execute(command_list_, command_list_1_);
     }
-    deferred_command_list_.Execute(command_list_, command_list_1_);
+    WriteSubmissionEndTimestamp();
     if (is_closing_frame && performance_timestamp_query_heap_ &&
         performance_timestamp_frame_active_) {
       command_list_->EndQuery(performance_timestamp_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
@@ -3762,6 +3821,64 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    {
+      // Host frame pacing, reported once a minute (command processor thread).
+      static std::vector<uint32_t> frame_intervals_us;
+      static std::vector<uint32_t> frame_draws;
+      frame_draws.push_back(g_mcla_frame_draws);
+      MclaReportGuestFrameDraws(g_mcla_frame_draws);
+      g_mcla_frame_draws = 0;
+      static std::chrono::steady_clock::time_point last_frame_end{};
+      static std::chrono::steady_clock::time_point next_pacing_report{};
+      const auto now = std::chrono::steady_clock::now();
+      if (last_frame_end.time_since_epoch().count() != 0) {
+        frame_intervals_us.push_back(uint32_t(std::min<int64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame_end).count(),
+            INT32_MAX)));
+      } else {
+        next_pacing_report = now + std::chrono::seconds(60);
+      }
+      last_frame_end = now;
+      if (now >= next_pacing_report && !frame_intervals_us.empty()) {
+        next_pacing_report = now + std::chrono::seconds(60);
+        std::vector<uint32_t> sorted = frame_intervals_us;
+        std::sort(sorted.begin(), sorted.end());
+        auto pct = [&](double p) { return sorted[size_t(p * double(sorted.size() - 1))]; };
+        uint64_t total_us = 0, over20 = 0, over34 = 0, over50 = 0, over100 = 0;
+        for (uint32_t v : sorted) {
+          total_us += v;
+          over20 += v > 20000;
+          over34 += v > 34000;
+          over50 += v > 50000;
+          over100 += v > 100000;
+        }
+        REXGPU_INFO(
+            "MCLA frame pacing/min: frames {} ({:.1f} fps), interval us p50 {} p90 {} p95 {} "
+            "p99 {} max {}; >20ms {} >34ms {} >50ms {} >100ms {}",
+            sorted.size(), double(sorted.size()) * 1e6 / double(std::max<uint64_t>(total_us, 1)),
+            pct(0.5), pct(0.9), pct(0.95), pct(0.99), sorted.back(), over20, over34, over50,
+            over100);
+        frame_intervals_us.clear();
+        if (!frame_draws.empty()) {
+          std::sort(frame_draws.begin(), frame_draws.end());
+          auto draws_pct = [&](double p) {
+            return frame_draws[size_t(p * double(frame_draws.size() - 1))];
+          };
+          REXGPU_INFO("MCLA draws per frame/min: p10 {} p50 {} p90 {} max {}", draws_pct(0.1),
+                      draws_pct(0.5), draws_pct(0.9), frame_draws.back());
+          frame_draws.clear();
+        }
+        if (submission_timestamp_frequency_) {
+          uint64_t gpu_busy_us =
+              gpu_busy_ticks_accumulated_ * 1000000 / submission_timestamp_frequency_;
+          REXGPU_INFO("MCLA gpu busy/min: {} ms over {} submissions, {:.2f} ms per frame",
+                      gpu_busy_us / 1000, gpu_busy_submissions_accumulated_,
+                      double(gpu_busy_us) / 1000.0 / double(std::max<size_t>(sorted.size(), 1)));
+          gpu_busy_ticks_accumulated_ = 0;
+          gpu_busy_submissions_accumulated_ = 0;
+        }
+      }
+    }
     if (performance_timestamp_frame_active_) {
       const uint64_t cpu_us =
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -3822,6 +3939,83 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   return true;
 }
 
+void D3D12CommandProcessor::WriteSubmissionStartTimestamp() {
+  submission_timestamp_open_slot_ = UINT32_MAX;
+  if (!submission_timestamp_heap_) {
+    if (submission_timestamp_init_failed_) {
+      return;
+    }
+    submission_timestamp_init_failed_ = true;
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+    ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
+    if (FAILED(queue->GetTimestampFrequency(&submission_timestamp_frequency_)) ||
+        !submission_timestamp_frequency_) {
+      return;
+    }
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kSubmissionTimestampSlots * 2;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
+    if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&heap)))) {
+      return;
+    }
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        buffer_desc, sizeof(uint64_t) * kSubmissionTimestampSlots * 2, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                               GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                               &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(&readback)))) {
+      return;
+    }
+    D3D12_RANGE read_range = {0, sizeof(uint64_t) * kSubmissionTimestampSlots * 2};
+    void* mapping = nullptr;
+    if (FAILED(readback->Map(0, &read_range, &mapping))) {
+      return;
+    }
+    submission_timestamp_heap_ = heap;
+    submission_timestamp_readback_ = readback;
+    submission_timestamp_mapping_ = reinterpret_cast<uint64_t*>(mapping);
+    submission_timestamp_init_failed_ = false;
+  }
+  if (submission_timestamp_pending_.size() >= kSubmissionTimestampSlots - 1) {
+    return;
+  }
+  uint32_t slot = submission_timestamp_next_slot_;
+  submission_timestamp_next_slot_ = (slot + 1) % kSubmissionTimestampSlots;
+  command_list_->EndQuery(submission_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+  submission_timestamp_open_slot_ = slot;
+}
+
+void D3D12CommandProcessor::WriteSubmissionEndTimestamp() {
+  uint32_t slot = submission_timestamp_open_slot_;
+  if (slot == UINT32_MAX) {
+    return;
+  }
+  submission_timestamp_open_slot_ = UINT32_MAX;
+  command_list_->EndQuery(submission_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          slot * 2 + 1);
+  command_list_->ResolveQueryData(submission_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  slot * 2, 2, submission_timestamp_readback_.Get(),
+                                  uint64_t(slot) * 2 * sizeof(uint64_t));
+  submission_timestamp_pending_.emplace_back(submission_current_, slot);
+}
+
+void D3D12CommandProcessor::CollectSubmissionTimestamps() {
+  while (!submission_timestamp_pending_.empty() &&
+         submission_timestamp_pending_.front().first <= submission_completed_) {
+    uint32_t slot = submission_timestamp_pending_.front().second;
+    submission_timestamp_pending_.pop_front();
+    uint64_t begin = submission_timestamp_mapping_[slot * 2];
+    uint64_t end = submission_timestamp_mapping_[slot * 2 + 1];
+    if (end > begin) {
+      gpu_busy_ticks_accumulated_ += end - begin;
+      ++gpu_busy_submissions_accumulated_;
+    }
+  }
+}
+
 bool D3D12CommandProcessor::InitializePerformanceTelemetry() {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
@@ -3863,6 +4057,14 @@ bool D3D12CommandProcessor::InitializePerformanceTelemetry() {
 
 void D3D12CommandProcessor::ShutdownPerformanceTelemetry() {
   rex::perf::SetFrameAuditGpuTimingAvailable(false);
+  if (submission_timestamp_readback_ && submission_timestamp_mapping_) {
+    submission_timestamp_readback_->Unmap(0, nullptr);
+  }
+  submission_timestamp_mapping_ = nullptr;
+  submission_timestamp_readback_.Reset();
+  submission_timestamp_heap_.Reset();
+  submission_timestamp_pending_.clear();
+  submission_timestamp_open_slot_ = UINT32_MAX;
   if (performance_timestamp_readback_ && performance_timestamp_mapping_) {
     performance_timestamp_readback_->Unmap(0, nullptr);
   }

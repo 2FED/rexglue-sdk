@@ -398,7 +398,14 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t written_size[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // Resolves since the last CPU copy, for the "some" readback mode.
+    uint32_t resolves_since_copy = 0;
   };
+  // In "some" mode a resolve target is copied to guest memory on a cache miss
+  // and additionally every this many resolves, so CPU readers such as Photo
+  // Mode (which keeps resolving the same frozen frame) see a recent frame
+  // instead of whatever the first resolve of that address contained.
+  static constexpr uint32_t kReadbackSomeRefreshInterval = 4;
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
@@ -464,6 +471,23 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kQueueFrames] = {};
 
+  // Per-submission GPU execution timestamps (start and end of every command
+  // list), summed into the per-minute frame pacing report.
+  static constexpr uint32_t kSubmissionTimestampSlots = 1024;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> submission_timestamp_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> submission_timestamp_readback_;
+  uint64_t* submission_timestamp_mapping_ = nullptr;
+  uint64_t submission_timestamp_frequency_ = 0;
+  bool submission_timestamp_init_failed_ = false;
+  uint32_t submission_timestamp_next_slot_ = 0;
+  uint32_t submission_timestamp_open_slot_ = UINT32_MAX;
+  std::deque<std::pair<uint64_t, uint32_t>> submission_timestamp_pending_;
+  uint64_t gpu_busy_ticks_accumulated_ = 0;
+  uint64_t gpu_busy_submissions_accumulated_ = 0;
+  void WriteSubmissionStartTimestamp();
+  void WriteSubmissionEndTimestamp();
+  void CollectSubmissionTimestamps();
+
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> performance_timestamp_query_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> performance_timestamp_readback_;
   uint64_t* performance_timestamp_mapping_ = nullptr;
@@ -486,6 +510,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+  // Whether the open submission is being replayed by the streaming worker
+  // (the command list has been reset in BeginSubmission).
+  bool streaming_submission_ = false;
+  bool EnsureWritableCommandAllocator();
 
   bool debug_markers_enabled_ = false;
 

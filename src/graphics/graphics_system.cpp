@@ -12,6 +12,7 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <functional>
@@ -39,11 +40,43 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(mcla_guest_vblank_hz, 0 /*MCLA_VBLANK_DEFAULT*/, "GPU",
+                     "Guest vblank rate in Hz while vsync is enabled (0 = guest video mode "
+                     "refresh rate). MCLA presents every 2nd vblank, so 120 caps at 60 FPS.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(mcla_guest_vblank_unlock_delay_s, 45, "GPU",
+                     "Seconds after start before mcla_guest_vblank_hz applies; the "
+                     "frame-counted legal and logo screens keep the stock rate until then.")
+    .range(0, 3600)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(mcla_ui_cap_draws_low, 250, "GPU",
+                     "Frames with at most this many draws are treated as UI screens and keep "
+                     "the stock vblank rate (0 disables the UI cap)")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(mcla_ui_cap_draws_high, 600, "GPU",
+                     "Frames need more than this many draws to count towards leaving the UI cap")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(mcla_ui_cap_unlock_frames, 8, "GPU",
+                     "Consecutive heavy frames needed to leave the UI cap")
+    .range(1, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
 
 namespace {
+
+std::atomic<bool> g_mcla_ui_capped{true};
+uint32_t g_mcla_heavy_frames = 0;
+uint64_t g_mcla_ui_cap_transitions = 0;
 
 rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     const std::string& effect_name) {
@@ -150,6 +183,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
+  // Unlocked frame rates present without vsync; never let that tear unless the
+  // user explicitly asked for tearing / variable refresh.
+  if (REXCVAR_GET(mcla_guest_vblank_hz) > 0 &&
+      !rex::cvar::HasNonDefaultValue("d3d12_allow_variable_refresh_rate_and_tearing")) {
+    if (rex::cvar::SetFlagByName("d3d12_allow_variable_refresh_rate_and_tearing", "false")) {
+      REXGPU_INFO("MCLA unlocked frame rate: presentation tearing disabled");
+    }
+  }
+
   // Guest vblank timer based on the configured guest video mode.
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
@@ -162,10 +204,30 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        int32_t logged_vblank_hz = -1;
+        const uint64_t vblank_start_time = last_frame_time;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          int32_t vblank_hz_override = REXCVAR_GET(mcla_guest_vblank_hz);
+          if (current_time - vblank_start_time <
+              uint64_t(REXCVAR_GET(mcla_guest_vblank_unlock_delay_s)) * guest_tick_frequency) {
+            vblank_hz_override = 0;
+          }
+          if (REXCVAR_GET(mcla_ui_cap_draws_low) > 0 &&
+              g_mcla_ui_capped.load(std::memory_order_relaxed)) {
+            vblank_hz_override = 0;
+          }
+          if (vblank_hz_override != logged_vblank_hz) {
+            logged_vblank_hz = vblank_hz_override;
+            REXGPU_INFO("MCLA guest vblank: {} Hz (video mode {} Hz, vsync {})",
+                        vblank_hz_override ? vblank_hz_override : int32_t(refresh_rate_hz),
+                        refresh_rate_hz, REXCVAR_GET(vsync));
+          }
+          if (REXCVAR_GET(vsync) && vblank_hz_override > 0) {
+            interval_ticks = std::max(uint64_t(1), guest_tick_frequency / uint64_t(vblank_hz_override));
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
@@ -323,6 +385,38 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+}
+
+void MclaReportGuestFrameDraws(uint32_t draw_count) {
+  const int32_t low = REXCVAR_GET(mcla_ui_cap_draws_low);
+  if (low <= 0) {
+    return;
+  }
+  const bool capped = g_mcla_ui_capped.load(std::memory_order_relaxed);
+  if (draw_count <= uint32_t(low)) {
+    g_mcla_heavy_frames = 0;
+    if (!capped) {
+      g_mcla_ui_capped.store(true, std::memory_order_relaxed);
+      if (++g_mcla_ui_cap_transitions <= 40) {
+        REXGPU_INFO("MCLA UI cap: on ({} draws in frame)", draw_count);
+      }
+    }
+    return;
+  }
+  if (!capped) {
+    return;
+  }
+  if (draw_count > uint32_t(REXCVAR_GET(mcla_ui_cap_draws_high))) {
+    if (++g_mcla_heavy_frames >= uint32_t(REXCVAR_GET(mcla_ui_cap_unlock_frames))) {
+      g_mcla_heavy_frames = 0;
+      g_mcla_ui_capped.store(false, std::memory_order_relaxed);
+      if (++g_mcla_ui_cap_transitions <= 40) {
+        REXGPU_INFO("MCLA UI cap: off ({} draws in frame)", draw_count);
+      }
+    }
+  } else {
+    g_mcla_heavy_frames = 0;
+  }
 }
 
 void GraphicsSystem::MarkVblank() {
