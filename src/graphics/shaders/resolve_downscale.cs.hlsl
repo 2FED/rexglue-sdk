@@ -75,6 +75,25 @@ void main(uint3 xe_group_id : SV_GroupID,
                     pixel_index * pixel_size * scale_xy +
                     block_sample_offset * pixel_size;
 
+  // 32bpp resolves expand uint4 groups, not individual dwords. All three
+  // scaled 32bpp writer variants divide host X by four before separating
+  // scale subcoordinates. Invert that layout using the physical tiled dword
+  // ordinal (pixel_index), without applying a second tiled permutation.
+  // Keep other formats unchanged until their packing/endian rules are tested.
+  [branch] if (xe_downscale_pixel_size_log2 == 2u) {
+    uint sample_x = 0u;
+    uint sample_y = 0u;
+    if (xe_downscale_half_pixel_offset != 0u && scale_xy > 1u) {
+      sample_x = xe_downscale_scale_x >> 1u;
+      sample_y = xe_downscale_scale_y >> 1u;
+    }
+    uint host_x = (pixel_index & 3u) * xe_downscale_scale_x + sample_x;
+    uint scaled_vector = (host_x >> 2u) * xe_downscale_scale_y + sample_y;
+    src_offset = tile_index * tile_size_scaled +
+                 (pixel_index >> 2u) * 16u * scale_xy +
+                 scaled_vector * 16u + (host_x & 3u) * 4u;
+  }
+
   // Destination offset in 1x buffer
   uint dst_offset = tile_index * tile_size_1x +
                     pixel_index * pixel_size;
