@@ -51,6 +51,12 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_async_pipeline_wait, false, "GPU/D3D12",
+                    "With async_shader_compilation, wait (bounded) for a pipeline that is "
+                    "still being created instead of skipping its draw. Meant to be turned "
+                    "on by a title only around CPU-read captures such as photo modes")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2437,6 +2443,27 @@ namespace {
 uint32_t g_mcla_frame_draws = 0;
 }  // namespace
 
+bool D3D12CommandProcessor::WaitForPendingPipeline(void* pipeline_handle) {
+  if (!async_pipeline_wait_episode_.enabled() ||
+      pipeline_cache_->GetPipelineAuditStatus(pipeline_handle) !=
+          PipelineCache::PipelineAuditStatus::kPending) {
+    return false;
+  }
+  uint64_t timeout_ms = async_pipeline_wait_episode_.NextTimeoutMs();
+  if (!timeout_ms) {
+    return false;
+  }
+  uint64_t elapsed_ms = 0;
+  PendingWaitResult result =
+      pipeline_cache_->AwaitPipeline(pipeline_handle, timeout_ms, &elapsed_ms);
+  bool created = pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) != nullptr;
+  if (async_pipeline_wait_episode_.Record(elapsed_ms, result, created)) {
+    REXGPU_WARN("D3D12 async pipeline wait: a pipeline took {} ms{}", elapsed_ms,
+                result == PendingWaitResult::kTimedOut ? " (timed out, draw skipped)" : "");
+  }
+  return created;
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2568,8 +2595,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
+  if (async_pipeline_wait_episode_.Observe(REXCVAR_GET(d3d12_async_pipeline_wait))) {
+    const PendingWaitEpisode::Stats& stats = async_pipeline_wait_episode_.stats();
+    REXGPU_INFO(
+        "D3D12 async pipeline wait: episode ended, {} waits ({} ms total, {} ms max), "
+        "{} timed out, {} failed, {} skipped over budget",
+        stats.waits, stats.total_ms, stats.max_ms, stats.timeouts, stats.failed,
+        stats.budget_skips);
+  }
   if (REXCVAR_GET(async_shader_compilation) &&
-      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr &&
+      !WaitForPendingPipeline(pipeline_handle)) {
     if (render_audit_enabled_) {
       PipelineCache::PipelineAuditStatus pipeline_status =
           pipeline_cache_->GetPipelineAuditStatus(pipeline_handle);

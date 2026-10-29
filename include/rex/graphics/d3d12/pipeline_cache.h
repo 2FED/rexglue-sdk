@@ -33,6 +33,7 @@
 #include <rex/graphics/primitive_processor.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/pending_pipeline_wait.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/platform.h>
@@ -97,6 +98,12 @@ class PipelineCache {
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
+  // Waits, bounded by timeout_ms, for a pipeline that is still being created
+  // asynchronously, creating queued pipelines on the calling (command
+  // processor) thread meanwhile. kCompleted means creation has finished; the
+  // pipeline state may still be nullptr if creation failed.
+  PendingWaitResult AwaitPipeline(void* handle, uint64_t timeout_ms, uint64_t* elapsed_ms_out);
+
   enum class PipelineAuditStatus { kPending, kReady, kFailed };
   PipelineAuditStatus GetPipelineAuditStatus(void* handle) const {
     const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
@@ -422,6 +429,9 @@ class PipelineCache {
   // Pipeline creation threads.
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();
+  // Creates the highest-priority queued pipeline on the calling thread.
+  // Returns false if the queue was empty.
+  bool CreateOneQueuedPipelineOnProcessorThread();
   std::mutex creation_request_lock_;
   std::condition_variable creation_request_cond_;
   // Protected with creation_request_lock_, notify_one creation_request_cond_

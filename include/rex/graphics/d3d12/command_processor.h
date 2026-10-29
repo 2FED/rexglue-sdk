@@ -234,6 +234,10 @@ class D3D12CommandProcessor : public CommandProcessor {
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
+  // With d3d12_async_pipeline_wait on, waits (bounded) for a pipeline that is
+  // still being created. Returns true if the pipeline is now usable.
+  bool WaitForPendingPipeline(void* pipeline_handle);
+
   void EmitRenderAuditSummary(const char* phase);
 
   enum RootParameter : UINT {
@@ -605,6 +609,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
 
   std::unique_ptr<PipelineCache> pipeline_cache_;
+  // d3d12_async_pipeline_wait episode bookkeeping (command processor thread).
+  PendingWaitEpisode async_pipeline_wait_episode_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

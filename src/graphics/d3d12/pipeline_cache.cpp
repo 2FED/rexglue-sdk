@@ -13,12 +13,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -816,6 +818,24 @@ void PipelineCache::EndSubmission() {
       rex::thread::Wait(creation_completion_event_.get(), false);
     }
   }
+}
+
+PendingWaitResult PipelineCache::AwaitPipeline(void* handle, uint64_t timeout_ms,
+                                               uint64_t* elapsed_ms_out) {
+  auto* pipeline = reinterpret_cast<Pipeline*>(handle);
+  auto now_ms = [] {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+  };
+  return AwaitPending(
+      [pipeline] { return pipeline->creation_complete.load(std::memory_order_acquire); },
+      [this] {
+        // Synchronous creation (no threads) always completes in
+        // ConfigurePipeline, so the queue only exists with threads.
+        return !creation_threads_.empty() && CreateOneQueuedPipelineOnProcessorThread();
+      },
+      [] { std::this_thread::yield(); }, now_ms, timeout_ms, elapsed_ms_out);
 }
 
 bool PipelineCache::IsCreatingPipelines() {
@@ -3355,26 +3375,29 @@ void PipelineCache::CreationThread(size_t thread_index) {
 
 void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
   assert_false(creation_threads_.empty());
-  while (true) {
-    Pipeline* pipeline_to_create;
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      if (creation_queue_.empty()) {
-        break;
-      }
-      pipeline_to_create = creation_queue_.top();
-      creation_queue_.pop();
+  while (CreateOneQueuedPipelineOnProcessorThread()) {
+  }
+}
+
+bool PipelineCache::CreateOneQueuedPipelineOnProcessorThread() {
+  Pipeline* pipeline_to_create;
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    if (creation_queue_.empty()) {
+      return false;
     }
-    PipelineRuntimeDescription runtime_description;
-    if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
-      pipeline_to_create->state.store(nullptr, std::memory_order_release);
-      pipeline_to_create->creation_complete.store(true, std::memory_order_release);
-      continue;
-    }
+    pipeline_to_create = creation_queue_.top();
+    creation_queue_.pop();
+  }
+  PipelineRuntimeDescription runtime_description;
+  if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
+    pipeline_to_create->state.store(nullptr, std::memory_order_release);
+  } else {
     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
                                     std::memory_order_release);
-    pipeline_to_create->creation_complete.store(true, std::memory_order_release);
   }
+  pipeline_to_create->creation_complete.store(true, std::memory_order_release);
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12
