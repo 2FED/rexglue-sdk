@@ -29,6 +29,11 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+// KI-040 opt-in: let SDL see XInput-class pads that Windows could not give one
+// of the four XInput user indices (extra or virtual pads). Off by default:
+// RawInput without XInput correlation merges triggers and loses rumble.
+REXCVAR_DEFINE_BOOL(hid_sdl_rawinput, false, "Input",
+                    "Experimental: enumerate gamepads through SDL's Windows RawInput backend");
 REXCVAR_DEFINE_INT32(wheel_steering_axis, 0, "Input/Wheel", "Raw steering axis (-1 disables)")
     .range(-1, 31);
 REXCVAR_DEFINE_INT32(wheel_brake_axis, 1, "Input/Wheel", "Raw brake axis (-1 disables)")
@@ -221,6 +226,12 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
             return false;
           },
           this);
+
+      // Hints must be set before the joystick subsystem starts.
+      if (REXCVAR_GET(hid_sdl_rawinput)) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "1");
+        REXLOG_INFO("SDL: RawInput joystick backend enabled (hid_sdl_rawinput).");
+      }
 
       // Initialize game controller subsystem
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
@@ -957,11 +968,17 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
       "JoystickType({}), "
       "GameControllerType({}), "
       "VendorID(0x{:04X}), "
-      "ProductID(0x{:04X})",
+      "ProductID(0x{:04X}), "
+      "Instance({}), "
+      "Backend({}), "
+      "Path(\"{}\")",
       SDL_GetGamepadName(controller),
       static_cast<int>(SDL_GetJoystickType(SDL_GetGamepadJoystick(controller))),
       static_cast<int>(SDL_GetGamepadType(controller)), SDL_GetGamepadVendor(controller),
-      SDL_GetGamepadProduct(controller));
+      SDL_GetGamepadProduct(controller), static_cast<uint32_t>(event.gdevice.which),
+      SdlJoystickBackendName(SDL_GetJoystickGUIDForID(event.gdevice.which).data[14]),
+      PrivacySafeSdlDevicePath(SDL_GetGamepadPath(controller) ? SDL_GetGamepadPath(controller)
+                                                              : ""));
   uint32_t occupied_slot_mask = 0;
   for (uint32_t slot = 0; slot < controllers_.size(); ++slot) {
     if (IsControllerConnected(controllers_.at(slot)))

@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 
 namespace rex::input::sdl {
 
@@ -84,6 +85,47 @@ constexpr std::optional<uint32_t> ChooseMostRecentlyActiveController(
 // physical face-button challenge used by the slot audit.
 constexpr bool IsInputSlotAuditChallengeButton(uint32_t sdl_button) {
   return sdl_button == 0;
+}
+
+// SDL backend that enumerated a joystick, from the driver signature SDL stores
+// in byte 14 of the joystick GUID. DirectInput and other backends store 0.
+constexpr std::string_view SdlJoystickBackendName(uint8_t guid_driver_signature) {
+  switch (guid_driver_signature) {
+    case 'x':
+      return "xinput";
+    case 'w':
+      return "wgi";
+    case 'g':
+      return "gameinput";
+    case 'h':
+      return "hidapi";
+    case 'm':
+      return "mfi";
+    case 'r':
+      return "rawinput";
+    case 'v':
+      return "virtual";
+    case 0:
+      return "dinput-or-other";
+    default:
+      return "unknown";
+  }
+}
+
+// SDL's XInput backend reports "XInput#<user index>", which is safe and useful
+// in diagnostics. Other backends report OS device-interface paths that can
+// carry serial numbers or Bluetooth addresses, so they are withheld.
+constexpr std::string_view PrivacySafeSdlDevicePath(std::string_view path) {
+  constexpr std::string_view kXInputPrefix = "XInput#";
+  if (path.size() > kXInputPrefix.size() && path.size() <= kXInputPrefix.size() + 3 &&
+      path.substr(0, kXInputPrefix.size()) == kXInputPrefix) {
+    for (const char c : path.substr(kXInputPrefix.size())) {
+      if (c < '0' || c > '9')
+        return "withheld";
+    }
+    return path;
+  }
+  return path.empty() ? std::string_view("none") : std::string_view("withheld");
 }
 
 }  // namespace rex::input::sdl
