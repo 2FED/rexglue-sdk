@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -25,6 +26,16 @@
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+namespace {
+// KI-035 diagnostic: guest allocation failures were silent. Log the first 32
+// and then every 256th so a never-ending load can be tied to heap exhaustion.
+std::atomic<uint32_t> g_guest_alloc_failures{0};
+bool ShouldLogGuestAllocFailure(uint32_t* ordinal) {
+  *ordinal = g_guest_alloc_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+  return *ordinal <= 32 || (*ordinal % 256) == 0;
+}
+}  // namespace
 
 uint32_t ToXdkProtectFlags(uint32_t protect) {
   uint32_t result = 0;
@@ -173,6 +184,13 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   }
   if (!address) {
     // Failed - assume no memory available.
+    uint32_t ordinal = 0;
+    if (ShouldLogGuestAllocFailure(&ordinal)) {
+      REXKRNL_IMPORT_FAIL("NtAllocateVirtualMemory",
+                          "#{} base={:#x} size={:#x} page={:#x} type={:#x} protect={:#x}", ordinal,
+                          adjusted_base, adjusted_size, page_size, (uint32_t)alloc_type,
+                          (uint32_t)protect_bits);
+    }
     return X_STATUS_NO_MEMORY;
   }
 
@@ -400,6 +418,14 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size, adjusted_alignment,
                         allocation_type, protect, top_down, &base_address)) {
     // Failed - assume no memory available.
+    uint32_t ordinal = 0;
+    if (ShouldLogGuestAllocFailure(&ordinal)) {
+      REXKRNL_IMPORT_FAIL("MmAllocatePhysicalMemoryEx",
+                          "#{} size={:#x} page={:#x} align={:#x} min={:#x} max={:#x} protect={:#x}",
+                          ordinal, adjusted_size, page_size, adjusted_alignment,
+                          (uint32_t)min_addr_range, (uint32_t)max_addr_range,
+                          (uint32_t)protect_bits);
+    }
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);
