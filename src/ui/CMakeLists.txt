@@ -12,6 +12,7 @@ set(REXUI_CORE_SOURCES
     menu_item.cpp
     presenter.cpp
     renderdoc_api.cpp
+    sdl_event_observer.cpp
     sdl_virtual_key.cpp
     window.cpp
     window_sdl.cpp

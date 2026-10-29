@@ -42,6 +42,7 @@ add_executable(unit_tests
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp
     ui/imgui_dialog_test.cpp
+    ui/sdl_event_observer_test.cpp
 )
 
 add_executable(sdl_wheel_probe
