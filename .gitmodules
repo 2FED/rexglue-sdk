@@ -58,8 +58,8 @@
 	url = https://github.com/pavel-kirienko/o1heap.git
 [submodule "thirdparty/sdl3"]
 	path = thirdparty/sdl3
-	url = https://github.com/libsdl-org/SDL
-	branch = release-3.4.x
+	url = https://github.com/2FED/SDL.git
+	branch = mcla/xinput-hotplug-poll
 [submodule "thirdparty/inja"]
 	path = thirdparty/inja
 	url = https://github.com/pantor/inja.git
