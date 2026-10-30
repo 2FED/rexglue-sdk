@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/sdl/wheel_force_feedback_rearm.h>
 
 #include <SDL3/SDL.h>
 
@@ -61,6 +62,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     uint32_t duration_ms = 0;
     bool running = false;
     bool resume_pending = false;
+    // KI-022: first suppressed infinite start per run is logged.
+    bool start_suppressed_logged = false;
+    // KI-022: bounds re-arm attempts of a device-stopped infinite effect.
+    WheelRearmBudget rearm_budget;
   };
 
   struct ControllerState {
@@ -78,6 +83,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     uint32_t force_feedback_total_update_count;
     uint32_t force_feedback_total_start_count;
     bool force_feedback_device_info_logged;
+    uint64_t force_feedback_rearm_check_ms;
   };
 
   enum class RepeatState {
@@ -116,6 +122,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   SDL_Joystick* GetControllerJoystick(const ControllerState& state) const;
   void StopControllerFeedback(ControllerState& state, bool preserve_running = false);
   void ResumeControllerFeedback(ControllerState& state, const char* reason);
+  // KI-022: re-run infinite effects that the host believes are running but
+  // the device reports as stopped (silent DirectInput re-acquire, driver
+  // eviction). Only acts on the active wheel while the window has focus.
+  // `only_slot` limits the pass to one zero-based effect slot.
+  void RearmStoppedWheelEffectsLocked(ControllerState& state, const char* reason,
+                                      std::optional<size_t> only_slot = std::nullopt);
   void CloseController(ControllerState& state);
   void UpdateWheelAxisLocked(ControllerState& state, uint8_t axis, int16_t value,
                              bool record_activity);

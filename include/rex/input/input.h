@@ -143,6 +143,38 @@ inline ForceFeedbackOperationEntry DecodeForceFeedbackOperationWords(uint32_t ef
   return {.effect_index = effect_index, .iterations = std::max(iterations, 1u)};
 }
 
+// XInputdFFEffectOperation passes an array of {effect_index, iterations}
+// entries (two big-endian words each); r5 carries the entry count. Bound the
+// count to the 64 guest effect slots; a zero count keeps the historical
+// single-entry behaviour.
+inline constexpr uint32_t kMaxForceFeedbackOperationEntries = 64;
+inline constexpr size_t kForceFeedbackOperationEntryWords = 2;
+
+constexpr uint32_t ClampForceFeedbackOperationCount(uint32_t count) {
+  return std::clamp<uint32_t>(count, 1u, kMaxForceFeedbackOperationEntries);
+}
+
+// Applies every entry of a start (`start`) or stop operation. `load_word(i)`
+// returns guest word i of the array; `apply(entry)` performs one start/stop
+// and returns an X_RESULT-style code (0 = success). The first failure is
+// returned, but every entry is still applied.
+template <typename LoadWord, typename Apply>
+uint32_t ApplyForceFeedbackOperationBatch(uint32_t raw_count, bool start, LoadWord&& load_word,
+                                          Apply&& apply) {
+  const uint32_t count = ClampForceFeedbackOperationCount(raw_count);
+  uint32_t result = 0;
+  for (uint32_t entry = 0; entry < count; ++entry) {
+    const size_t word = size_t(entry) * kForceFeedbackOperationEntryWords;
+    const auto operation =
+        DecodeForceFeedbackOperationWords(load_word(word), start ? load_word(word + 1) : 1);
+    const uint32_t entry_result = static_cast<uint32_t>(apply(operation));
+    if (result == 0) {
+      result = entry_result;
+    }
+  }
+  return result;
+}
+
 inline constexpr size_t kForceFeedbackEffectWordCount = 29;
 
 inline ForceFeedbackEffect DecodeForceFeedbackEffectWords(

@@ -372,6 +372,14 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  if (is_active && controller->is_wheel && controller->haptic) {
+    const uint64_t now_ms = SDL_GetTicks();
+    if (ShouldRunWheelRearmWatchdog(now_ms, controller->force_feedback_rearm_check_ms)) {
+      controller->force_feedback_rearm_check_ms = now_ms;
+      RearmStoppedWheelEffectsLocked(*controller, "watchdog");
+    }
+  }
+
   if (user_index == 0) {
     const bool source_changed = slot_zero_state_source_ != active_controller_index_;
     if (source_changed || is_active != slot_zero_is_active_ ||
@@ -529,6 +537,11 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffect(uint32_t user_index,
     submitted = SDL_UpdateHapticEffect(controller->haptic, effect_state.effect_id, &sdl_effect);
   } else {
     const bool restart = effect_state.running && has_focus_.load();
+    if (IsWheelEffectRetype(update, effect_state.effect_id >= 0, effect_state.type,
+                            effect.type)) {
+      REXLOG_INFO("{}", FormatWheelRetypeLine(effect.effect_index, effect_state.type, effect.type,
+                                              restart));
+    }
     if (effect_state.effect_id >= 0) {
       SDL_DestroyHapticEffect(controller->haptic, effect_state.effect_id);
       effect_state.effect_id = -1;
@@ -554,6 +567,11 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffect(uint32_t user_index,
 
   effect_state.type = effect.type;
   effect_state.duration_ms = effect.duration_ms;
+  if (update && !recreated) {
+    // An update never restarts a stopped DirectInput effect. Re-arm this slot
+    // if it is a running infinite effect the device reports as stopped.
+    RearmStoppedWheelEffectsLocked(*controller, "update", effect.effect_index - 1);
+  }
   if (update) {
     if (effect_state.update_count == 0) {
       LogWheelEffectParameters(effect, sdl_effect, "first-update", gain);
@@ -623,6 +641,9 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffectRunning(uint32_t user_index, uint
                                                status_supported, status_playing)) {
     // Avoid re-articulating a genuinely running infinite condition or engine
     // effect. Finite event starts are never suppressed by status.
+    if (ShouldLogWheelStartSuppressed(effect_state.start_suppressed_logged)) {
+      REXLOG_INFO("{}", FormatWheelStartSuppressedLine(effect_index, effect_state.type));
+    }
     return X_ERROR_SUCCESS;
   }
 
@@ -636,6 +657,7 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffectRunning(uint32_t user_index, uint
   }
   effect_state.running = running;
   effect_state.resume_pending = false;
+  effect_state.start_suppressed_logged = false;
   if (running) {
     controller->force_feedback_total_start_count++;
   }
@@ -1348,10 +1370,58 @@ void SDLInputDriver::ResumeControllerFeedback(ControllerState& state, const char
     }
     effect.running = true;
     effect.resume_pending = false;
+    effect.start_suppressed_logged = false;
     state.force_feedback_total_start_count++;
     REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action=resume slot={} type={} reason={}", effect_slot + 1,
                 GetWheelEffectTypeName(effect.type), reason);
   }
+}
+
+void SDLInputDriver::RearmStoppedWheelEffectsLocked(ControllerState& state, const char* reason,
+                                                    std::optional<size_t> only_slot) {
+  if (!state.is_wheel || !state.haptic || !has_focus_.load() ||
+      !REXCVAR_GET(wheel_force_feedback)) {
+    return;
+  }
+  const auto controller_index = static_cast<size_t>(&state - controllers_.data());
+  if (active_controller_index_ != controller_index) {
+    return;
+  }
+  if ((SDL_GetHapticFeatures(state.haptic) & SDL_HAPTIC_STATUS) == 0) {
+    // Without status the host cannot tell a stopped effect from a playing one;
+    // re-running blindly would re-articulate centering, so do nothing.
+    return;
+  }
+  const uint64_t now_ms = SDL_GetTicks();
+  auto status_playing = [&](SDL_HapticEffectID effect_id) {
+    return SDL_GetHapticEffectStatus(state.haptic, effect_id);
+  };
+  auto run = [&](SDL_HapticEffectID effect_id, uint32_t iterations) {
+    return SDL_RunHapticEffect(state.haptic, effect_id, iterations);
+  };
+  auto on_event = [&](WheelRearmEvent event, size_t slot_number, ForceFeedbackEffectType type) {
+    switch (event) {
+      case WheelRearmEvent::kRearmed:
+        state.force_feedback_total_start_count++;
+        REXLOG_INFO("{}", FormatWheelRearmLine(slot_number, type, reason));
+        break;
+      case WheelRearmEvent::kRunFailed:
+        REXLOG_ERROR("SDL wheel FFB {} rearm failed for slot {} type {}: {}", reason, slot_number,
+                     GetWheelEffectTypeName(type), SDL_GetError());
+        break;
+      case WheelRearmEvent::kLimitReached:
+        REXLOG_WARN("{}", FormatWheelRearmLimitLine(slot_number, type, reason));
+        break;
+    }
+  };
+  if (only_slot) {
+    if (*only_slot < state.force_feedback_effects.size()) {
+      RearmStoppedWheelEffect(state.force_feedback_effects[*only_slot], *only_slot + 1, now_ms,
+                              status_playing, run, on_event);
+    }
+    return;
+  }
+  RearmStoppedWheelEffects(state.force_feedback_effects, now_ms, status_playing, run, on_event);
 }
 
 void SDLInputDriver::CloseController(ControllerState& state) {

@@ -9,6 +9,7 @@ add_executable(unit_tests
     input/sdl_slot_mapping_test.cpp
     input/sdl_controller_matrix_test.cpp
     input/sdl_wheel_mapping_test.cpp
+    input/sdl_wheel_ffb_rearm_test.cpp
     kernel/object_table_test.cpp
     kernel/offline_service_test.cpp
     kernel/offline_service_route_test.cpp

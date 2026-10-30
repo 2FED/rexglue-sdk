@@ -141,11 +141,31 @@ REX_HOOK_RAW(__imp__XInputdFFEffectOperation) {
   } else {
     // MCLA passes an array of {effect_index, iterations} entries. r5 is the
     // entry count, r6 is the start/stop operation, and r7 carries flags.
-    const auto operation = rex::input::DecodeForceFeedbackOperationWords(
-        rex::kernel::xboxkrnl::LoadForceFeedbackWord(base, ctx.r4.u32, 0),
-        ctx.r6.u32 == 1 ? rex::kernel::xboxkrnl::LoadForceFeedbackWord(base, ctx.r4.u32, 1) : 1);
-    ctx.r3.u64 = rex::kernel::xboxkrnl::input_system()->SetForceFeedbackEffectRunning(
-        ctx.r3.u32, operation.effect_index, ctx.r6.u32 == 1, operation.iterations);
+    // KI-022: apply every entry; only entry 0 used to be applied, so a batched
+    // stop/start of the centering and engine effects dropped the rest.
+    const bool start = ctx.r6.u32 == 1;
+    const uint32_t count = rex::input::ClampForceFeedbackOperationCount(ctx.r5.u32);
+    static std::atomic_bool batch_logged = false;
+    if (count > 1 && !batch_logged.exchange(true)) {
+      REXLOG_INFO(
+          "XINPUTD_FF_AUDIT v=1 export=EffectOperation action=batch count={} op={} r5=0x{:08X} "
+          "r7=0x{:08X} entry0=0x{:08X} entry1=0x{:08X}",
+          count, ctx.r6.u32, ctx.r5.u32, ctx.r7.u32,
+          rex::kernel::xboxkrnl::LoadForceFeedbackWord(base, ctx.r4.u32, 0),
+          rex::kernel::xboxkrnl::LoadForceFeedbackWord(
+              base, ctx.r4.u32, rex::input::kForceFeedbackOperationEntryWords));
+    }
+    const uint32_t user_index = ctx.r3.u32;
+    const uint32_t entries = ctx.r4.u32;
+    ctx.r3.u64 = rex::input::ApplyForceFeedbackOperationBatch(
+        ctx.r5.u32, start,
+        [&](size_t word) {
+          return rex::kernel::xboxkrnl::LoadForceFeedbackWord(base, entries, word);
+        },
+        [&](const rex::input::ForceFeedbackOperationEntry& operation) {
+          return rex::kernel::xboxkrnl::input_system()->SetForceFeedbackEffectRunning(
+              user_index, operation.effect_index, start, operation.iterations);
+        });
   }
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XInputdFFEffectOperation(
