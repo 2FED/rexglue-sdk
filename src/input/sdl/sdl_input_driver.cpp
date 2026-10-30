@@ -174,9 +174,9 @@ void LogWheelEffectParameters(const ForceFeedbackEffect& guest, const SDL_Haptic
 std::mutex g_wheel_resync_request_mutex;
 WheelResyncRequestSlot g_wheel_resync_request;
 
-bool TakeWheelResyncRequest(uint64_t now_ms, std::string& reason) {
+bool PollWheelResyncRequest(uint64_t now_ms, bool quiet, std::string& reason) {
   std::lock_guard lock(g_wheel_resync_request_mutex);
-  return g_wheel_resync_request.Take(now_ms, reason);
+  return g_wheel_resync_request.Poll(now_ms, quiet, reason);
 }
 
 }  // namespace
@@ -1522,9 +1522,12 @@ void SDLInputDriver::ServiceWheelEffectResyncLocked(ControllerState& state, uint
       !has_focus_.load() || !REXCVAR_GET(wheel_force_feedback)) {
     return;
   }
-  std::string host_reason;
-  const bool host_request = TakeWheelResyncRequest(now_ms, host_reason);
   const bool burst_end = state.force_feedback_burst.ConsumeBurstEnd(now_ms);
+  // No finite start for 1 s: a global stop now cuts no impact in flight. A
+  // burst-end pass runs anyway, so a deferred host request joins it.
+  const bool quiet = state.force_feedback_burst.Quiet(now_ms);
+  std::string host_reason;
+  const bool host_request = PollWheelResyncRequest(now_ms, quiet || burst_end, host_reason);
   if (!AnyWheelEffectResyncCandidate(state.force_feedback_effects)) {
     // Nothing believed running: keep the periodic timer armed from now.
     state.force_feedback_resync_ms = now_ms;
@@ -1535,7 +1538,8 @@ void SDLInputDriver::ServiceWheelEffectResyncLocked(ControllerState& state, uint
     ResyncWheelEffectsLocked(state, WheelResyncTrigger::kHost, "host:" + host_reason);
   } else if (burst_end) {
     ResyncWheelEffectsLocked(state, WheelResyncTrigger::kBurst, "burst");
-  } else if (ShouldRunWheelPeriodicResync(now_ms, state.force_feedback_resync_ms)) {
+  } else if (quiet && ShouldRunWheelPeriodicResync(now_ms, state.force_feedback_resync_ms)) {
+    // Deferred (timer kept) while finite effects keep starting.
     ResyncWheelEffectsLocked(state, WheelResyncTrigger::kPeriodic, "periodic");
   } else {
     return;

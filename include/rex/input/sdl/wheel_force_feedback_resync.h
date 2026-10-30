@@ -51,6 +51,11 @@ inline constexpr uint64_t kWheelResyncBurstWindowMs = 2000;
 // 0.8 s; the resync fires once the burst has settled, never inside it.
 inline constexpr uint64_t kWheelResyncBurstQuietMs = 300;
 inline constexpr uint64_t kWheelResyncRequestExpiryMs = 2000;
+// The global stop of a resync pass would cut an impact in flight, so the
+// periodic and host-requested passes wait until no finite effect has started
+// for this long (the periodic pass is deferred, the host request up to its
+// expiry; then it runs anyway).
+inline constexpr uint64_t kWheelResyncQuietMs = 1000;
 // A periodic pass leaves this many budget attempts per window for the
 // event-driven triggers (host request, burst end).
 inline constexpr uint32_t kWheelResyncPeriodicReserve = 1;
@@ -123,8 +128,15 @@ struct WheelFiniteBurstTracker {
   size_t next = 0;
   uint64_t last_start_ms = 0;
   bool armed = false;
+  bool any_start = false;
+
+  // True when no finite start happened within kWheelResyncQuietMs.
+  constexpr bool Quiet(uint64_t now_ms) const {
+    return !any_start || now_ms - last_start_ms >= kWheelResyncQuietMs;
+  }
 
   constexpr void OnFiniteStart(uint64_t now_ms) {
+    any_start = true;
     recent_ms[next] = now_ms;
     next = (next + 1) % recent_ms.size();
     if (recorded < recent_ms.size()) {
@@ -181,6 +193,8 @@ struct WheelResyncRequestSlot {
   bool pending = false;
   std::string reason;
   uint64_t requested_ms = 0;
+  // Set once a poll deferred the request for lack of a quiet window.
+  bool deferred = false;
 
   // Returns false when the request was coalesced into a pending one.
   bool Offer(std::string tag, uint64_t now_ms) {
@@ -190,6 +204,30 @@ struct WheelResyncRequestSlot {
     pending = true;
     reason = std::move(tag);
     requested_ms = now_ms;
+    deferred = false;
+    return true;
+  }
+
+  // Poll from the wheel's input path. `quiet` = no finite start within
+  // kWheelResyncQuietMs (or a burst pass is running now). Runs the request
+  // when quiet, defers it while not quiet until it reaches the expiry and
+  // then runs it anyway; a request no poll saw before its expiry is dropped
+  // as stale.
+  bool Poll(uint64_t now_ms, bool quiet, std::string& out_reason) {
+    if (!pending) {
+      return false;
+    }
+    const uint64_t age = now_ms - requested_ms;
+    if (!quiet && age < kWheelResyncRequestExpiryMs) {
+      deferred = true;
+      return false;
+    }
+    pending = false;
+    if (age > kWheelResyncRequestExpiryMs && !deferred) {
+      return false;
+    }
+    deferred = false;
+    out_reason = reason;
     return true;
   }
 

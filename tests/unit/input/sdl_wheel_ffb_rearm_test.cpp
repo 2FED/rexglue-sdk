@@ -880,3 +880,91 @@ TEST_CASE("A slot over budget is never stopped by a global stop",
   CHECK(host.lines[1] ==
         "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=4 type=square reason=host:resume");
 }
+
+TEST_CASE("The periodic resync is deferred while finite starts keep coming",
+          "[input][sdl][wheel][ffb][ki022]") {
+  using rex::input::sdl::kWheelResyncQuietMs;
+  CHECK(kWheelResyncQuietMs == 1000);
+  // Impacts every 900 ms from 5 s to 15.8 s: never a burst (4 starts span
+  // 2.7 s), never 1 s quiet. The periodic pass is due at 10 s.
+  WheelFiniteBurstTracker tracker;
+  CHECK(tracker.Quiet(0));  // no finite start yet
+  FakeResyncHaptic haptic;
+  auto slots = RaceSlots();
+  uint64_t last_resync_ms = 0;
+  uint64_t next_start = 5000;
+  std::vector<uint64_t> passes;
+  for (uint64_t now_ms = 0; now_ms <= 30000; now_ms += 16) {
+    while (next_start <= 15800 && next_start <= now_ms) {
+      tracker.OnFiniteStart(next_start);
+      next_start += 900;
+    }
+    CHECK_FALSE(tracker.ConsumeBurstEnd(now_ms));
+    if (tracker.Quiet(now_ms) && ShouldRunWheelPeriodicResync(now_ms, last_resync_ms)) {
+      ResyncWheelEffects(slots, now_ms, WheelResyncTrigger::kPeriodic, haptic.stop_all(),
+                         haptic.stop(), haptic.run(), haptic.events("periodic"));
+      last_resync_ms = now_ms;
+      passes.push_back(now_ms);
+    }
+  }
+  // Due at 10 s but deferred until 1 s after the last impact (15.8 s), then
+  // the normal 10 s cadence resumes from that pass.
+  REQUIRE(passes.size() == 2);
+  CHECK(passes[0] >= 15800 + kWheelResyncQuietMs);
+  CHECK(passes[0] < 15800 + kWheelResyncQuietMs + 16);
+  CHECK(passes[1] - passes[0] >= kWheelResyncPeriodicIntervalMs);
+  CHECK(passes[1] - passes[0] < kWheelResyncPeriodicIntervalMs + 16);
+  CHECK(haptic.stop_alls == 2);
+  CHECK(slots[0].resync_budget.attempts == 2);  // deferral spends no budget
+}
+
+TEST_CASE("A host resync request waits for a quiet window up to its expiry",
+          "[input][sdl][wheel][ffb][ki022]") {
+  using rex::input::sdl::kWheelResyncQuietMs;
+  std::string reason;
+
+  // Impacts at 0.9, 1.5 and 1.9 s; the request at 1.0 s runs once 1 s has
+  // passed without a finite start (2.9 s), before its 3.0 s expiry.
+  WheelFiniteBurstTracker tracker;
+  WheelResyncRequestSlot request;
+  const std::vector<uint64_t> impacts = {900, 1500, 1900};
+  size_t next = 0;
+  std::vector<uint64_t> fired;
+  for (uint64_t now_ms = 800; now_ms <= 4000; now_ms += 4) {
+    while (next < impacts.size() && impacts[next] <= now_ms) {
+      tracker.OnFiniteStart(impacts[next++]);
+    }
+    if (now_ms == 1000) {
+      CHECK(request.Offer("resume", now_ms));
+    }
+    if (request.Poll(now_ms, tracker.Quiet(now_ms), reason)) {
+      fired.push_back(now_ms);
+    }
+  }
+  REQUIRE(fired.size() == 1);
+  CHECK(fired[0] == 1900 + kWheelResyncQuietMs);
+  CHECK(fired[0] < 1000 + kWheelResyncRequestExpiryMs);
+  CHECK(reason == "resume");
+
+  // Never quiet: deferred until the expiry, then it runs anyway.
+  WheelResyncRequestSlot busy;
+  CHECK(busy.Offer("racer-active", 5000));
+  CHECK_FALSE(busy.Poll(5016, false, reason));
+  CHECK_FALSE(busy.Poll(5000 + kWheelResyncRequestExpiryMs - 1, false, reason));
+  CHECK(busy.Poll(5000 + kWheelResyncRequestExpiryMs + 10, false, reason));
+  CHECK(reason == "racer-active");
+  CHECK_FALSE(busy.Poll(5000 + kWheelResyncRequestExpiryMs + 26, true, reason));
+
+  // A deferred request that reaches its expiry on a quiet poll still runs.
+  WheelResyncRequestSlot late;
+  CHECK(late.Offer("photo-close", 9000));
+  CHECK_FALSE(late.Poll(10990, false, reason));
+  CHECK(late.Poll(11010, true, reason));
+  CHECK(reason == "photo-close");
+
+  // A request no poll saw before its expiry (no focused wheel) is stale.
+  WheelResyncRequestSlot stale;
+  CHECK(stale.Offer("resume", 100));
+  CHECK_FALSE(stale.Poll(5000, true, reason));
+  CHECK_FALSE(stale.pending);
+}
