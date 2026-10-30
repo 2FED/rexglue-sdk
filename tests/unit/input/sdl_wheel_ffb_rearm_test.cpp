@@ -403,17 +403,29 @@ struct FakeResyncHaptic {
   std::vector<int> stops;
   std::vector<RunRecord> runs;
   std::vector<std::string> lines;
+  std::vector<std::string> ops;
+  uint32_t stop_alls = 0;
   bool run_succeeds = true;
+  bool stop_all_succeeds = true;
 
+  auto stop_all() {
+    return [this]() {
+      stop_alls++;
+      ops.push_back("stop_all");
+      return stop_all_succeeds;
+    };
+  }
   auto stop() {
     return [this](int effect_id) {
       stops.push_back(effect_id);
+      ops.push_back("stop " + std::to_string(effect_id));
       return true;
     };
   }
   auto run() {
     return [this](int effect_id, uint32_t iterations) {
       runs.emplace_back(effect_id, iterations);
+      ops.push_back("run " + std::to_string(effect_id) + " x" + std::to_string(iterations));
       return run_succeeds;
     };
   }
@@ -429,6 +441,9 @@ struct FakeResyncHaptic {
           break;
         case WheelResyncEvent::kLimitReached:
           lines.push_back(FormatWheelResyncLimitLine(slot_number, type, reason));
+          break;
+        case WheelResyncEvent::kStopAllFailed:
+          lines.push_back("stop-all-failed");
           break;
       }
     };
@@ -462,9 +477,10 @@ TEST_CASE("A host resync request restarts believed-running infinite slots once",
   CHECK(AnyWheelEffectResyncCandidate(slots));
 
   // The device would report every effect as playing; the resync ignores it.
-  CHECK(ResyncWheelEffects(slots, 5000, WheelResyncTrigger::kHost, haptic.stop(), haptic.run(),
-                           haptic.events("host:resume")) == 2);
-  CHECK(haptic.stops == std::vector<int>{11, 14});
+  CHECK(ResyncWheelEffects(slots, 5000, WheelResyncTrigger::kHost, haptic.stop_all(),
+                           haptic.stop(), haptic.run(), haptic.events("host:resume")) == 2);
+  CHECK(haptic.ops == std::vector<std::string>{"stop_all", "run 11 x1", "run 14 x1"});
+  CHECK(haptic.stops.empty());
   REQUIRE(haptic.runs.size() == 2);
   CHECK(haptic.runs[0] == RunRecord{11, 1});
   CHECK(haptic.runs[1] == RunRecord{14, 1});
@@ -559,13 +575,14 @@ TEST_CASE("The periodic resync runs every ten seconds and leaves a reserve",
   uint32_t passes = 0;
   for (uint64_t now_ms = 100000; now_ms <= 145000; now_ms += 16) {
     if (ShouldRunWheelPeriodicResync(now_ms, last_resync_ms)) {
-      ResyncWheelEffects(slots, now_ms, WheelResyncTrigger::kPeriodic, haptic.stop(),
-                         haptic.run(), haptic.events("periodic"));
+      ResyncWheelEffects(slots, now_ms, WheelResyncTrigger::kPeriodic, haptic.stop_all(),
+                         haptic.stop(), haptic.run(), haptic.events("periodic"));
       last_resync_ms = now_ms;
       passes++;
     }
   }
   CHECK(passes == 4);
+  CHECK(haptic.stop_alls == 4);
   CHECK(haptic.runs.size() == 8);  // spring and engine periodic, four passes each
   for (const auto& record : haptic.runs) {
     CHECK((record.first == 11 || record.first == 14));
@@ -644,15 +661,16 @@ TEST_CASE("A failed resync run keeps the running belief and finite slots stay un
   CHECK_FALSE(AnyWheelEffectResyncCandidate(finite));
   for (auto trigger :
        {WheelResyncTrigger::kHost, WheelResyncTrigger::kBurst, WheelResyncTrigger::kPeriodic}) {
-    CHECK(ResyncWheelEffects(finite, 1000, trigger, finite_haptic.stop(), finite_haptic.run(),
-                             finite_haptic.events("burst")) == 0);
+    CHECK(ResyncWheelEffects(finite, 1000, trigger, finite_haptic.stop_all(), finite_haptic.stop(),
+                             finite_haptic.run(), finite_haptic.events("burst")) == 0);
   }
+  CHECK(finite_haptic.stop_alls == 0);  // no candidate: the device is not stopped
   CHECK(finite_haptic.stops.empty());
   CHECK(finite_haptic.runs.empty());
   CHECK(finite_haptic.lines.empty());
 }
 
-TEST_CASE("A resync stops then runs each believed-running infinite slot in slot order",
+TEST_CASE("A resync stops the device once, then runs each believed-running infinite slot",
           "[input][sdl][wheel][ffb][ki022]") {
   // The T300 baseline at the race start: spring, constant (gain 0 by policy,
   // still believed running), damper, plus finite event slots.
@@ -682,6 +700,10 @@ TEST_CASE("A resync stops then runs each believed-running infinite slot in slot 
 
   std::vector<std::string> ops;
   uint32_t status_queries = 0;
+  auto stop_all = [&]() {
+    ops.push_back("stop_all");
+    return true;
+  };
   auto stop = [&](int effect_id) {
     ops.push_back("stop " + std::to_string(effect_id));
     return true;
@@ -708,10 +730,13 @@ TEST_CASE("A resync stops then runs each believed-running infinite slot in slot 
   CHECK(rearm_haptic.runs.empty());
   const uint32_t queries_before = status_queries;
 
-  CHECK(ResyncWheelEffects(slots, 1000, WheelResyncTrigger::kBurst, stop, run, events) == 4);
+  CHECK(ResyncWheelEffects(slots, 1000, WheelResyncTrigger::kBurst, stop_all, stop, run,
+                           events) == 4);
   CHECK(status_queries == queries_before);  // no status query at all
-  CHECK(ops == std::vector<std::string>{"stop 21", "run 21 x1", "stop 22", "run 22 x1", "stop 23",
-                                        "run 23 x1", "stop 26", "run 26 x3"});
+  // Exactly the focus-resume sequence: one global stop, then the runs in slot
+  // order with the stored iterations; finite slots are not run again.
+  CHECK(ops == std::vector<std::string>{"stop_all", "run 21 x1", "run 22 x1", "run 23 x1",
+                                        "run 26 x3"});
   REQUIRE(lines.size() == 4);
   CHECK(lines[1] == "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=2 type=constant reason=burst");
   CHECK(lines[3] == "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=6 type=square reason=burst");
@@ -813,4 +838,45 @@ TEST_CASE("Later updates that neutralise or shorten an effect are logged, rate l
   CHECK(FormatWheelUpdateChangeLimitLine(3, ForceFeedbackEffectType::kDamper) ==
         "SDL_WHEEL_FFB_EFFECT v=2 action=update-change-limit slot=3 type=damper limit=6 "
         "window_ms=60000");
+}
+
+TEST_CASE("A failed global stop falls back to per-slot stop and run",
+          "[input][sdl][wheel][ffb][ki022]") {
+  FakeResyncHaptic haptic;
+  haptic.stop_all_succeeds = false;
+  auto slots = RaceSlots();
+  CHECK(ResyncWheelEffects(slots, 5000, WheelResyncTrigger::kHost, haptic.stop_all(),
+                           haptic.stop(), haptic.run(), haptic.events("host:resume")) == 2);
+  CHECK(haptic.ops == std::vector<std::string>{"stop_all", "stop 11", "run 11 x1", "stop 14",
+                                               "run 14 x1"});
+  REQUIRE(haptic.lines.size() == 3);
+  CHECK(haptic.lines[0] == "stop-all-failed");
+  CHECK(slots[0].resync_budget.attempts == 1);
+  CHECK(slots[3].resync_budget.attempts == 1);
+}
+
+TEST_CASE("A slot over budget is never stopped by a global stop",
+          "[input][sdl][wheel][ffb][ki022]") {
+  auto slots = RaceSlots();
+  // The spring used its whole budget; the engine periodic was created later.
+  for (uint32_t i = 0; i < kWheelResyncBudgetPerWindow; ++i) {
+    ConsumeWheelResyncBudget(slots[0].resync_budget, 1000);
+  }
+  FakeResyncHaptic periodic;
+  CHECK(ResyncWheelEffects(slots, 2000, WheelResyncTrigger::kPeriodic, periodic.stop_all(),
+                           periodic.stop(), periodic.run(), periodic.events("periodic")) == 0);
+  CHECK(periodic.ops.empty());  // the periodic pass is skipped as a whole
+
+  FakeResyncHaptic host;
+  CHECK(ResyncWheelEffects(slots, 2000, WheelResyncTrigger::kHost, host.stop_all(), host.stop(),
+                           host.run(), host.events("host:resume")) == 1);
+  // No global stop: the spring keeps playing, the periodic slot is resynced
+  // on its own, and the spring logs its limit once.
+  CHECK(host.ops == std::vector<std::string>{"stop 14", "run 14 x1"});
+  REQUIRE(host.lines.size() == 2);
+  CHECK(host.lines[0] ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync-limit slot=1 type=spring reason=host:resume "
+        "limit=6 window_ms=60000");
+  CHECK(host.lines[1] ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=4 type=square reason=host:resume");
 }

@@ -5,9 +5,10 @@
 // drop a downloaded infinite effect at a burst of event effects or a game
 // time-scale transition and keep reporting it as playing, so the status-based
 // re-arm in wheel_force_feedback_rearm.h never fires. The focus-resume path
-// (stop + run) restores such an effect every time, so the resync repeats that
-// stop + run for every infinite effect the host believes is running, on a few
-// bounded triggers:
+// (one global stop of the device, then a run of each preserved infinite
+// effect) restores such an effect every time, so the resync repeats exactly
+// that sequence for every infinite effect the host believes is running, on a
+// few bounded triggers:
 //   - a host request (RequestWheelEffectResync), e.g. at a pause/slow-motion
 //     transition the title performs;
 //   - the end of a burst of finite event-effect starts;
@@ -319,10 +320,25 @@ enum class WheelResyncEvent {
   kResynced,
   kRunFailed,
   kLimitReached,
+  // The global stop failed; the pass falls back to per-slot stop + run.
+  // Reported with slot_number 0.
+  kStopAllFailed,
 };
 
-// Resyncs one slot: if the host believes it is a running infinite effect,
-// stop it and run it again (the focus-resume sequence), regardless of the
+// True when `trigger` may spend one attempt of this slot's budget now
+// (without consuming it). Periodic passes keep the reserve.
+constexpr bool WheelResyncHasBudget(WheelResyncBudget& budget, uint64_t now_ms,
+                                    WheelResyncTrigger trigger) {
+  if (trigger == WheelResyncTrigger::kPeriodic) {
+    return WheelResyncPeriodicHasBudget(budget, now_ms);
+  }
+  RefreshWheelResyncBudgetWindow(budget, now_ms);
+  return budget.attempts < kWheelResyncBudgetPerWindow;
+}
+
+// Resyncs one slot on its own (fallback of ResyncWheelEffects): if the host
+// believes it is a running infinite effect, stop it and run it again,
+// regardless of the
 // device status (never queried; the start path's status-playing skip does
 // not apply) and without re-sending parameters: the device keeps the ones it
 // holds. `stop(effect_id)` and `run(effect_id, iterations)` wrap the
@@ -357,16 +373,64 @@ bool ResyncWheelEffect(Slot& slot, size_t slot_number, uint64_t now_ms, WheelRes
   return true;
 }
 
-template <typename Slots, typename StopFn, typename RunFn, typename EventFn>
+// One resync pass over all slots, identical to the focus-resume sequence:
+// one global `stop_all()` of the wheel's haptic device, then `run` for every
+// believed-running infinite slot in slot order with its stored iterations.
+// Finite effects in flight are cut by the global stop, exactly as on a focus
+// loss. A global stop is used only when every candidate slot has budget, so
+// a slot over its limit is never stopped without being run again:
+//   - periodic pass with a slot over budget: the pass is skipped silently;
+//   - host/burst pass with a slot over budget: per-slot stop + run for the
+//     slots with budget, one limit line per refused slot and window;
+//   - global stop failed: kStopAllFailed, then per-slot stop + run.
+// Returns the number of slots run successfully.
+template <typename Slots, typename StopAllFn, typename StopFn, typename RunFn, typename EventFn>
 uint32_t ResyncWheelEffects(Slots& slots, uint64_t now_ms, WheelResyncTrigger trigger,
-                            StopFn&& stop, RunFn&& run, EventFn&& on_event) {
+                            StopAllFn&& stop_all, StopFn&& stop, RunFn&& run,
+                            EventFn&& on_event) {
+  bool any_candidate = false;
+  bool all_have_budget = true;
+  for (auto& slot : slots) {
+    if (!IsWheelEffectResyncCandidate(slot.running, slot.effect_id >= 0, slot.duration_ms)) {
+      continue;
+    }
+    any_candidate = true;
+    if (!WheelResyncHasBudget(slot.resync_budget, now_ms, trigger)) {
+      all_have_budget = false;
+    }
+  }
+  if (!any_candidate) {
+    return 0;
+  }
+  if (!all_have_budget && trigger == WheelResyncTrigger::kPeriodic) {
+    return 0;
+  }
+  bool global = all_have_budget;
+  if (global && !stop_all()) {
+    on_event(WheelResyncEvent::kStopAllFailed, size_t{0}, ForceFeedbackEffectType::kConstant);
+    global = false;
+  }
   uint32_t resynced = 0;
   size_t slot_number = 1;
   for (auto& slot : slots) {
-    if (ResyncWheelEffect(slot, slot_number, now_ms, trigger, stop, run, on_event)) {
-      resynced++;
+    const size_t number = slot_number++;
+    if (!global) {
+      if (ResyncWheelEffect(slot, number, now_ms, trigger, stop, run, on_event)) {
+        resynced++;
+      }
+      continue;
     }
-    slot_number++;
+    if (!IsWheelEffectResyncCandidate(slot.running, slot.effect_id >= 0, slot.duration_ms)) {
+      continue;
+    }
+    // Budget was checked for every candidate above.
+    ConsumeWheelResyncBudget(slot.resync_budget, now_ms);
+    if (!run(slot.effect_id, slot.iterations)) {
+      on_event(WheelResyncEvent::kRunFailed, number, slot.type);
+      continue;
+    }
+    on_event(WheelResyncEvent::kResynced, number, slot.type);
+    resynced++;
   }
   return resynced;
 }

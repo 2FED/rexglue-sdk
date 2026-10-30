@@ -1482,8 +1482,10 @@ void SDLInputDriver::ResyncWheelEffectsLocked(ControllerState& state, WheelResyn
     return;
   }
   const uint64_t now_ms = SDL_GetTicks();
-  // Same device sequence as a focus loss and regain (stop, then run), which
-  // restores an effect the driver dropped while still reporting it playing.
+  // Same device sequence as a focus loss and regain (one global stop, then a
+  // run of each infinite effect), which restores an effect the driver dropped
+  // while still reporting it playing.
+  auto stop_all = [&]() { return SDL_StopHapticEffects(state.haptic); };
   auto stop = [&](SDL_HapticEffectID effect_id) {
     return SDL_StopHapticEffect(state.haptic, effect_id);
   };
@@ -1504,9 +1506,14 @@ void SDLInputDriver::ResyncWheelEffectsLocked(ControllerState& state, WheelResyn
       case WheelResyncEvent::kLimitReached:
         REXLOG_WARN("{}", FormatWheelResyncLimitLine(slot_number, type, reason));
         break;
+      case WheelResyncEvent::kStopAllFailed:
+        REXLOG_ERROR("SDL wheel FFB {} resync stop-all failed: {}; per-slot stop and run", reason,
+                     SDL_GetError());
+        break;
     }
   };
-  ResyncWheelEffects(state.force_feedback_effects, now_ms, trigger, stop, run, on_event);
+  ResyncWheelEffects(state.force_feedback_effects, now_ms, trigger, stop_all, stop, run,
+                     on_event);
 }
 
 void SDLInputDriver::ServiceWheelEffectResyncLocked(ControllerState& state, uint64_t now_ms) {
