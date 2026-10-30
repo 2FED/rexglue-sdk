@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <mutex>
+#include <string>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -167,7 +169,24 @@ void LogWheelEffectParameters(const ForceFeedbackEffect& guest, const SDL_Haptic
   }
 }
 
+// KI-022: one coalesced host resync request, shared by all driver instances
+// and consumed on the poll path of the active wheel.
+std::mutex g_wheel_resync_request_mutex;
+WheelResyncRequestSlot g_wheel_resync_request;
+
+bool TakeWheelResyncRequest(uint64_t now_ms, std::string& reason) {
+  std::lock_guard lock(g_wheel_resync_request_mutex);
+  return g_wheel_resync_request.Take(now_ms, reason);
+}
+
 }  // namespace
+
+void RequestWheelEffectResync(const char* reason) {
+  std::string tag = NormalizeWheelResyncHostReason(reason);
+  const uint64_t now_ms = SDL_GetTicks();
+  std::lock_guard lock(g_wheel_resync_request_mutex);
+  g_wheel_resync_request.Offer(std::move(tag), now_ms);
+}
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -378,6 +397,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
       controller->force_feedback_rearm_check_ms = now_ms;
       RearmStoppedWheelEffectsLocked(*controller, "watchdog");
     }
+    ServiceWheelEffectResyncLocked(*controller, now_ms);
   }
 
   if (user_index == 0) {
@@ -567,6 +587,28 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffect(uint32_t user_index,
 
   effect_state.type = effect.type;
   effect_state.duration_ms = effect.duration_ms;
+  {
+    const bool neutral = IsWheelEffectNeutral(effect, gain);
+    const bool finite = effect.duration_ms != UINT32_MAX;
+    if (!update || recreated || effect_state.update_count == 0) {
+      // Create, retype and the first update already log their parameters.
+      ResetWheelUpdateChange(effect_state.update_change, neutral, finite);
+    } else {
+      switch (ObserveWheelUpdateChange(effect_state.update_change, neutral, finite,
+                                       SDL_GetTicks())) {
+        case WheelUpdateChangeLog::kLog:
+          REXLOG_INFO("{}", FormatWheelUpdateChangeLine(effect.effect_index, effect.type, neutral,
+                                                        effect.duration_ms, gain));
+          LogWheelEffectParameters(effect, sdl_effect, "update-change", gain);
+          break;
+        case WheelUpdateChangeLog::kLimitReached:
+          REXLOG_WARN("{}", FormatWheelUpdateChangeLimitLine(effect.effect_index, effect.type));
+          break;
+        case WheelUpdateChangeLog::kNone:
+          break;
+      }
+    }
+  }
   if (update && !recreated) {
     // An update never restarts a stopped DirectInput effect. Re-arm this slot
     // if it is a running infinite effect the device reports as stopped.
@@ -660,6 +702,11 @@ X_RESULT SDLInputDriver::SetForceFeedbackEffectRunning(uint32_t user_index, uint
   effect_state.start_suppressed_logged = false;
   if (running) {
     controller->force_feedback_total_start_count++;
+    if (effect_state.duration_ms != UINT32_MAX) {
+      // KI-022: a burst of finite event starts can make some wheel drivers
+      // drop the infinite effects silently; resync after the burst ends.
+      controller->force_feedback_burst.OnFiniteStart(SDL_GetTicks());
+    }
   }
   REXLOG_INFO("SDL_WHEEL_FFB_EFFECT v=2 action={} slot={} type={}", running ? "start" : "stop",
               effect_index, GetWheelEffectTypeName(effect_state.type));
@@ -1422,6 +1469,71 @@ void SDLInputDriver::RearmStoppedWheelEffectsLocked(ControllerState& state, cons
     return;
   }
   RearmStoppedWheelEffects(state.force_feedback_effects, now_ms, status_playing, run, on_event);
+}
+
+void SDLInputDriver::ResyncWheelEffectsLocked(ControllerState& state, WheelResyncTrigger trigger,
+                                              const std::string& reason) {
+  if (!state.is_wheel || !state.haptic || !has_focus_.load() ||
+      !REXCVAR_GET(wheel_force_feedback)) {
+    return;
+  }
+  const auto controller_index = static_cast<size_t>(&state - controllers_.data());
+  if (active_controller_index_ != controller_index) {
+    return;
+  }
+  const uint64_t now_ms = SDL_GetTicks();
+  // Same device sequence as a focus loss and regain (stop, then run), which
+  // restores an effect the driver dropped while still reporting it playing.
+  auto stop = [&](SDL_HapticEffectID effect_id) {
+    return SDL_StopHapticEffect(state.haptic, effect_id);
+  };
+  auto run = [&](SDL_HapticEffectID effect_id, uint32_t iterations) {
+    return SDL_RunHapticEffect(state.haptic, effect_id, iterations);
+  };
+  auto on_event = [&](WheelResyncEvent event, size_t slot_number, ForceFeedbackEffectType type) {
+    switch (event) {
+      case WheelResyncEvent::kResynced:
+        state.force_feedback_total_start_count++;
+        state.force_feedback_effects[slot_number - 1].start_suppressed_logged = false;
+        REXLOG_INFO("{}", FormatWheelResyncLine(slot_number, type, reason));
+        break;
+      case WheelResyncEvent::kRunFailed:
+        REXLOG_ERROR("SDL wheel FFB {} resync failed for slot {} type {}: {}", reason, slot_number,
+                     GetWheelEffectTypeName(type), SDL_GetError());
+        break;
+      case WheelResyncEvent::kLimitReached:
+        REXLOG_WARN("{}", FormatWheelResyncLimitLine(slot_number, type, reason));
+        break;
+    }
+  };
+  ResyncWheelEffects(state.force_feedback_effects, now_ms, trigger, stop, run, on_event);
+}
+
+void SDLInputDriver::ServiceWheelEffectResyncLocked(ControllerState& state, uint64_t now_ms) {
+  const auto controller_index = static_cast<size_t>(&state - controllers_.data());
+  if (active_controller_index_ != controller_index || !state.is_wheel || !state.haptic ||
+      !has_focus_.load() || !REXCVAR_GET(wheel_force_feedback)) {
+    return;
+  }
+  std::string host_reason;
+  const bool host_request = TakeWheelResyncRequest(now_ms, host_reason);
+  const bool burst_end = state.force_feedback_burst.ConsumeBurstEnd(now_ms);
+  if (!AnyWheelEffectResyncCandidate(state.force_feedback_effects)) {
+    // Nothing believed running: keep the periodic timer armed from now.
+    state.force_feedback_resync_ms = now_ms;
+    return;
+  }
+  if (host_request) {
+    // A burst end at the same poll is coalesced into the host pass.
+    ResyncWheelEffectsLocked(state, WheelResyncTrigger::kHost, "host:" + host_reason);
+  } else if (burst_end) {
+    ResyncWheelEffectsLocked(state, WheelResyncTrigger::kBurst, "burst");
+  } else if (ShouldRunWheelPeriodicResync(now_ms, state.force_feedback_resync_ms)) {
+    ResyncWheelEffectsLocked(state, WheelResyncTrigger::kPeriodic, "periodic");
+  } else {
+    return;
+  }
+  state.force_feedback_resync_ms = now_ms;
 }
 
 void SDLInputDriver::CloseController(ControllerState& state) {

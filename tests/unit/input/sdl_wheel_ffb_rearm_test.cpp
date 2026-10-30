@@ -16,6 +16,7 @@
 
 #include <rex/input/input.h>
 #include <rex/input/sdl/wheel_force_feedback_rearm.h>
+#include <rex/input/sdl/wheel_force_feedback_resync.h>
 
 using rex::input::ApplyForceFeedbackOperationBatch;
 using rex::input::ClampForceFeedbackOperationCount;
@@ -38,6 +39,26 @@ using rex::input::sdl::ShouldRunWheelRearmWatchdog;
 using rex::input::sdl::WheelRearmBudget;
 using rex::input::sdl::WheelRearmBudgetResult;
 using rex::input::sdl::WheelRearmEvent;
+using rex::input::sdl::AnyWheelEffectResyncCandidate;
+using rex::input::sdl::ConsumeWheelResyncBudget;
+using rex::input::sdl::FormatWheelResyncLimitLine;
+using rex::input::sdl::FormatWheelResyncLine;
+using rex::input::sdl::kWheelResyncBudgetPerWindow;
+using rex::input::sdl::kWheelResyncBudgetWindowMs;
+using rex::input::sdl::kWheelResyncBurstMinStarts;
+using rex::input::sdl::kWheelResyncBurstQuietMs;
+using rex::input::sdl::kWheelResyncBurstWindowMs;
+using rex::input::sdl::kWheelResyncPeriodicIntervalMs;
+using rex::input::sdl::kWheelResyncRequestExpiryMs;
+using rex::input::sdl::NormalizeWheelResyncHostReason;
+using rex::input::sdl::ResyncWheelEffect;
+using rex::input::sdl::ResyncWheelEffects;
+using rex::input::sdl::ShouldRunWheelPeriodicResync;
+using rex::input::sdl::WheelFiniteBurstTracker;
+using rex::input::sdl::WheelResyncBudget;
+using rex::input::sdl::WheelResyncEvent;
+using rex::input::sdl::WheelResyncRequestSlot;
+using rex::input::sdl::WheelResyncTrigger;
 
 namespace {
 
@@ -50,6 +71,7 @@ struct FakeSlot {
   uint32_t duration_ms = 0;
   bool running = false;
   WheelRearmBudget rearm_budget;
+  WheelResyncBudget resync_budget;
 };
 
 using RunRecord = std::pair<int, uint32_t>;
@@ -371,4 +393,424 @@ TEST_CASE("Suppressed infinite starts and retypes produce diagnostic lines",
   CHECK(FormatWheelRetypeLine(1, ForceFeedbackEffectType::kSpring,
                               ForceFeedbackEffectType::kSquare, true) ==
         "SDL_WHEEL_FFB_EFFECT v=2 action=retype slot=1 from=spring to=square restart=1");
+}
+
+namespace {
+
+// Device that drops nothing visibly: status always reads "playing", which is
+// exactly the T300 case the status re-arm cannot see.
+struct FakeResyncHaptic {
+  std::vector<int> stops;
+  std::vector<RunRecord> runs;
+  std::vector<std::string> lines;
+  bool run_succeeds = true;
+
+  auto stop() {
+    return [this](int effect_id) {
+      stops.push_back(effect_id);
+      return true;
+    };
+  }
+  auto run() {
+    return [this](int effect_id, uint32_t iterations) {
+      runs.emplace_back(effect_id, iterations);
+      return run_succeeds;
+    };
+  }
+  auto events(std::string reason) {
+    return [this, reason](WheelResyncEvent event, size_t slot_number,
+                          ForceFeedbackEffectType type) {
+      switch (event) {
+        case WheelResyncEvent::kResynced:
+          lines.push_back(FormatWheelResyncLine(slot_number, type, reason));
+          break;
+        case WheelResyncEvent::kRunFailed:
+          lines.push_back("run-failed");
+          break;
+        case WheelResyncEvent::kLimitReached:
+          lines.push_back(FormatWheelResyncLimitLine(slot_number, type, reason));
+          break;
+      }
+    };
+  }
+};
+
+std::array<FakeSlot, 4> RaceSlots() {
+  std::array<FakeSlot, 4> slots = {};
+  slots[0] = InfiniteSpring(11);  // centering
+  slots[1].effect_id = 12;        // finite collision square, still marked running
+  slots[1].type = ForceFeedbackEffectType::kSquare;
+  slots[1].duration_ms = 150;
+  slots[1].running = true;
+  slots[2].effect_id = 13;  // infinite damper the title stopped
+  slots[2].type = ForceFeedbackEffectType::kDamper;
+  slots[2].duration_ms = kInfinite;
+  slots[2].running = false;
+  slots[3].effect_id = 14;  // infinite engine periodic
+  slots[3].type = ForceFeedbackEffectType::kSquare;
+  slots[3].duration_ms = kInfinite;
+  slots[3].running = true;
+  return slots;
+}
+
+}  // namespace
+
+TEST_CASE("A host resync request restarts believed-running infinite slots once",
+          "[input][sdl][wheel][ffb][ki022]") {
+  FakeResyncHaptic haptic;
+  auto slots = RaceSlots();
+  CHECK(AnyWheelEffectResyncCandidate(slots));
+
+  // The device would report every effect as playing; the resync ignores it.
+  CHECK(ResyncWheelEffects(slots, 5000, WheelResyncTrigger::kHost, haptic.stop(), haptic.run(),
+                           haptic.events("host:resume")) == 2);
+  CHECK(haptic.stops == std::vector<int>{11, 14});
+  REQUIRE(haptic.runs.size() == 2);
+  CHECK(haptic.runs[0] == RunRecord{11, 1});
+  CHECK(haptic.runs[1] == RunRecord{14, 1});
+  REQUIRE(haptic.lines.size() == 2);
+  CHECK(haptic.lines[0] ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=1 type=spring reason=host:resume");
+  CHECK(haptic.lines[1] ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=4 type=square reason=host:resume");
+  // Finite and title-stopped effects keep their state and are untouched.
+  CHECK(slots[1].running);
+  CHECK_FALSE(slots[2].running);
+  CHECK(slots[1].resync_budget.attempts == 0);
+  CHECK(slots[2].resync_budget.attempts == 0);
+}
+
+TEST_CASE("Host resync requests are coalesced, normalised and expire",
+          "[input][sdl][wheel][ffb][ki022]") {
+  CHECK(NormalizeWheelResyncHostReason("host:resume") == "resume");
+  CHECK(NormalizeWheelResyncHostReason("racer-active") == "racer-active");
+  CHECK(NormalizeWheelResyncHostReason("photo close!") == "photo-close-");
+  CHECK(NormalizeWheelResyncHostReason("") == "request");
+  CHECK(NormalizeWheelResyncHostReason(nullptr) == "request");
+  CHECK(NormalizeWheelResyncHostReason(std::string(80, 'a').c_str()).size() == 32);
+
+  WheelResyncRequestSlot request;
+  std::string reason;
+  CHECK_FALSE(request.Take(100, reason));
+  CHECK(request.Offer("resume", 1000));
+  CHECK_FALSE(request.Offer("racer-active", 1100));  // coalesced, first reason kept
+  CHECK(request.Take(1200, reason));
+  CHECK(reason == "resume");
+  CHECK_FALSE(request.Take(1216, reason));  // one pass per request
+
+  CHECK(request.Offer("photo-close", 2000));
+  CHECK_FALSE(request.Take(2000 + kWheelResyncRequestExpiryMs + 1, reason));
+  // An expired pending request is replaced by a new one.
+  CHECK(request.Offer("resume", 5000));
+  CHECK(request.Offer("racer-active", 5000 + kWheelResyncRequestExpiryMs + 1));
+  CHECK(request.Take(5000 + kWheelResyncRequestExpiryMs + 2, reason));
+  CHECK(reason == "racer-active");
+}
+
+TEST_CASE("A burst of finite starts arms one resync after it ends",
+          "[input][sdl][wheel][ffb][ki022]") {
+  CHECK(kWheelResyncBurstMinStarts == 4);
+  CHECK(kWheelResyncBurstWindowMs == 2000);
+  CHECK(kWheelResyncBurstQuietMs == 300);
+
+  WheelFiniteBurstTracker tracker;
+  // Three starts are not a burst.
+  tracker.OnFiniteStart(1000);
+  tracker.OnFiniteStart(1100);
+  tracker.OnFiniteStart(1200);
+  CHECK_FALSE(tracker.armed);
+  CHECK_FALSE(tracker.ConsumeBurstEnd(5000));
+
+  // Four starts spread over more than two seconds are not a burst either.
+  WheelFiniteBurstTracker slow;
+  for (uint64_t t = 0; t < 4; ++t) {
+    slow.OnFiniteStart(10000 + t * 700);
+  }
+  CHECK_FALSE(slow.armed);
+
+  // The race-start pattern: 17 square starts at about frame rate.
+  WheelFiniteBurstTracker race;
+  uint64_t now_ms = 20000;
+  for (int i = 0; i < 17; ++i) {
+    race.OnFiniteStart(now_ms);
+    CHECK_FALSE(race.ConsumeBurstEnd(now_ms + 16));  // still inside the burst
+    now_ms += 45;
+  }
+  const uint64_t last_start = now_ms - 45;
+  CHECK(race.armed);
+  CHECK_FALSE(race.ConsumeBurstEnd(last_start + kWheelResyncBurstQuietMs - 1));
+  CHECK(race.ConsumeBurstEnd(last_start + kWheelResyncBurstQuietMs));
+  CHECK_FALSE(race.ConsumeBurstEnd(last_start + kWheelResyncBurstQuietMs + 16));  // once
+  // A single later start does not re-arm.
+  race.OnFiniteStart(last_start + 3000);
+  CHECK_FALSE(race.armed);
+}
+
+TEST_CASE("The periodic resync runs every ten seconds and leaves a reserve",
+          "[input][sdl][wheel][ffb][ki022]") {
+  CHECK(kWheelResyncPeriodicIntervalMs == 10000);
+  CHECK_FALSE(ShouldRunWheelPeriodicResync(19999, 10000));
+  CHECK(ShouldRunWheelPeriodicResync(20000, 10000));
+
+  // Guest polling at 16 ms for 45 s with the spring believed running.
+  FakeResyncHaptic haptic;
+  auto slots = RaceSlots();
+  uint64_t last_resync_ms = 100000;
+  uint32_t passes = 0;
+  for (uint64_t now_ms = 100000; now_ms <= 145000; now_ms += 16) {
+    if (ShouldRunWheelPeriodicResync(now_ms, last_resync_ms)) {
+      ResyncWheelEffects(slots, now_ms, WheelResyncTrigger::kPeriodic, haptic.stop(),
+                         haptic.run(), haptic.events("periodic"));
+      last_resync_ms = now_ms;
+      passes++;
+    }
+  }
+  CHECK(passes == 4);
+  CHECK(haptic.runs.size() == 8);  // spring and engine periodic, four passes each
+  for (const auto& record : haptic.runs) {
+    CHECK((record.first == 11 || record.first == 14));
+  }
+
+  // A fifth periodic pass in the window is allowed, a sixth would use the
+  // reserve kept for host/burst triggers and is skipped silently.
+  FakeResyncHaptic reserve;
+  FakeSlot spring = InfiniteSpring(1);
+  for (uint32_t i = 0; i < kWheelResyncBudgetPerWindow - 1; ++i) {
+    CHECK(ResyncWheelEffect(spring, 1, 1000 + i * 10000, WheelResyncTrigger::kPeriodic,
+                            reserve.stop(), reserve.run(), reserve.events("periodic")));
+  }
+  CHECK_FALSE(ResyncWheelEffect(spring, 1, 51000, WheelResyncTrigger::kPeriodic, reserve.stop(),
+                                reserve.run(), reserve.events("periodic")));
+  CHECK(reserve.lines.size() == kWheelResyncBudgetPerWindow - 1);
+  CHECK(ResyncWheelEffect(spring, 1, 52000, WheelResyncTrigger::kHost, reserve.stop(),
+                          reserve.run(), reserve.events("host:resume")));
+  CHECK(reserve.runs.size() == kWheelResyncBudgetPerWindow);
+}
+
+TEST_CASE("The per-slot resync budget allows six per minute with one limit line",
+          "[input][sdl][wheel][ffb][ki022]") {
+  CHECK(kWheelResyncBudgetPerWindow == 6);
+  CHECK(kWheelResyncBudgetWindowMs == 60000);
+  FakeResyncHaptic haptic;
+  FakeSlot spring = InfiniteSpring(7);
+  for (uint32_t i = 0; i < 10; ++i) {
+    ResyncWheelEffect(spring, 3, 1000 + i * 100, WheelResyncTrigger::kHost, haptic.stop(),
+                      haptic.run(), haptic.events("host:resume"));
+  }
+  CHECK(haptic.runs.size() == 6);
+  CHECK(haptic.stops.size() == 6);
+  REQUIRE(haptic.lines.size() == 7);
+  CHECK(haptic.lines[6] ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync-limit slot=3 type=spring reason=host:resume "
+        "limit=6 window_ms=60000");
+  // The next window allows resyncs again.
+  CHECK(ResyncWheelEffect(spring, 3, 1000 + kWheelResyncBudgetWindowMs, WheelResyncTrigger::kBurst,
+                          haptic.stop(), haptic.run(), haptic.events("burst")));
+  CHECK(haptic.lines.back() ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=3 type=spring reason=burst");
+
+  // The resync budget is independent of the status re-arm budget.
+  WheelResyncBudget budget;
+  for (uint32_t i = 0; i < kWheelResyncBudgetPerWindow; ++i) {
+    CHECK(ConsumeWheelResyncBudget(budget, 10) == WheelRearmBudgetResult::kAllowed);
+  }
+  CHECK(ConsumeWheelResyncBudget(budget, 20) == WheelRearmBudgetResult::kLimitReached);
+  CHECK(ConsumeWheelResyncBudget(budget, 30) == WheelRearmBudgetResult::kLimitedSilently);
+  CHECK(spring.rearm_budget.attempts == 0);
+}
+
+TEST_CASE("A failed resync run keeps the running belief and finite slots stay untouched",
+          "[input][sdl][wheel][ffb][ki022]") {
+  FakeResyncHaptic haptic;
+  haptic.run_succeeds = false;
+  FakeSlot spring = InfiniteSpring(9);
+  CHECK_FALSE(ResyncWheelEffect(spring, 1, 1000, WheelResyncTrigger::kHost, haptic.stop(),
+                                haptic.run(), haptic.events("host:photo-close")));
+  CHECK(spring.running);
+  CHECK(spring.resync_budget.attempts == 1);
+  REQUIRE(haptic.lines.size() == 1);
+  CHECK(haptic.lines[0] == "run-failed");
+
+  FakeResyncHaptic finite_haptic;
+  std::array<FakeSlot, 2> finite = {};
+  finite[0].effect_id = 1;
+  finite[0].type = ForceFeedbackEffectType::kConstant;
+  finite[0].duration_ms = 150;
+  finite[0].running = true;
+  finite[1].effect_id = 2;
+  finite[1].type = ForceFeedbackEffectType::kSquare;
+  finite[1].duration_ms = 150;
+  finite[1].running = true;
+  CHECK_FALSE(AnyWheelEffectResyncCandidate(finite));
+  for (auto trigger :
+       {WheelResyncTrigger::kHost, WheelResyncTrigger::kBurst, WheelResyncTrigger::kPeriodic}) {
+    CHECK(ResyncWheelEffects(finite, 1000, trigger, finite_haptic.stop(), finite_haptic.run(),
+                             finite_haptic.events("burst")) == 0);
+  }
+  CHECK(finite_haptic.stops.empty());
+  CHECK(finite_haptic.runs.empty());
+  CHECK(finite_haptic.lines.empty());
+}
+
+TEST_CASE("A resync stops then runs each believed-running infinite slot in slot order",
+          "[input][sdl][wheel][ffb][ki022]") {
+  // The T300 baseline at the race start: spring, constant (gain 0 by policy,
+  // still believed running), damper, plus finite event slots.
+  std::array<FakeSlot, 6> slots = {};
+  slots[0] = InfiniteSpring(21);
+  slots[1].effect_id = 22;
+  slots[1].type = ForceFeedbackEffectType::kConstant;
+  slots[1].duration_ms = kInfinite;
+  slots[1].running = true;
+  slots[2].effect_id = 23;
+  slots[2].type = ForceFeedbackEffectType::kDamper;
+  slots[2].duration_ms = kInfinite;
+  slots[2].running = true;
+  slots[3].effect_id = 24;
+  slots[3].type = ForceFeedbackEffectType::kSquare;
+  slots[3].duration_ms = 150;
+  slots[3].running = true;
+  slots[4].effect_id = 25;
+  slots[4].type = ForceFeedbackEffectType::kConstant;
+  slots[4].duration_ms = 150;
+  slots[4].running = true;
+  slots[5].effect_id = 26;
+  slots[5].type = ForceFeedbackEffectType::kSquare;
+  slots[5].duration_ms = kInfinite;
+  slots[5].running = true;
+  slots[5].iterations = 3;
+
+  std::vector<std::string> ops;
+  uint32_t status_queries = 0;
+  auto stop = [&](int effect_id) {
+    ops.push_back("stop " + std::to_string(effect_id));
+    return true;
+  };
+  auto run = [&](int effect_id, uint32_t iterations) {
+    ops.push_back("run " + std::to_string(effect_id) + " x" + std::to_string(iterations));
+    return true;
+  };
+  std::vector<std::string> lines;
+  auto events = [&](WheelResyncEvent event, size_t slot_number, ForceFeedbackEffectType type) {
+    if (event == WheelResyncEvent::kResynced) {
+      lines.push_back(FormatWheelResyncLine(slot_number, type, "burst"));
+    }
+  };
+  // A device that keeps reporting every effect as playing: the status re-arm
+  // does nothing, the resync ignores the status entirely.
+  auto always_playing = [&](int) {
+    status_queries++;
+    return true;
+  };
+  FakeHaptic rearm_haptic;
+  CHECK(RearmStoppedWheelEffects(slots, 1000, always_playing, rearm_haptic.run(),
+                                 rearm_haptic.events("watchdog")) == 0);
+  CHECK(rearm_haptic.runs.empty());
+  const uint32_t queries_before = status_queries;
+
+  CHECK(ResyncWheelEffects(slots, 1000, WheelResyncTrigger::kBurst, stop, run, events) == 4);
+  CHECK(status_queries == queries_before);  // no status query at all
+  CHECK(ops == std::vector<std::string>{"stop 21", "run 21 x1", "stop 22", "run 22 x1", "stop 23",
+                                        "run 23 x1", "stop 26", "run 26 x3"});
+  REQUIRE(lines.size() == 4);
+  CHECK(lines[1] == "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=2 type=constant reason=burst");
+  CHECK(lines[3] == "SDL_WHEEL_FFB_EFFECT v=2 action=resync slot=6 type=square reason=burst");
+}
+
+TEST_CASE("The race-start burst resyncs once after it settles, not inside it",
+          "[input][sdl][wheel][ffb][ki022]") {
+  CHECK(kWheelResyncBurstQuietMs == 300);
+  // 28 finite square starts on one slot within 0.76 s (often two in the same
+  // millisecond) while the guest polls GetState every 16 ms.
+  std::vector<uint64_t> starts;
+  for (uint64_t frame = 0; frame < 13; ++frame) {
+    starts.push_back(50000 + frame * 55);
+    starts.push_back(50000 + frame * 55);
+  }
+  starts.push_back(50000 + 13 * 55);
+  starts.push_back(50000 + 13 * 55 + 40);
+  REQUIRE(starts.size() == 28);
+  const uint64_t last_start = starts.back();
+  REQUIRE(last_start - starts.front() <= 800);
+
+  WheelFiniteBurstTracker tracker;
+  size_t next_start = 0;
+  std::vector<uint64_t> fired;
+  for (uint64_t now_ms = 49990; now_ms <= 53000; now_ms += 16) {
+    while (next_start < starts.size() && starts[next_start] <= now_ms) {
+      tracker.OnFiniteStart(starts[next_start++]);
+    }
+    if (tracker.ConsumeBurstEnd(now_ms)) {
+      fired.push_back(now_ms);
+    }
+  }
+  REQUIRE(fired.size() == 1);
+  CHECK(fired[0] >= last_start + kWheelResyncBurstQuietMs);
+  CHECK(fired[0] < last_start + kWheelResyncBurstQuietMs + 16);
+}
+
+TEST_CASE("Later updates that neutralise or shorten an effect are logged, rate limited",
+          "[input][sdl][wheel][ffb][ki022]") {
+  using rex::input::ForceFeedbackEffect;
+  using rex::input::sdl::FormatWheelUpdateChangeLimitLine;
+  using rex::input::sdl::FormatWheelUpdateChangeLine;
+  using rex::input::sdl::IsWheelEffectNeutral;
+  using rex::input::sdl::kWheelUpdateChangeLogPerWindow;
+  using rex::input::sdl::ObserveWheelUpdateChange;
+  using rex::input::sdl::ResetWheelUpdateChange;
+  using rex::input::sdl::WheelUpdateChangeLog;
+  using rex::input::sdl::WheelUpdateChangeState;
+
+  ForceFeedbackEffect spring;
+  spring.type = ForceFeedbackEffectType::kSpring;
+  spring.duration_ms = kInfinite;
+  spring.conditions[0].right_coefficient = 89;
+  spring.conditions[0].left_coefficient = 89;
+  spring.conditions[0].right_saturation = 178;
+  spring.conditions[0].left_saturation = 178;
+  CHECK_FALSE(IsWheelEffectNeutral(spring, 100));
+  CHECK(IsWheelEffectNeutral(spring, 0));
+  ForceFeedbackEffect zero_spring = spring;
+  zero_spring.conditions[0].right_coefficient = 0;
+  zero_spring.conditions[0].left_coefficient = 0;
+  CHECK(IsWheelEffectNeutral(zero_spring, 100));
+
+  ForceFeedbackEffect periodic;
+  periodic.type = ForceFeedbackEffectType::kSquare;
+  periodic.periodic_magnitude = 38;
+  CHECK_FALSE(IsWheelEffectNeutral(periodic, 40));
+  periodic.periodic_magnitude = 0;
+  CHECK(IsWheelEffectNeutral(periodic, 40));
+  ForceFeedbackEffect constant;
+  constant.type = ForceFeedbackEffectType::kConstant;
+  constant.constant_level = -25;
+  CHECK_FALSE(IsWheelEffectNeutral(constant, 100));
+  CHECK(IsWheelEffectNeutral(constant, 0));  // continuous constant policy gain 0
+
+  WheelUpdateChangeState state;
+  ResetWheelUpdateChange(state, false, false);
+  // Ordinary speed-dependent updates keep the state: nothing logged.
+  for (int i = 0; i < 100; ++i) {
+    CHECK(ObserveWheelUpdateChange(state, false, false, 1000 + i) == WheelUpdateChangeLog::kNone);
+  }
+  CHECK(ObserveWheelUpdateChange(state, true, false, 2000) == WheelUpdateChangeLog::kLog);
+  CHECK(ObserveWheelUpdateChange(state, true, false, 2016) == WheelUpdateChangeLog::kNone);
+  CHECK(ObserveWheelUpdateChange(state, false, true, 2032) == WheelUpdateChangeLog::kLog);
+  // Flapping is bounded: six lines per minute, then one limit line.
+  uint32_t logged = 2;
+  uint32_t limits = 0;
+  for (int i = 0; i < 20; ++i) {
+    const auto result = ObserveWheelUpdateChange(state, i % 2 == 0, false, 3000 + i);
+    logged += result == WheelUpdateChangeLog::kLog ? 1 : 0;
+    limits += result == WheelUpdateChangeLog::kLimitReached ? 1 : 0;
+  }
+  CHECK(logged == kWheelUpdateChangeLogPerWindow);
+  CHECK(limits == 1);
+
+  CHECK(FormatWheelUpdateChangeLine(1, ForceFeedbackEffectType::kSpring, true, kInfinite, 100) ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=update-change slot=1 type=spring neutral=1 finite=0 "
+        "duration=4294967295 gain_percent=100");
+  CHECK(FormatWheelUpdateChangeLimitLine(3, ForceFeedbackEffectType::kDamper) ==
+        "SDL_WHEEL_FFB_EFFECT v=2 action=update-change-limit slot=3 type=damper limit=6 "
+        "window_ms=60000");
 }

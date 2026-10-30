@@ -19,6 +19,7 @@
 
 #include <rex/input/input_driver.h>
 #include <rex/input/sdl/wheel_force_feedback_rearm.h>
+#include <rex/input/sdl/wheel_force_feedback_resync.h>
 
 #include <SDL3/SDL.h>
 
@@ -66,6 +67,10 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     bool start_suppressed_logged = false;
     // KI-022: bounds re-arm attempts of a device-stopped infinite effect.
     WheelRearmBudget rearm_budget;
+    // KI-022: bounds unconditional resyncs (host request, burst, periodic).
+    WheelResyncBudget resync_budget;
+    // KI-022: neutral/finite state of the last update, for update-change lines.
+    WheelUpdateChangeState update_change;
   };
 
   struct ControllerState {
@@ -84,6 +89,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     uint32_t force_feedback_total_start_count;
     bool force_feedback_device_info_logged;
     uint64_t force_feedback_rearm_check_ms;
+    // KI-022: unconditional resync triggers.
+    WheelFiniteBurstTracker force_feedback_burst;
+    uint64_t force_feedback_resync_ms;
   };
 
   enum class RepeatState {
@@ -128,6 +136,15 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // `only_slot` limits the pass to one zero-based effect slot.
   void RearmStoppedWheelEffectsLocked(ControllerState& state, const char* reason,
                                       std::optional<size_t> only_slot = std::nullopt);
+  // KI-022: stop + run every infinite effect the host believes is running on
+  // the active focused wheel, regardless of the device status (the
+  // focus-resume sequence). `reason` is the log reason ("host:<tag>",
+  // "burst", "periodic"). Bounded per slot by WheelResyncBudget.
+  void ResyncWheelEffectsLocked(ControllerState& state, WheelResyncTrigger trigger,
+                                const std::string& reason);
+  // KI-022: evaluates the host request, burst-end and periodic triggers from
+  // the input poll path.
+  void ServiceWheelEffectResyncLocked(ControllerState& state, uint64_t now_ms);
   void CloseController(ControllerState& state);
   void UpdateWheelAxisLocked(ControllerState& state, uint8_t axis, int16_t value,
                              bool record_activity);
