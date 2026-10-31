@@ -1234,6 +1234,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   if (render_audit_enabled_) {
     ++render_audit_resolve_info_ok_;
   }
+  last_resolve_diag_info_.copy_dest_base = resolve_info.copy_dest_base;
+  last_resolve_diag_info_.copy_dest_extent_start = resolve_info.copy_dest_extent_start;
+  last_resolve_diag_info_.copy_dest_extent_length = resolve_info.copy_dest_extent_length;
+  last_resolve_diag_info_.width = uint32_t(resolve_info.coordinate_info.width_div_8) * 8;
+  last_resolve_diag_info_.height = resolve_info.height_div_8 * 8;
+  last_resolve_diag_info_.copy_dest_format =
+      uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  last_resolve_diag_info_.copy_src_select = resolve_info.rb_copy_control.copy_src_select;
+  last_resolve_diag_info_.source_edram_base = resolve_info.IsCopyingDepth()
+                                                  ? resolve_info.depth_original_base
+                                                  : resolve_info.color_original_base;
 
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {

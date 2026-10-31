@@ -85,6 +85,24 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
 
+  // Geometry of the last resolve whose resolve info was valid, for the
+  // d3d12_livery_diag diagnostics (MCLA KI-047). Addresses, sizes and formats
+  // only.
+  struct LastResolveDiagInfo {
+    uint32_t copy_dest_base = 0;
+    uint32_t copy_dest_extent_start = 0;
+    uint32_t copy_dest_extent_length = 0;
+    // Resolve rectangle in guest pixels.
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t copy_dest_format = 0;
+    // RB_COPY_CONTROL copy_src_select: 0-3 color render target, 4 depth.
+    uint32_t copy_src_select = 0;
+    // EDRAM base (tiles) of the source render target.
+    uint32_t source_edram_base = 0;
+  };
+  const LastResolveDiagInfo& last_resolve_diag_info() const { return last_resolve_diag_info_; }
+
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
@@ -682,6 +700,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   static constexpr uint32_t kRenderAuditRenderTargetRecordLimit = 128;
   static constexpr uint32_t kRenderAuditOwnershipModeLimit = 64;
   static constexpr uint32_t kRenderAuditResolveModeLimit = 128;
+  LastResolveDiagInfo last_resolve_diag_info_;
+
   bool render_audit_enabled_ = false;
   bool render_audit_config_emitted_ = false;
   std::atomic<bool> render_audit_summary_emitted_{false};

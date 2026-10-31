@@ -27,6 +27,7 @@ add_executable(unit_tests
     graphics/primitive_processor_cache_test.cpp
     graphics/descriptor_binding_snapshot_test.cpp
     graphics/pending_pipeline_wait_test.cpp
+    graphics/livery_diag_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

@@ -36,6 +36,7 @@
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/xenos.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
@@ -237,6 +238,35 @@ class D3D12CommandProcessor : public CommandProcessor {
   // With d3d12_async_pipeline_wait on, waits (bounded) for a pipeline that is
   // still being created. Returns true if the pipeline is now usable.
   bool WaitForPendingPipeline(void* pipeline_handle);
+
+  // d3d12_livery_diag diagnostics (MCLA KI-047), command processor thread.
+  // Lines are tagged MCLA_LIVERY_DIAG v=1 and contain only frame and draw
+  // numbers, guest addresses, sizes, formats and hashes.
+  bool LiveryDiagEnabled();
+  void LiveryDiagOnPipelineSkip(void* pipeline_handle, bool failed,
+                                uint32_t normalized_color_mask,
+                                reg::RB_DEPTHCONTROL normalized_depth_control);
+  std::string LiveryDiagMinuteReport();
+  // State of one read-back resolve, reported when the scope ends (every exit
+  // of IssueCopy_ReadbackResolvePath after the resolve itself).
+  struct LiveryResolveDiagScope {
+    D3D12CommandProcessor* processor = nullptr;
+    ReadbackResolveMode mode = ReadbackResolveMode::kDisabled;
+    bool scaled = false;
+    uint32_t written_address = 0;
+    uint32_t written_length = 0;
+    bool should_copy = true;
+    bool copied = false;
+    const char* reason = "early_exit";
+    bool cache_miss = false;
+    bool read_previous_slot = false;
+    bool previous_slot_complete = false;
+    bool previous_slot_length_ok = false;
+    uint64_t previous_slot_age = 0;
+    uint32_t resolves_since_copy = 0;
+    ~LiveryResolveDiagScope();
+  };
+  void LiveryDiagReportResolve(const LiveryResolveDiagScope& scope);
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -611,6 +641,25 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
   // d3d12_async_pipeline_wait episode bookkeeping (command processor thread).
   PendingWaitEpisode async_pipeline_wait_episode_;
+
+  // d3d12_livery_diag state (command processor thread; untouched while off).
+  static constexpr uint32_t kLiveryDiagLinesPerMinute = 64;
+  static constexpr uint64_t kLiveryDiagQuietFrames = 120;
+  static constexpr uint32_t kLiveryDiagSkipBaseLimit = 64;
+  bool livery_diag_was_enabled_ = false;
+  WindowRateLimiter livery_diag_skip_lines_{kLiveryDiagLinesPerMinute};
+  WindowRateLimiter livery_diag_resolve_lines_{kLiveryDiagLinesPerMinute};
+  RecentKeyFilter livery_diag_skip_keys_{kLiveryDiagQuietFrames};
+  RecentKeyFilter livery_diag_resolve_keys_{kLiveryDiagQuietFrames};
+  LiveryDiagCounters livery_diag_minute_;
+  uint64_t livery_diag_skip_frame_ = 0;
+  uint32_t livery_diag_frame_skips_ = 0;
+  // Draws skipped since the previous read-back resolve, with the EDRAM bases
+  // (RT0 color, depth) of the first kLiveryDiagSkipBaseLimit of them.
+  uint32_t livery_diag_skips_since_resolve_ = 0;
+  uint32_t livery_diag_skip_base_count_ = 0;
+  std::array<uint32_t, kLiveryDiagSkipBaseLimit> livery_diag_skip_color_bases_ = {};
+  std::array<uint32_t, kLiveryDiagSkipBaseLimit> livery_diag_skip_depth_bases_ = {};
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

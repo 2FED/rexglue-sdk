@@ -114,6 +114,24 @@ class PipelineCache {
                                                            : PipelineAuditStatus::kFailed;
   }
 
+  // Identity of a pipeline for the d3d12_livery_diag diagnostics (MCLA
+  // KI-047): the description hash as stored in the pipeline storage, and the
+  // guest vertex and pixel shader ucode hashes (0 without a pixel shader).
+  struct PipelineDiagHashes {
+    uint64_t description = 0;
+    uint64_t vertex_shader = 0;
+    uint64_t pixel_shader = 0;
+  };
+  PipelineDiagHashes GetPipelineDiagHashes(void* handle) const {
+    const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
+    const PipelineDescription& description = pipeline->description.description;
+    PipelineDiagHashes hashes;
+    hashes.description = XXH3_64bits(&description, sizeof(description));
+    hashes.vertex_shader = description.vertex_shader_hash;
+    hashes.pixel_shader = description.pixel_shader_hash;
+    return hashes;
+  }
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
