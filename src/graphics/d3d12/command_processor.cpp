@@ -57,6 +57,13 @@ REXCVAR_DEFINE_BOOL(d3d12_async_pipeline_wait, false, "GPU/D3D12",
                     "on by a title only around CPU-read captures such as photo modes")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_async_pipeline_wait_always, false, "GPU/D3D12",
+                    "With async_shader_compilation, wait for every pipeline that is still "
+                    "being created instead of skipping its draw, bounded to 2 s per wait and "
+                    "15 s of waiting per minute (draws are skipped again once a minute's "
+                    "budget is spent). d3d12_async_pipeline_wait takes precedence while on")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_livery_diag, false, "GPU/D3D12",
                     "Log draws skipped while their pipeline is still being created and "
                     "every read-back resolve (MCLA_LIVERY_DIAG lines, rate-limited, no guest "
@@ -2478,9 +2485,11 @@ bool D3D12CommandProcessor::LiveryDiagEnabled() {
     livery_diag_was_enabled_ = enabled;
     REXGPU_INFO(
         "MCLA_LIVERY_DIAG v=1 kind={} frame={} async_shader_compilation={} "
-        "async_pipeline_wait={} readback={} scale={}x{} lines_per_minute={} quiet_frames={}",
+        "async_pipeline_wait={} async_pipeline_wait_always={} readback={} scale={}x{} "
+        "lines_per_minute={} quiet_frames={}",
         enabled ? "start" : "stop", frame_current_,
         int(REXCVAR_GET(async_shader_compilation)), int(REXCVAR_GET(d3d12_async_pipeline_wait)),
+        int(REXCVAR_GET(d3d12_async_pipeline_wait_always)),
         LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
         texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 0,
         texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 0, kLiveryDiagLinesPerMinute,
@@ -2626,24 +2635,50 @@ std::string D3D12CommandProcessor::LiveryDiagMinuteReport() {
 }
 
 bool D3D12CommandProcessor::WaitForPendingPipeline(void* pipeline_handle) {
-  if (!async_pipeline_wait_episode_.enabled() ||
+  PendingWaitMode mode = SelectPendingWaitMode(async_pipeline_wait_episode_.enabled(),
+                                               async_pipeline_wait_always_.enabled());
+  if (mode == PendingWaitMode::kNone ||
       pipeline_cache_->GetPipelineAuditStatus(pipeline_handle) !=
           PipelineCache::PipelineAuditStatus::kPending) {
     return false;
   }
-  uint64_t timeout_ms = async_pipeline_wait_episode_.NextTimeoutMs();
+  bool window = mode == PendingWaitMode::kWindow;
+  uint64_t timeout_ms = window ? async_pipeline_wait_episode_.NextTimeoutMs()
+                               : async_pipeline_wait_always_.NextTimeoutMs();
   if (!timeout_ms) {
+    if (!window && async_pipeline_wait_always_.TakeExhaustedNotice()) {
+      REXGPU_WARN(
+          "D3D12 async pipeline wait (always): pipeline wait budget exhausted ({} ms this "
+          "minute), skipping draws with pending pipelines until the next minute",
+          async_pipeline_wait_always_.stats().total_ms);
+    }
     return false;
   }
   uint64_t elapsed_ms = 0;
   PendingWaitResult result =
       pipeline_cache_->AwaitPipeline(pipeline_handle, timeout_ms, &elapsed_ms);
   bool created = pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) != nullptr;
-  if (async_pipeline_wait_episode_.Record(elapsed_ms, result, created)) {
-    REXGPU_WARN("D3D12 async pipeline wait: a pipeline took {} ms{}", elapsed_ms,
+  bool log_slow = window ? async_pipeline_wait_episode_.Record(elapsed_ms, result, created)
+                         : async_pipeline_wait_always_.Record(elapsed_ms, result, created);
+  if (log_slow) {
+    REXGPU_WARN("D3D12 async pipeline wait{}: a pipeline took {} ms{}",
+                window ? "" : " (always)", elapsed_ms,
                 result == PendingWaitResult::kTimedOut ? " (timed out, draw skipped)" : "");
   }
   return created;
+}
+
+void D3D12CommandProcessor::ObserveAlwaysPipelineWait() {
+  if (!async_pipeline_wait_always_.Observe(REXCVAR_GET(d3d12_async_pipeline_wait_always),
+                                           LiveryDiagNowMs())) {
+    return;
+  }
+  const PendingWaitMinuteBudget::Stats& stats = async_pipeline_wait_always_.finished_stats();
+  REXGPU_INFO(
+      "D3D12 async pipeline wait (always): minute summary over {} ms, {} waits ({} ms "
+      "total, {} ms longest), {} timed out, {} failed, {} skipped after budget exhausted",
+      async_pipeline_wait_always_.finished_duration_ms(), stats.waits, stats.total_ms,
+      stats.max_ms, stats.timeouts, stats.failed, stats.budget_skips);
 }
 
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -2784,6 +2819,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         "{} timed out, {} failed, {} skipped over budget",
         stats.waits, stats.total_ms, stats.max_ms, stats.timeouts, stats.failed,
         stats.budget_skips);
+  }
+  // Mode changes are seen per draw; minute windows roll over at frame end.
+  if (REXCVAR_GET(d3d12_async_pipeline_wait_always) != async_pipeline_wait_always_.enabled()) {
+    ObserveAlwaysPipelineWait();
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr &&
@@ -4093,6 +4132,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    if (async_pipeline_wait_always_.enabled()) {
+      ObserveAlwaysPipelineWait();
+    }
     {
       // Host frame pacing, reported once a minute (command processor thread).
       static std::vector<uint32_t> frame_intervals_us;

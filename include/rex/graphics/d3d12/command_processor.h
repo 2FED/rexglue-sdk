@@ -235,9 +235,12 @@ class D3D12CommandProcessor : public CommandProcessor {
  private:
   static constexpr uint32_t kQueueFrames = 3;
 
-  // With d3d12_async_pipeline_wait on, waits (bounded) for a pipeline that is
-  // still being created. Returns true if the pipeline is now usable.
+  // With d3d12_async_pipeline_wait or d3d12_async_pipeline_wait_always on,
+  // waits (bounded) for a pipeline that is still being created. Returns true if the pipeline is now usable.
   bool WaitForPendingPipeline(void* pipeline_handle);
+  // Applies the current d3d12_async_pipeline_wait_always value to the minute
+  // budget and logs the summary of a window that ended.
+  void ObserveAlwaysPipelineWait();
 
   // d3d12_livery_diag diagnostics (MCLA KI-047), command processor thread.
   // Lines are tagged MCLA_LIVERY_DIAG v=1 and contain only frame and draw
@@ -641,6 +644,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<PipelineCache> pipeline_cache_;
   // d3d12_async_pipeline_wait episode bookkeeping (command processor thread).
   PendingWaitEpisode async_pipeline_wait_episode_;
+  // d3d12_async_pipeline_wait_always minute budget (command processor thread).
+  PendingWaitMinuteBudget async_pipeline_wait_always_;
 
   // d3d12_livery_diag state (command processor thread; untouched while off).
   static constexpr uint32_t kLiveryDiagLinesPerMinute = 64;
