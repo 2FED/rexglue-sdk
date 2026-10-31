@@ -22,6 +22,7 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/thread.h>
 
 #include <rex/logging.h>
 
@@ -523,6 +524,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   if (ranges == nullptr || !count) {
     return true;
   }
+  if (perf_split_ && perf_split_thread_id_ == rex::thread::current_thread_system_id()) {
+    ++perf_split_->counters.request_calls;
+  }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
   // Called for every draw and texture request: reuse per-thread storage
@@ -690,6 +694,15 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  if (perf_split_ && perf_split_thread_id_ == rex::thread::current_thread_system_id()) {
+    uint64_t pages = 0;
+    for (const auto& upload_range : upload_ranges_) {
+      pages += upload_range.second;
+    }
+    perf_split_->counters.upload_bytes += pages << page_size_log2_;
+    rex::perf::ScopedPerfRegion region(perf_split_, rex::perf::PerfRegion::kUpload);
+    return UploadRanges(upload_ranges_);
+  }
   return UploadRanges(upload_ranges_);
 }
 

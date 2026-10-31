@@ -17,9 +17,11 @@
 #include <rex/graphics/flags.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/thread.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <utility>
@@ -45,6 +47,8 @@ struct ReplayStats {
   std::chrono::steady_clock::time_point next_report{};
 };
 ReplayStats g_replay_stats;
+// M10-001: never reset (the per-minute stats above are).
+std::atomic<uint64_t> g_replay_total_us{0};
 
 void ReportReplayStats() {
   ReplayStats& s = g_replay_stats;
@@ -183,10 +187,16 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     Replay(blocks_[i]->data.get(), used, state);
   }
   ++g_replay_stats.submissions;
-  g_replay_stats.replay_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::steady_clock::now() - replay_begin)
-                                           .count());
+  const uint64_t replay_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - replay_begin)
+                                          .count());
+  g_replay_stats.replay_us += replay_us;
+  g_replay_total_us.fetch_add(replay_us, std::memory_order_relaxed);
   ReportReplayStats();
+}
+
+uint64_t DeferredCommandList::TotalReplayMicroseconds() {
+  return g_replay_total_us.load(std::memory_order_relaxed);
 }
 
 void DeferredCommandList::BeginStreaming(ID3D12GraphicsCommandList* command_list,
@@ -231,6 +241,7 @@ void DeferredCommandList::FinishStreaming() {
 }
 
 void DeferredCommandList::WorkerMain() {
+  rex::thread::set_current_thread_name("D3D12 Replay");
   while (true) {
     ReplayState state;
     {
@@ -306,6 +317,7 @@ void DeferredCommandList::WorkerMain() {
     {
       std::lock_guard<std::mutex> lock(worker_mutex_);
       g_replay_stats.replay_us += replay_ns / 1000;
+      g_replay_total_us.fetch_add(replay_ns / 1000, std::memory_order_relaxed);
       worker_state_ = WorkerState::kIdle;
     }
     worker_done_cond_.notify_all();

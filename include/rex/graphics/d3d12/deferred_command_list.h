@@ -51,6 +51,14 @@ class DeferredCommandList {
   void FinishStreaming();
   bool IsStreaming() const { return streaming_; }
 
+  // M10-001: cumulative replay time of all lists (worker and Execute), and
+  // the streaming worker's native thread handle (null before the first
+  // streamed submission). The worker is named "D3D12 Replay".
+  static uint64_t TotalReplayMicroseconds();
+  void* WorkerNativeHandle() {
+    return worker_.joinable() ? reinterpret_cast<void*>(worker_.native_handle()) : nullptr;
+  }
+
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
                                                   UINT8 stencil, UINT num_rects) {

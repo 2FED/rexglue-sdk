@@ -38,6 +38,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/xenos.h>
+#include <rex/perf/perf_split.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -646,6 +647,37 @@ class D3D12CommandProcessor : public CommandProcessor {
   PendingWaitEpisode async_pipeline_wait_episode_;
   // d3d12_async_pipeline_wait_always minute budget (command processor thread).
   PendingWaitMinuteBudget async_pipeline_wait_always_;
+
+  // d3d12_perf_split (M10-001) state, command processor thread only.
+  // perf_split_active_ is null while the split is off, so every per-draw and
+  // slow-path probe is one branch on it.
+  rex::perf::PerfSplitAccumulator perf_split_;
+  rex::perf::PerfSplitAccumulator* perf_split_active_ = nullptr;
+  uint32_t perf_split_mode_ = 0;
+  uint64_t perf_split_seq_ = 0;
+  rex::perf::PerfSplitInputs perf_split_previous_;
+  uint64_t perf_gpu_busy_ticks_total_ = 0;
+  uint64_t perf_gpu_busy_submissions_total_ = 0;
+  void* perf_split_render_thread_ = nullptr;
+  uint32_t perf_split_render_thread_tid_ = 0;
+  bool perf_split_tsc_logged_ = false;
+  // Applies a d3d12_perf_split change and emits pending mark and minute lines
+  // (called at every frame close).
+  void PerfSplitFrameClose(bool minute_boundary);
+  rex::perf::PerfSplitInputs PerfSplitCollectInputs();
+  void PerfSplitEmit(const std::string& reason);
+  void PerfSplitShutdown();
+  // Counts the CPU-copy outcome of one read-back resolve on scope exit.
+  struct PerfReadbackOutcome {
+    rex::perf::PerfSplitAccumulator* accumulator = nullptr;
+    bool should_copy = true;
+    bool copied = false;
+    ~PerfReadbackOutcome() {
+      if (accumulator) {
+        accumulator->CountCopy(rex::perf::ClassifyPerfCopy(should_copy, copied));
+      }
+    }
+  };
 
   // d3d12_livery_diag state (command processor thread; untouched while off).
   static constexpr uint32_t kLiveryDiagLinesPerMinute = 64;

@@ -124,6 +124,8 @@ GraphicsPerformanceDiagnosticSnapshot CommandProcessor::GetPerformanceDiagnostic
   snapshot.command_ring_idle_us = performance_command_ring_idle_us_.load(std::memory_order_relaxed);
   snapshot.command_wait_reg_mem_us =
       performance_command_wait_reg_mem_us_.load(std::memory_order_relaxed);
+  snapshot.command_wait_reg_mem_memory_us =
+      performance_command_wait_reg_mem_memory_us_.load(std::memory_order_relaxed);
   snapshot.command_primary_buffer_count =
       performance_command_primary_buffer_count_.load(std::memory_order_relaxed);
   snapshot.command_primary_buffer_us =
@@ -1204,11 +1206,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   std::chrono::steady_clock::time_point wait_begin;
   const auto record_wait = [&]() {
     if (wait_started) {
-      performance_command_wait_reg_mem_us_.fetch_add(
+      const auto waited_us =
           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - wait_begin)
-                                    .count()),
-          std::memory_order_relaxed);
+                                    .count());
+      performance_command_wait_reg_mem_us_.fetch_add(waited_us, std::memory_order_relaxed);
+      if (is_memory) {
+        performance_command_wait_reg_mem_memory_us_.fetch_add(waited_us, std::memory_order_relaxed);
+      }
     }
   };
   bool matched = false;

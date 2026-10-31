@@ -23,6 +23,7 @@ add_executable(unit_tests
     core/fiber_test.cpp
     core/filesystem_test.cpp
     core/frame_audit_test.cpp
+    core/perf_split_test.cpp
     core/graphics_performance_diagnostic_test.cpp
     graphics/primitive_processor_cache_test.cpp
     graphics/descriptor_binding_snapshot_test.cpp

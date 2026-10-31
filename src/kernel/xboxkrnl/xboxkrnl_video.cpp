@@ -25,11 +25,13 @@
 #include <rex/kernel/xboxkrnl/rtl.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/perf/perf_split.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
 
@@ -445,6 +447,12 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
+  // M10-001: the guest render thread is the thread that calls VdSwap.
+  {
+    rex::system::XThread* swap_thread = rex::system::XThread::GetCurrentThread();
+    rex::perf::NotePerfSplitRenderThread(swap_thread ? swap_thread->handle() : 0);
+  }
+
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);

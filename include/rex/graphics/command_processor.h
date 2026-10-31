@@ -103,6 +103,9 @@ struct GraphicsPerformanceDiagnosticSnapshot {
   // Completed command-thread wait episodes, including yield/sleep time.
   uint64_t command_ring_idle_us = 0;
   uint64_t command_wait_reg_mem_us = 0;
+  // Memory-poll episodes (the rest of command_wait_reg_mem_us polls a
+  // register, such as a vblank wait).
+  uint64_t command_wait_reg_mem_memory_us = 0;
   // Completed inclusive command scopes, not CPU execution time. Primary-buffer
   // time includes its indirect buffers, packet handlers and end-of-buffer
   // submission, but indirect buffers are not added to the primary total again.
@@ -402,6 +405,8 @@ class CommandProcessor {
 
   std::atomic<uint64_t> performance_command_ring_idle_us_{0};
   std::atomic<uint64_t> performance_command_wait_reg_mem_us_{0};
+  // M10-001: the memory-poll share of performance_command_wait_reg_mem_us_.
+  std::atomic<uint64_t> performance_command_wait_reg_mem_memory_us_{0};
   std::atomic<uint64_t> performance_command_primary_buffer_count_{0};
   std::atomic<uint64_t> performance_command_primary_buffer_us_{0};
   std::atomic<uint64_t> performance_command_draw_packet_count_{0};

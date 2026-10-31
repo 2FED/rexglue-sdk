@@ -32,6 +32,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/thread.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
@@ -69,6 +70,13 @@ REXCVAR_DEFINE_BOOL(d3d12_livery_diag, false, "GPU/D3D12",
                     "every read-back resolve (MCLA_LIVERY_DIAG lines, rate-limited, no guest "
                     "memory contents). Diagnostic for render-to-texture content that is read "
                     "back by the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(d3d12_perf_split, 0, "GPU/D3D12",
+                     "M10-001 command-processor cost split: 0 off, 1 phase timing on one "
+                     "draw in 16, 2 on every draw. Logs one MCLA_PERF_SPLIT v=1 line per "
+                     "minute and per F10 mark")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
@@ -1713,6 +1721,7 @@ void D3D12CommandProcessor::EmitRenderAuditSummary(const char* phase) {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  PerfSplitShutdown();
   AwaitAllQueueOperationsCompletion();
   for (uint32_t slot = 0; slot < kQueueFrames; ++slot) {
     ConsumePerformanceTimestamp(slot);
@@ -1992,6 +2001,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  rex::perf::ScopedPerfRegion perf_present(perf_split_active_, rex::perf::PerfRegion::kPresent);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2634,6 +2644,140 @@ std::string D3D12CommandProcessor::LiveryDiagMinuteReport() {
   return report;
 }
 
+namespace {
+// GetThreadTimes in 100 ns units; false when the handle is null or the call
+// fails.
+bool PerfSplitThreadTimes(HANDLE thread, uint64_t& user_100ns, uint64_t& kernel_100ns) {
+  if (!thread) {
+    return false;
+  }
+  FILETIME creation{}, exit{}, kernel{}, user{};
+  if (!GetThreadTimes(thread, &creation, &exit, &kernel, &user)) {
+    return false;
+  }
+  user_100ns = (uint64_t(user.dwHighDateTime) << 32) | user.dwLowDateTime;
+  kernel_100ns = (uint64_t(kernel.dwHighDateTime) << 32) | kernel.dwLowDateTime;
+  return true;
+}
+}  // namespace
+
+rex::perf::PerfSplitInputs D3D12CommandProcessor::PerfSplitCollectInputs() {
+  rex::perf::PerfSplitInputs in;
+  in.steady_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count());
+  in.tsc = rex::perf::ReadTsc();
+  in.counters = perf_split_.counters;
+  PerfSplitThreadTimes(GetCurrentThread(), in.cp_user_100ns, in.cp_kernel_100ns);
+  PerfSplitThreadTimes(static_cast<HANDLE>(deferred_command_list_.WorkerNativeHandle()),
+                       in.replay_user_100ns, in.replay_kernel_100ns);
+  in.replay_us = DeferredCommandList::TotalReplayMicroseconds();
+
+  const uint32_t render_tid = rex::perf::PerfSplitRenderThreadId();
+  if (render_tid != perf_split_render_thread_tid_) {
+    if (perf_split_render_thread_) {
+      CloseHandle(static_cast<HANDLE>(perf_split_render_thread_));
+      perf_split_render_thread_ = nullptr;
+    }
+    perf_split_render_thread_tid_ = render_tid;
+    if (render_tid) {
+      perf_split_render_thread_ = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, render_tid);
+    }
+  }
+  in.render_tid = render_tid;
+  in.render_handle = rex::perf::PerfSplitRenderGuestHandle();
+  in.render_times_valid = PerfSplitThreadTimes(static_cast<HANDLE>(perf_split_render_thread_),
+                                               in.render_user_100ns, in.render_kernel_100ns);
+  in.render_wait_ticks = rex::perf::RenderSerialWaitTicksTotal();
+  in.render_poll_ticks = rex::perf::RenderSerialPollTicksTotal();
+
+  const GraphicsPerformanceDiagnosticSnapshot snapshot =
+      CommandProcessor::GetPerformanceDiagnosticSnapshot();
+  in.ring_idle_us = snapshot.command_ring_idle_us;
+  in.wrm_total_us = snapshot.command_wait_reg_mem_us;
+  in.wrm_memory_us = snapshot.command_wait_reg_mem_memory_us;
+  in.draw_packet_us = snapshot.command_draw_packet_us;
+  in.watch_arm_us = snapshot.memory_watch_arm_us;
+  in.watch_disarm_us = snapshot.memory_watch_disarm_us;
+  in.write_fault_us = snapshot.memory_non_mmio_write_fault_us;
+  if (submission_timestamp_frequency_) {
+    in.gpu_busy_us = perf_gpu_busy_ticks_total_ * 1000000 / submission_timestamp_frequency_;
+  }
+  in.gpu_submissions = perf_gpu_busy_submissions_total_;
+  return in;
+}
+
+void D3D12CommandProcessor::PerfSplitEmit(const std::string& reason) {
+  // Timed into the next window (emit_ms), nested in the submission region.
+  rex::perf::ScopedPerfRegion perf_emit(perf_split_active_, rex::perf::PerfRegion::kEmit);
+  const rex::perf::PerfSplitInputs current = PerfSplitCollectInputs();
+  rex::perf::PerfSplitWindow window =
+      rex::perf::ComputePerfSplitWindow(perf_split_previous_, current, perf_split_mode_);
+  window.seq = ++perf_split_seq_;
+  window.reason = reason;
+  window.sample_div = perf_split_mode_ >= 2 ? 1 : rex::perf::kPerfSplitSampleDivisor;
+  REXGPU_INFO("{}", rex::perf::FormatPerfSplitLine(window));
+  rex::perf::PublishPerfSplitSnapshot(window);
+  perf_split_previous_ = current;
+}
+
+void D3D12CommandProcessor::PerfSplitFrameClose(bool minute_boundary) {
+  const uint32_t mode = rex::perf::NormalizePerfSplitMode(REXCVAR_GET(d3d12_perf_split));
+  if (mode != perf_split_mode_) {
+    if (perf_split_mode_) {
+      // Close the window measured in the old mode.
+      ++perf_split_.counters.frames;
+      PerfSplitEmit(mode ? "mode" : "off");
+    }
+    if (mode && !perf_split_tsc_logged_) {
+      perf_split_tsc_logged_ = true;
+      REXGPU_INFO("MCLA perf split: invariant TSC {}",
+                  rex::perf::HasInvariantTsc() ? "yes" : "no (times are approximate)");
+    }
+    REXGPU_INFO("MCLA perf split: mode {} -> {} (1 = one draw in {}, 2 = every draw)",
+                perf_split_mode_, mode, rex::perf::kPerfSplitSampleDivisor);
+    perf_split_mode_ = mode;
+    perf_split_.mode = mode;
+    perf_split_active_ = mode ? &perf_split_ : nullptr;
+    shared_memory_->SetPerfSplitAccumulator(perf_split_active_,
+                                            rex::thread::current_thread_system_id());
+    rex::perf::SetPerfSplitActiveMode(mode);
+    if (mode) {
+      // The first window starts now.
+      perf_split_previous_ = PerfSplitCollectInputs();
+    }
+    return;
+  }
+  if (!mode) {
+    return;
+  }
+  ++perf_split_.counters.frames;
+  std::string mark;
+  if (rex::perf::TakePerfSplitMark(mark)) {
+    PerfSplitEmit(mark);
+  }
+  if (minute_boundary) {
+    PerfSplitEmit("minute");
+  }
+}
+
+void D3D12CommandProcessor::PerfSplitShutdown() {
+  if (perf_split_mode_) {
+    PerfSplitEmit("exit");
+    perf_split_mode_ = 0;
+    perf_split_active_ = nullptr;
+    if (shared_memory_) {
+      shared_memory_->SetPerfSplitAccumulator(nullptr, 0);
+    }
+    rex::perf::SetPerfSplitActiveMode(0);
+  }
+  if (perf_split_render_thread_) {
+    CloseHandle(static_cast<HANDLE>(perf_split_render_thread_));
+    perf_split_render_thread_ = nullptr;
+    perf_split_render_thread_tid_ = 0;
+  }
+}
+
 bool D3D12CommandProcessor::WaitForPendingPipeline(void* pipeline_handle) {
   PendingWaitMode mode = SelectPendingWaitMode(async_pipeline_wait_episode_.enabled(),
                                                async_pipeline_wait_always_.enabled());
@@ -2655,8 +2799,10 @@ bool D3D12CommandProcessor::WaitForPendingPipeline(void* pipeline_handle) {
     return false;
   }
   uint64_t elapsed_ms = 0;
+  rex::perf::ScopedPerfRegion perf_wait(perf_split_active_, rex::perf::PerfRegion::kPipelineWait);
   PendingWaitResult result =
       pipeline_cache_->AwaitPipeline(pipeline_handle, timeout_ms, &elapsed_ms);
+  perf_wait.End();
   bool created = pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) != nullptr;
   bool log_slow = window ? async_pipeline_wait_episode_.Record(elapsed_ms, result, created)
                          : async_pipeline_wait_always_.Record(elapsed_ms, result, created);
@@ -2697,6 +2843,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Special copy handling.
     return IssueCopy();
   }
+
+  // d3d12_perf_split: closes the open phase and counts the exit on return.
+  rex::perf::PerfDrawChain perf_chain(perf_split_active_);
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -2744,12 +2893,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!BeginSubmission(true)) {
     return false;
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kSetup);
 
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
     return false;
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kPrimitive);
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
     return true;
@@ -2782,6 +2933,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kRenderTargets);
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -2842,14 +2994,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                    PipelineCache::PipelineAuditStatus::kFailed,
                                normalized_color_mask, normalized_depth_control);
     }
+    perf_chain.SetExit(rex::perf::PerfDrawExit::kPipelineSkip);
     return true;
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kPipeline);
 
   // Update the textures - this may bind pipelines.
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  perf_chain.Mark(rex::perf::PerfPhase::kTextures);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2915,6 +3070,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
     return false;
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kBindings);
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
@@ -2994,6 +3150,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return false;
     }
   }
+  perf_chain.Mark(rex::perf::PerfPhase::kVertexRanges);
 
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -3257,6 +3414,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  perf_chain.Mark(rex::perf::PerfPhase::kRecord);
+  perf_chain.SetExit(rex::perf::PerfDrawExit::kIssued);
   return true;
 }
 
@@ -3424,12 +3583,14 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  rex::perf::ScopedPerfRegion perf_copy(perf_split_active_, rex::perf::PerfRegion::kCopy);
   if (!BeginSubmission(true)) {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
+    rex::perf::ScopedPerfRegion perf_resolve(perf_split_active_, rex::perf::PerfRegion::kResolve);
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
   }
@@ -3438,9 +3599,12 @@ bool D3D12CommandProcessor::IssueCopy() {
 
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
-  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
-                                     written_length)) {
-    return false;
+  {
+    rex::perf::ScopedPerfRegion perf_resolve(perf_split_active_, rex::perf::PerfRegion::kResolve);
+    if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
+                                       written_length)) {
+      return false;
+    }
   }
 
   if (!written_length) {
@@ -3452,6 +3616,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+  // d3d12_perf_split: the copy outcome is counted on every exit below, and
+  // the read-back setup and GPU copy recording are timed until the wait.
+  PerfReadbackOutcome perf_outcome;
+  perf_outcome.accumulator = perf_split_active_;
+  rex::perf::ScopedPerfRegion perf_readback_gpu(perf_split_active_,
+                                                rex::perf::PerfRegion::kReadbackGpu);
   // d3d12_livery_diag: reported when this scope ends, on every exit below.
   LiveryResolveDiagScope diag;
   if (LiveryDiagEnabled()) {
@@ -3644,15 +3814,19 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     rb.written_size[write_index] = written_length;
   }
 
+  perf_readback_gpu.End();
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
-    diag.reason = "await_failed";
-    return true;
+  } else {
+    rex::perf::ScopedPerfRegion perf_wait(perf_split_active_, rex::perf::PerfRegion::kReadbackWait);
+    if (!AwaitAllQueueOperationsCompletion()) {
+      diag.reason = "await_failed";
+      return true;
+    }
   }
 
   bool is_cache_miss = false;
@@ -3660,6 +3834,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                            !rb.mapped_data[read_index])) {
     is_cache_miss = true;
     read_index = write_index;
+    rex::perf::ScopedPerfRegion perf_wait(perf_split_active_, rex::perf::PerfRegion::kReadbackWait);
     if (!AwaitAllQueueOperationsCompletion()) {
       diag.reason = "await_failed";
       return true;
@@ -3673,6 +3848,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       rb.resolves_since_copy = 0;
     }
   }
+  perf_outcome.should_copy = should_copy;
   if (diag.processor) {
     diag.should_copy = should_copy;
     diag.cache_miss = is_cache_miss;
@@ -3695,7 +3871,15 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
     if (destination) {
-      std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      {
+        rex::perf::ScopedPerfRegion perf_memcpy(perf_split_active_,
+                                                rex::perf::PerfRegion::kReadbackMemcpy);
+        std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+      }
+      if (perf_split_active_) {
+        perf_split_active_->counters.readback_bytes += written_length;
+      }
+      perf_outcome.copied = true;
       diag.copied = true;
     } else {
       diag.reason = "no_destination";
@@ -3722,7 +3906,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
+        {
+          rex::perf::ScopedPerfRegion perf_fence(perf_split_active_,
+                                                 rex::perf::PerfRegion::kFenceWait);
+          WaitForSingleObject(fence_completion_event_, INFINITE);
+        }
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3741,7 +3929,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
+      {
+        rex::perf::ScopedPerfRegion perf_fence(perf_split_active_,
+                                               rex::perf::PerfRegion::kFenceWait);
+        WaitForSingleObject(fence_completion_event_, INFINITE);
+      }
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -4037,6 +4229,7 @@ bool D3D12CommandProcessor::EnsureWritableCommandAllocator() {
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  rex::perf::ScopedPerfRegion perf_submit(perf_split_active_, rex::perf::PerfRegion::kSubmit);
 
   // Make sure there is a command allocator to write commands to.
   // Try to submit later if this fails. Completely dropping the submission is
@@ -4079,7 +4272,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (streaming_submission_) {
       // The command list was reset with this allocator in BeginSubmission, and
       // the allocator stays at the head of the writable list until here.
-      deferred_command_list_.FinishStreaming();
+      {
+        rex::perf::ScopedPerfRegion perf_finish(perf_split_active_,
+                                                rex::perf::PerfRegion::kStreamFinishWait);
+        deferred_command_list_.FinishStreaming();
+      }
       streaming_submission_ = false;
     } else {
       ID3D12CommandAllocator* command_allocator =
@@ -4108,7 +4305,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    {
+      rex::perf::ScopedPerfRegion perf_execute(perf_split_active_, rex::perf::PerfRegion::kExecute);
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -4135,6 +4335,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (async_pipeline_wait_always_.enabled()) {
       ObserveAlwaysPipelineWait();
     }
+    bool pacing_minute_reported = false;
     {
       // Host frame pacing, reported once a minute (command processor thread).
       static std::vector<uint32_t> frame_intervals_us;
@@ -4155,6 +4356,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       last_frame_end = now;
       if (now >= next_pacing_report && !frame_intervals_us.empty()) {
         next_pacing_report = now + std::chrono::seconds(60);
+        pacing_minute_reported = true;
         std::vector<uint32_t> sorted = frame_intervals_us;
         std::sort(sorted.begin(), sorted.end());
         auto pct = [&](double p) { return sorted[size_t(p * double(sorted.size() - 1))]; };
@@ -4200,6 +4402,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
       }
     }
+    // d3d12_perf_split: on the pacing minute boundary, and at F10 marks.
+    PerfSplitFrameClose(pacing_minute_reported);
     if (performance_timestamp_frame_active_) {
       const uint64_t cpu_us =
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -4333,6 +4537,8 @@ void D3D12CommandProcessor::CollectSubmissionTimestamps() {
     if (end > begin) {
       gpu_busy_ticks_accumulated_ += end - begin;
       ++gpu_busy_submissions_accumulated_;
+      perf_gpu_busy_ticks_total_ += end - begin;
+      ++perf_gpu_busy_submissions_total_;
     }
   }
 }
