@@ -3583,6 +3583,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
+      SharedMemory::ScopedRequestSource census_source(*shared_memory_,
+                                                      SharedMemory::RequestSource::kVertex);
       if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
@@ -3606,6 +3608,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (memexport_used_pixel) {
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
+  SharedMemory::ScopedRequestSource memexport_census_source(
+      *shared_memory_, SharedMemory::RequestSource::kMemexport);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
                                       memexport_range.size_bytes)) {
@@ -5018,6 +5022,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         // M10-002 step 0: read-back counters of the minute (always on).
         REXGPU_INFO("{}", ReadbackCountersReport("minute", "minute"));
         readback_counters_ = {};
+        // M10 watch census (memory_watch_census).
+        if (shared_memory_) {
+          const std::string watch =
+              shared_memory_->WatchCensusReport("minute", "minute", frame_current_, true);
+          if (!watch.empty()) {
+            REXGPU_INFO("MCLA_WATCH v=1 {}", watch);
+          }
+        }
         frame_intervals_us.clear();
         if (!frame_draws.empty()) {
           std::sort(frame_draws.begin(), frame_draws.end());
@@ -5041,6 +5053,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     // d3d12_perf_split: on the pacing minute boundary, and at F10 marks.
     PerfSplitFrameClose(pacing_minute_reported);
+    // M10 watch census: per-block fault history of the closed frame.
+    if (shared_memory_) {
+      shared_memory_->WatchCensusFrameEnd();
+    }
     // KI-047 diag v3: F10 writes the flight recorder and the read-back sync
     // counters of the current minute so far.
     {
@@ -5050,6 +5066,18 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         REXGPU_INFO("{}", WaitRegMemReport("mark", flight_reason, frame_current_, false));
         // M10-002 step 0: the current minute's read-back counters so far.
         REXGPU_INFO("{}", ReadbackCountersReport("mark", flight_reason.c_str()));
+        // M10 watch census: the current minute so far, and the probes.
+        if (shared_memory_) {
+          const std::string watch =
+              shared_memory_->WatchCensusReport("mark", flight_reason, frame_current_, false);
+          if (!watch.empty()) {
+            REXGPU_INFO("MCLA_WATCH v=1 {}", watch);
+            if (REXCVAR_GET(memory_watch_probes)) {
+              REXGPU_INFO("MCLA_WATCH v=1 kind=probe reason={} frame={} {}", flight_reason,
+                          frame_current_, shared_memory_->WatchCensusProbes());
+            }
+          }
+        }
         if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
           REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=mark reason={} {}", flight_reason,
                       ReadbackSyncMinuteReport());

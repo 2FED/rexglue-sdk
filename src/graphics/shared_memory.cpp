@@ -26,7 +26,21 @@
 
 #include <rex/logging.h>
 
+#include <fmt/format.h>
+
+REXCVAR_DEFINE_INT32(shared_memory_upload_ahead_pages, 0, "GPU",
+                     "M10 step 2 upload-ahead: when a request uploads an invalid run, also "
+                     "upload (and watch) the contiguous invalid, CPU-owned, committed "
+                     "guest-writable pages around it inside the same 256 KiB block, up to this "
+                     "many pages in the run. 0 = off; only 16 and 64 are accepted")
+    .validator([](std::string_view value) {
+      return value == "0" || value == "16" || value == "64";
+    })
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
+
+namespace wc = rex::memory::watch_census;
 
 namespace {
 // Write-tracking statistics, reported once a minute. All members are only
@@ -156,6 +170,11 @@ void SharedMemory::InitializeCommon() {
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
   dirty_blocks_.store(0, std::memory_order_relaxed);
 
+  census_.history.assign(num_system_page_flags_, 0);
+  census_.faulted.assign((num_system_page_flags_ + 63) / 64, 0);
+  census_.shadow[0].assign(num_system_page_flags_, 0);
+  census_.shadow[1].assign(num_system_page_flags_, 0);
+
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
 }
@@ -237,6 +256,7 @@ void SharedMemory::InvalidateAllPages() {
   // Force a refresh on the next frame-end sync.
   dirty_blocks_.store(UINT32_MAX, std::memory_order_relaxed);
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
+  ClearCensusShadowsLocked();
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -275,6 +295,11 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
   staging_valid_flags_.store(old_active, std::memory_order_release);
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+  {
+    // Valid is now GPU-written only: no CPU upload stays in the step 2 shadow.
+    auto global_lock = global_critical_region_.Acquire();
+    ClearCensusShadowsLocked();
+  }
 }
 
 void SharedMemory::ClearCache() {
@@ -462,10 +487,18 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_page_last = last >> page_size_log2_;
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
+  // M10 watch census: attribution of this range's arm calls, and the step 2
+  // shadow (whether upload-ahead would already have uploaded this range).
+  const bool census = CensusCounting();
+  bool shadow_covered[2] = {false, false};
 
   {
     auto global_lock = global_critical_region_.Acquire();
     uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_relaxed);
+    if (census && !written_by_gpu &&
+        !wc::SanitizeUploadAheadPages(REXCVAR_GET(shared_memory_upload_ahead_pages))) {
+      ShadowUploadAheadLocked(valid_page_first, valid_page_last, valid_flags, shadow_covered);
+    }
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -491,11 +524,130 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
                           kBufferSize >> page_size_log2_, page_size_log2_);
   }
 
+  memory::WatchArmResult arm;
   if (memory_invalidation_callback_handle_) {
     memory().EnablePhysicalMemoryAccessCallbacks(
         valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false,
+        census ? &arm : nullptr);
   }
+  if (census) {
+    const uint32_t source = uint32_t(written_by_gpu ? RequestSource::kGpuWritten : request_source_);
+    ++census_.valid_calls[source];
+    census_.arm_calls[source] += arm.calls;
+    census_.arm_ticks[source] += arm.ticks;
+    census_.class_arm_calls[CensusBlockClass(valid_page_first)] += arm.calls;
+    for (uint32_t c = 0; c < 2; ++c) {
+      if (shadow_covered[c]) {
+        census_.shadow_saved_arms[c] += arm.calls;
+      }
+    }
+  }
+}
+
+uint32_t SharedMemory::CensusBlockClass(uint32_t page) const {
+  const uint32_t block = page >> 6;
+  return block < census_.history.size() ? wc::HotnessClass(census_.history[block])
+                                        : wc::kHotnessClassCount - 1;
+}
+
+void SharedMemory::ClearCensusShadowsLocked() {
+  for (auto& shadow : census_.shadow) {
+    std::fill(shadow.begin(), shadow.end(), uint64_t(0));
+  }
+}
+
+void SharedMemory::ShadowUploadAheadLocked(uint32_t page_first, uint32_t page_last,
+                                           const uint64_t* valid_flags, bool covered[2]) {
+  if (census_.shadow[0].size() != num_system_page_flags_ || page_size_log2_ != 12) {
+    return;
+  }
+  const uint32_t page_count = page_last - page_first + 1;
+  const uint32_t block_first = page_first >> 6;
+  const uint32_t block_last = page_last >> 6;
+  // Not yet marked valid: the shadow extension sees the same valid and
+  // GPU-written state the real one would (without the writable-page check).
+  const uint64_t blocked_first = (valid_flags ? valid_flags[block_first] : 0) |
+                                 system_page_flags_valid_and_gpu_written_[block_first];
+  const uint64_t blocked_last = (valid_flags ? valid_flags[block_last] : 0) |
+                                system_page_flags_valid_and_gpu_written_[block_last];
+  static constexpr uint32_t kCaps[2] = {16, 64};
+  for (uint32_t c = 0; c < 2; ++c) {
+    uint64_t* bits = census_.shadow[c].data();
+    if (wc::AllPagesSet(bits, page_first, page_last)) {
+      covered[c] = true;
+      ++census_.shadow_saved_uploads[c];
+      census_.shadow_saved_pages[c] += page_count;
+      continue;
+    }
+    const wc::PageRun run = wc::ExtendUploadRun(page_first, page_last, blocked_first, blocked_last,
+                                                0, (kBufferSize >> page_size_log2_) - 1, kCaps[c]);
+    wc::SetPages(bits, run.first, run.last);
+    census_.shadow_ext_pages[c] += run.count() - page_count;
+  }
+}
+
+void SharedMemory::ExtendUploadRangesLocked(uint32_t ahead_pages, const uint64_t* valid_flags) {
+  // Blocks are 64 system pages; the canonical physical heap has 4 KiB pages.
+  if (page_size_log2_ != 12 || upload_ranges_.empty()) {
+    return;
+  }
+  const uint32_t total_pages = kBufferSize >> page_size_log2_;
+  const size_t count = upload_ranges_.size();
+  for (size_t i = 0; i < count; ++i) {
+    std::pair<uint32_t, uint32_t>& range = upload_ranges_[i];
+    if (range.second >= ahead_pages) {
+      continue;
+    }
+    const uint32_t page_first = range.first;
+    const uint32_t page_last = range.first + range.second - 1;
+    const uint32_t min_page =
+        i ? upload_ranges_[i - 1].first + upload_ranges_[i - 1].second : uint32_t(0);
+    const uint32_t max_page = i + 1 < count ? upload_ranges_[i + 1].first - 1 : total_pages - 1;
+    // A page may be added only when it is invalid, not GPU-written and
+    // committed guest-writable in the physical heap (so it is watched by
+    // the arm). Its state is read under the heap try-lock; on a miss the run
+    // is uploaded exactly as requested.
+    uint64_t blocked[2] = {};
+    const uint32_t blocks[2] = {page_first >> 6, page_last >> 6};
+    bool known = true;
+    for (uint32_t b = 0; b < 2 && known; ++b) {
+      if (b == 1 && blocks[1] == blocks[0]) {
+        blocked[1] = blocked[0];
+        break;
+      }
+      uint64_t writable = 0;
+      if (!memory().TryQueryPhysicalWritablePages(blocks[b] << (6 + 12), 64, &writable)) {
+        known = false;
+        break;
+      }
+      blocked[b] = (valid_flags ? valid_flags[blocks[b]] : 0) |
+                   system_page_flags_valid_and_gpu_written_[blocks[b]] | ~writable;
+    }
+    if (!known) {
+      ++census_.ahead_lock_misses;
+      continue;
+    }
+    const wc::PageRun run = wc::ExtendUploadRun(page_first, page_last, blocked[0], blocked[1],
+                                                min_page, max_page, ahead_pages);
+    if (run.first != page_first || run.last != page_last) {
+      ++census_.ahead_extended_runs;
+      census_.ahead_extra_pages += run.count() - range.second;
+      range.first = run.first;
+      range.second = run.count();
+    }
+  }
+  // Coalesce runs that now touch (they never overlap).
+  size_t write = 0;
+  for (size_t i = 1; i < count; ++i) {
+    std::pair<uint32_t, uint32_t>& previous = upload_ranges_[write];
+    if (previous.first + previous.second == upload_ranges_[i].first) {
+      previous.second += upload_ranges_[i].second;
+    } else {
+      upload_ranges_[++write] = upload_ranges_[i];
+    }
+  }
+  upload_ranges_.resize(write + 1);
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
@@ -527,6 +679,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   if (perf_split_ && perf_split_thread_id_ == rex::thread::current_thread_system_id()) {
     ++perf_split_->counters.request_calls;
   }
+  const bool census = CensusCounting();
+  const uint32_t census_source = uint32_t(request_source_);
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
   // Called for every draw and texture request: reuse per-thread storage
@@ -609,6 +763,11 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       }
     }
     if (all_valid) {
+      if (census) {
+        ++census_.requests[census_source];
+        ++census_.fast[census_source];
+        ++census_.class_fast[CensusBlockClass(merged_ranges.front().first >> page_size_log2_)];
+      }
       COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
       COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
                         uint32_t(merged_ranges.size()));
@@ -682,6 +841,22 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
         append_upload_range(range_start, page_last + 1 - range_start);
       }
     }
+    // M10 step 2: upload-ahead inside the 256 KiB block.
+    if (const uint32_t ahead_pages =
+            wc::SanitizeUploadAheadPages(REXCVAR_GET(shared_memory_upload_ahead_pages))) {
+      ExtendUploadRangesLocked(ahead_pages, valid_flags);
+    }
+  }
+  if (census) {
+    ++census_.requests[census_source];
+    ++census_.class_requests[CensusBlockClass(merged_ranges.front().first >> page_size_log2_)];
+    for (const auto& upload_range : upload_ranges_) {
+      const uint32_t upload_class = CensusBlockClass(upload_range.first);
+      ++census_.uploads[census_source];
+      census_.upload_pages[census_source] += upload_range.second;
+      ++census_.class_uploads[upload_class];
+      census_.class_upload_pages[upload_class] += upload_range.second;
+    }
   }
 
   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
@@ -732,6 +907,18 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
+  // M10 watch census: CPU write faults per 256 KiB block (the non-exact
+  // invalidations come from the write-fault path).
+  if (!exact_range && census_enabled_.load(std::memory_order_relaxed) &&
+      (page_first >> 6) < census_.history.size()) {
+    ++census_.cpu_faults;
+    ++census_.class_faults[CensusBlockClass(page_first)];
+    for (uint32_t block = page_first >> 6;
+         block <= (page_last >> 6) && block < census_.history.size(); ++block) {
+      census_.faulted[block >> 6] |= uint64_t(1) << (block & 63);
+    }
+  }
+
   if (!exact_range) {
     const uint32_t widen_pages = InvalidateWidenPages();
     const uint32_t requested_page_first = page_first;
@@ -780,6 +967,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
   dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
 
+  if (census_.shadow[0].size() == num_system_page_flags_) {
+    for (auto& shadow : census_.shadow) {
+      wc::ClearPages(shadow.data(), page_first, page_last);
+    }
+  }
+
   ++g_watch_stats.invalidate_calls;
   g_watch_stats.invalidate_pages += page_last - page_first + 1;
   if (exact_range) {
@@ -790,6 +983,184 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   return std::make_pair(page_first << page_size_log2_, (page_last - page_first + 1)
                                                            << page_size_log2_);
+}
+
+void SharedMemory::WatchCensusFrameEnd() {
+  const uint32_t tid = rex::thread::current_thread_system_id();
+  census_thread_id_ = tid;
+  wc::SetCommandProcessorThread(tid);
+  const bool enabled = wc::Enabled();
+  if (enabled != census_enabled_.load(std::memory_order_relaxed)) {
+    auto global_lock = global_critical_region_.Acquire();
+    if (enabled) {
+      // Start from a clean history and shadow: nothing was tracked while off.
+      std::fill(census_.history.begin(), census_.history.end(), uint8_t(0));
+      std::fill(census_.faulted.begin(), census_.faulted.end(), uint64_t(0));
+      ClearCensusShadowsLocked();
+    }
+    census_enabled_.store(enabled, std::memory_order_relaxed);
+  }
+  if (!enabled) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  if (census_.base_tsc == 0) {
+    // The first window starts with the first counted frame.
+    ResetCensusWindow(true);
+  }
+  census_.active_in_window = true;
+  ++census_.frames;
+  const size_t block_count = census_.history.size();
+  for (size_t block = 0; block < block_count; ++block) {
+    census_.history[block] = wc::AdvanceHistory(
+        census_.history[block], ((census_.faulted[block >> 6] >> (block & 63)) & 1) != 0);
+  }
+  std::fill(census_.faulted.begin(), census_.faulted.end(), uint64_t(0));
+}
+
+void SharedMemory::ResetCensusWindow(bool clear_lock_counters) {
+  WatchCensus& c = census_;
+  for (uint32_t s = 0; s < kRequestSourceCount; ++s) {
+    c.requests[s] = c.fast[s] = c.uploads[s] = c.upload_pages[s] = 0;
+    c.valid_calls[s] = c.arm_calls[s] = c.arm_ticks[s] = 0;
+  }
+  for (uint32_t h = 0; h < wc::kHotnessClassCount; ++h) {
+    c.class_requests[h] = c.class_fast[h] = c.class_uploads[h] = 0;
+    c.class_upload_pages[h] = c.class_arm_calls[h] = 0;
+  }
+  c.frames = 0;
+  c.active_in_window = census_enabled_.load(std::memory_order_relaxed);
+  c.base_tsc = rex::perf::ReadTsc();
+  c.base_time = std::chrono::steady_clock::now();
+  c.memory_base = wc::GetSnapshot();
+  if (clear_lock_counters) {
+    c.cpu_faults = 0;
+    for (uint32_t h = 0; h < wc::kHotnessClassCount; ++h) {
+      c.class_faults[h] = 0;
+    }
+    for (uint32_t k = 0; k < 2; ++k) {
+      c.shadow_saved_uploads[k] = c.shadow_saved_pages[k] = 0;
+      c.shadow_saved_arms[k] = c.shadow_ext_pages[k] = 0;
+    }
+    c.ahead_extended_runs = c.ahead_extra_pages = c.ahead_lock_misses = 0;
+  }
+}
+
+std::string SharedMemory::WatchCensusReport(std::string_view kind, std::string_view reason,
+                                            uint64_t frame, bool reset) {
+  WatchCensus& c = census_;
+  if (c.base_tsc == 0) {
+    // No frame was counted yet.
+    return {};
+  }
+  if (!c.active_in_window && !census_enabled_.load(std::memory_order_relaxed)) {
+    if (reset) {
+      auto global_lock = global_critical_region_.Acquire();
+      ResetCensusWindow(true);
+    }
+    return {};
+  }
+  const uint64_t tsc_delta = rex::perf::ReadTsc() - c.base_tsc;
+  const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - c.base_time)
+                                   .count());
+  const double tsc_mhz = rex::perf::TscMhz(tsc_delta, ns);
+  const auto ms = [&](uint64_t ticks) {
+    return tsc_mhz > 0.0 ? double(ticks) / (tsc_mhz * 1000.0) : 0.0;
+  };
+  const wc::Snapshot memory_window = wc::Difference(wc::GetSnapshot(), c.memory_base);
+
+  std::string out = fmt::format(
+      "kind={} reason={} frame={} frames={} secs={:.1f} tsc_mhz={:.0f} census={} bridge={} "
+      "ahead={} ",
+      kind, reason, frame, c.frames, double(ns) / 1e9, tsc_mhz,
+      census_enabled_.load(std::memory_order_relaxed) ? 1 : 0,
+      REXCVAR_GET(memory_watch_disarm_bridge_safe_gaps) ? 1 : 0,
+      wc::SanitizeUploadAheadPages(REXCVAR_GET(shared_memory_upload_ahead_pages)));
+  out += wc::FormatMemoryFields(memory_window, tsc_mhz);
+
+  static constexpr std::string_view kSourceNames[kRequestSourceCount] = {
+      "other", "vb", "ib", "tex", "resolve", "memexport", "gpuwritten"};
+  for (uint32_t s = 0; s < kRequestSourceCount; ++s) {
+    fmt::format_to(std::back_inserter(out),
+                   " src_{}=req:{},fast:{},up:{},up_kb:{},valid:{},arms:{},arm_ms:{:.1f}",
+                   kSourceNames[s], c.requests[s], c.fast[s], c.uploads[s],
+                   (c.upload_pages[s] << page_size_log2_) >> 10, c.valid_calls[s], c.arm_calls[s],
+                   ms(c.arm_ticks[s]));
+  }
+
+  auto global_lock = global_critical_region_.Acquire();
+  // Blocks by hotness class (faulted in K of the last 8 closed frames), with
+  // texture/range watches and GPU-written pages.
+  uint64_t hot_blocks[wc::kHotnessClassCount] = {};
+  uint64_t hot_tex[wc::kHotnessClassCount] = {};
+  uint64_t hot_gpu[wc::kHotnessClassCount] = {};
+  for (uint32_t block = 0; block < c.history.size(); ++block) {
+    if (!c.history[block]) {
+      continue;
+    }
+    const uint32_t h = wc::HotnessClass(c.history[block]);
+    ++hot_blocks[h];
+    if (block < system_page_flags_valid_and_gpu_written_.size() &&
+        system_page_flags_valid_and_gpu_written_[block]) {
+      ++hot_gpu[h];
+    }
+    const uint32_t page_first = block << 6;
+    const uint32_t page_last = page_first + 63;
+    const uint32_t bucket = (page_first << page_size_log2_) >> kWatchBucketSizeLog2;
+    for (const WatchNode* node = bucket < kWatchBucketCount ? watch_buckets_[bucket] : nullptr;
+         node != nullptr; node = node->bucket_node_next) {
+      if (node->range->page_first <= page_last && node->range->page_last >= page_first) {
+        ++hot_tex[h];
+        break;
+      }
+    }
+  }
+  const auto classes = [&](std::string_view name, const uint64_t* values, uint32_t count) {
+    fmt::format_to(std::back_inserter(out), " {}=", name);
+    for (uint32_t h = 0; h < count; ++h) {
+      fmt::format_to(std::back_inserter(out), "{}{}:{}", h ? "," : "", wc::kHotnessClassNames[h],
+                     values[h]);
+    }
+  };
+  classes("hot_blocks", hot_blocks, wc::kHotnessClassCount - 1);
+  classes("hot_blocks_tex", hot_tex, wc::kHotnessClassCount - 1);
+  classes("hot_blocks_gpu", hot_gpu, wc::kHotnessClassCount - 1);
+  fmt::format_to(std::back_inserter(out), " cpu_faults={}", c.cpu_faults);
+  classes("by_hot_faults", c.class_faults, wc::kHotnessClassCount);
+  classes("by_hot_requests", c.class_requests, wc::kHotnessClassCount);
+  classes("by_hot_fast", c.class_fast, wc::kHotnessClassCount);
+  classes("by_hot_uploads", c.class_uploads, wc::kHotnessClassCount);
+  classes("by_hot_upload_pages", c.class_upload_pages, wc::kHotnessClassCount);
+  classes("by_hot_arms", c.class_arm_calls, wc::kHotnessClassCount);
+  static constexpr uint32_t kCaps[2] = {16, 64};
+  for (uint32_t k = 0; k < 2; ++k) {
+    fmt::format_to(std::back_inserter(out),
+                   " ahead_shadow{}=saved_uploads:{},saved_pages:{},saved_arms:{},ext_pages:{}",
+                   kCaps[k], c.shadow_saved_uploads[k], c.shadow_saved_pages[k],
+                   c.shadow_saved_arms[k], c.shadow_ext_pages[k]);
+  }
+  fmt::format_to(std::back_inserter(out),
+                 " ahead_extended_runs={} ahead_extra_pages={} ahead_lock_misses={}",
+                 c.ahead_extended_runs, c.ahead_extra_pages, c.ahead_lock_misses);
+  if (reset) {
+    ResetCensusWindow(true);
+  }
+  return out;
+}
+
+std::string SharedMemory::WatchCensusProbes() {
+  const uint64_t tsc_begin = rex::perf::ReadTsc();
+  const auto time_begin = std::chrono::steady_clock::now();
+  // Calibrate the TSC over about 20 ms before the timed probes.
+  while (std::chrono::steady_clock::now() - time_begin < std::chrono::milliseconds(20)) {}
+  const double tsc_mhz =
+      rex::perf::TscMhz(rex::perf::ReadTsc() - tsc_begin,
+                        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - time_begin)
+                                     .count()));
+  return fmt::format("tsc_mhz={:.0f} {}", tsc_mhz,
+                     wc::RunProbes(memory().WatchProbeSectionPage(), tsc_mhz));
 }
 
 void SharedMemory::PrepareForTraceDownload() {

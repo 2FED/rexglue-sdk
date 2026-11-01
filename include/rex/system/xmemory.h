@@ -123,6 +123,14 @@ union PageEntry {
   };
 };
 
+// Protection calls made by one arm walk (EnableAccessCallbacks), for the M10
+// watch census attribution by request source. ticks are rdtsc ticks of the
+// protection calls only.
+struct WatchArmResult {
+  uint32_t calls = 0;
+  uint64_t ticks = 0;
+};
+
 // Heap abstraction for page-based allocation.
 class BaseHeap {
  public:
@@ -216,6 +224,12 @@ class BaseHeap {
   // range.
   rex::memory::PageAccess QueryRangeAccess(uint32_t low_address, uint32_t high_address);
 
+  // M10 upload-ahead: non-blocking. Sets bit i of *out_mask when heap page
+  // (address >> page size) + i, i < page_count <= 64, is committed and its
+  // current protection is read-write. Returns false without reading anything
+  // when the heap mutex is contended or the range is outside the heap.
+  bool TryQueryWritablePages(uint32_t address, uint32_t page_count, uint64_t* out_mask);
+
   bool Save(stream::ByteStream* stream);
   bool Restore(stream::ByteStream* stream);
 
@@ -283,7 +297,8 @@ class PhysicalHeap : public BaseHeap {
                uint32_t* old_protect = nullptr) override;
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
-                             bool enable_invalidation_notifications, bool enable_data_providers);
+                             bool enable_invalidation_notifications, bool enable_data_providers,
+                             WatchArmResult* result = nullptr);
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
@@ -462,7 +477,20 @@ class Memory {
   // snapped to system page boundaries.
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
-                                           bool enable_data_providers);
+                                           bool enable_data_providers,
+                                           WatchArmResult* result = nullptr);
+
+  // M10 upload-ahead: committed guest-writable pages of the canonical physical
+  // heap (bit i = 4 KiB physical page (physical_address >> 12) + i, up to 64
+  // pages). Non-blocking; false on heap mutex contention.
+  bool TryQueryPhysicalWritablePages(uint32_t physical_address, uint32_t page_count,
+                                     uint64_t* out_mask);
+
+  // M10 watch probes: a host page of the guest physical section view that the
+  // guest can never use (the reserved last 64 KiB of physical memory).
+  void* WatchProbeSectionPage() const {
+    return physical_membase_ ? physical_membase_ + 0x1FFFF000 : nullptr;
+  }
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
@@ -533,7 +561,8 @@ class Memory {
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
 
-  bool ProtectWatchRange(void* host_address, size_t length, rex::memory::PageAccess access);
+  bool ProtectWatchRange(void* host_address, size_t length, rex::memory::PageAccess access,
+                         uint64_t* out_ticks = nullptr);
   std::atomic<uint64_t> watch_arm_calls_{0};
   std::atomic<uint64_t> watch_arm_us_{0};
   std::atomic<uint64_t> watch_arm_lock_wait_us_{0};

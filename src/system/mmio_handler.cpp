@@ -20,6 +20,7 @@
 #include <rex/memory.h>
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
+#include <rex/system/watch_census.h>
 #include <rex/types.h>
 
 using namespace rex::arch;
@@ -438,6 +439,14 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
         write_fault_callback_us_.fetch_add(callback_us, std::memory_order_relaxed);
         if (already_cleared) {
           write_fault_already_cleared_count_.fetch_add(1, std::memory_order_relaxed);
+        }
+        // M10 watch census: the same totals by faulting thread class.
+        if (memory::watch_census::Enabled()) {
+          memory::watch_census::RecordFault(
+              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - fault_begin)
+                                        .count()),
+              query_us, lock_wait_us);
         }
       }
       return handled;

@@ -11,13 +11,18 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <rex/memory.h>
 #include <rex/perf/perf_split.h>
+#include <rex/system/watch_census.h>
+#include <rex/thread.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::graphics {
@@ -37,6 +42,44 @@ class SharedMemory {
 
   static constexpr uint32_t kBufferSizeLog2 = 29;
   static constexpr uint32_t kBufferSize = 1 << kBufferSizeLog2;
+
+  // M10 watch census (memory_watch_census): who asked for the data. Set by
+  // the caller around RequestRange(s) on the command processor thread;
+  // RangeWrittenByGpu is always kGpuWritten.
+  enum class RequestSource : uint8_t {
+    kOther,
+    kVertex,
+    kIndex,
+    kTexture,
+    kResolve,
+    kMemexport,
+    kGpuWritten,
+  };
+  static constexpr uint32_t kRequestSourceCount = 7;
+  class ScopedRequestSource {
+   public:
+    ScopedRequestSource(SharedMemory& shared_memory, RequestSource source)
+        : shared_memory_(shared_memory), previous_(shared_memory.request_source_) {
+      shared_memory.request_source_ = source;
+    }
+    ~ScopedRequestSource() { shared_memory_.request_source_ = previous_; }
+    ScopedRequestSource(const ScopedRequestSource&) = delete;
+    ScopedRequestSource& operator=(const ScopedRequestSource&) = delete;
+
+   private:
+    SharedMemory& shared_memory_;
+    RequestSource previous_;
+  };
+
+  // M10 watch census, command processor thread: advances the per-block
+  // hotness history at each frame end (and follows memory_watch_census).
+  void WatchCensusFrameEnd();
+  // The fields after "MCLA_WATCH v=1 " for a minute (reset = true) or F10 mark
+  // line, or an empty string when the census was off for the whole window.
+  std::string WatchCensusReport(std::string_view kind, std::string_view reason, uint64_t frame,
+                                bool reset);
+  // memory_watch_probes at an F10 mark: the fields of the probe line.
+  std::string WatchCensusProbes();
 
   virtual ~SharedMemory();
   // Call in the implementation-specific ClearCache.
@@ -187,6 +230,59 @@ class SharedMemory {
 
   rex::perf::PerfSplitAccumulator* perf_split_ = nullptr;
   uint32_t perf_split_thread_id_ = 0;
+
+  // M10 watch census and upload-ahead (shared_memory_upload_ahead_pages).
+  RequestSource request_source_ = RequestSource::kOther;
+  std::atomic<bool> census_enabled_{false};
+  uint32_t census_thread_id_ = 0;
+  bool CensusCounting() const {
+    return census_enabled_.load(std::memory_order_relaxed) &&
+           census_thread_id_ == rex::thread::current_thread_system_id();
+  }
+  uint32_t CensusBlockClass(uint32_t page) const;
+  struct WatchCensus {
+    // Command processor thread only.
+    uint64_t requests[kRequestSourceCount] = {};
+    uint64_t fast[kRequestSourceCount] = {};
+    uint64_t uploads[kRequestSourceCount] = {};
+    uint64_t upload_pages[kRequestSourceCount] = {};
+    uint64_t valid_calls[kRequestSourceCount] = {};
+    uint64_t arm_calls[kRequestSourceCount] = {};
+    uint64_t arm_ticks[kRequestSourceCount] = {};
+    uint64_t class_requests[memory::watch_census::kHotnessClassCount] = {};
+    uint64_t class_fast[memory::watch_census::kHotnessClassCount] = {};
+    uint64_t class_uploads[memory::watch_census::kHotnessClassCount] = {};
+    uint64_t class_upload_pages[memory::watch_census::kHotnessClassCount] = {};
+    uint64_t class_arm_calls[memory::watch_census::kHotnessClassCount] = {};
+    uint64_t frames = 0;
+    bool active_in_window = false;
+    uint64_t base_tsc = 0;
+    std::chrono::steady_clock::time_point base_time{};
+    memory::watch_census::Snapshot memory_base{};
+    // Global critical region.
+    uint64_t cpu_faults = 0;
+    uint64_t class_faults[memory::watch_census::kHotnessClassCount] = {};
+    std::vector<uint8_t> history;   // per 256 KiB block
+    std::vector<uint64_t> faulted;  // per block bit, this frame
+    // Step 2 shadow at 16 and 64 pages (upload-ahead off only).
+    std::vector<uint64_t> shadow[2];
+    uint64_t shadow_saved_uploads[2] = {};
+    uint64_t shadow_saved_pages[2] = {};
+    uint64_t shadow_saved_arms[2] = {};
+    uint64_t shadow_ext_pages[2] = {};
+    // Step 2 actual (upload-ahead on).
+    uint64_t ahead_extended_runs = 0;
+    uint64_t ahead_extra_pages = 0;
+    uint64_t ahead_lock_misses = 0;
+  };
+  WatchCensus census_;
+  void ResetCensusWindow(bool clear_lock_counters);
+  void ClearCensusShadowsLocked();
+  // Step 2 under the global lock: extends upload_ranges_ in place.
+  void ExtendUploadRangesLocked(uint32_t ahead_pages, const uint64_t* valid_flags);
+  // Step 2 shadow under the global lock, before the range is marked valid.
+  void ShadowUploadAheadLocked(uint32_t page_first, uint32_t page_last, const uint64_t* valid_flags,
+                               bool covered[2]);
 
   // GPU-written memory downloading for traces. <Start address, length>.
   std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;

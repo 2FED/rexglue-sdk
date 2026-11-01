@@ -5,6 +5,7 @@ set(REXSYSTEM_SOURCES
     achievements.cpp
     kernel_state.cpp
     xmemory.cpp
+    watch_census.cpp
     kernel_module.cpp
     user_module.cpp
     xthread.cpp

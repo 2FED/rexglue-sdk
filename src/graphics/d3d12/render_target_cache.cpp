@@ -1359,6 +1359,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                             resolve_info.copy_dest_base +
                                                             resolve_info.copy_dest_extent_length);
       } else {
+        SharedMemory::ScopedRequestSource census_source(shared_memory,
+                                                        SharedMemory::RequestSource::kResolve);
         copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
                                                          resolve_info.copy_dest_extent_length);
       }
