@@ -28,6 +28,7 @@ add_executable(unit_tests
     graphics/primitive_processor_cache_test.cpp
     graphics/descriptor_binding_snapshot_test.cpp
     graphics/pending_pipeline_wait_test.cpp
+    graphics/storage_creation_threads_test.cpp
     graphics/livery_diag_test.cpp
     graphics/livery_diag2_test.cpp
     graphics/readback_sync_test.cpp

@@ -42,6 +42,7 @@
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/storage_creation_threads.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -563,11 +564,13 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
     // Launch additional creation threads to use all cores to create
     // pipelines faster. Will also be using the main thread, so minus 1.
+    // M10-003: the loop used creation_thread_original_count, so no extra
+    // thread was ever started (and the blocking wait below never ran).
     size_t creation_thread_original_count = creation_threads_.size();
     size_t creation_thread_needed_count =
-        std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
-                 creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_original_count) {
+        StorageCreationThreadCount(pipeline_stored_descriptions.size(), logical_processor_count,
+                                   creation_thread_original_count);
+    while (creation_threads_.size() < creation_thread_needed_count) {
       size_t creation_thread_index = creation_threads_.size();
       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
@@ -686,6 +689,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
       ++pipelines_created;
     }
 
+    const size_t creation_thread_used_count = creation_threads_.size();
     if (!creation_threads_.empty()) {
       CreateQueuedPipelinesOnProcessorThread();
       if (creation_threads_.size() > creation_thread_original_count) {
@@ -700,15 +704,24 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
           rex::thread::Wait(creation_threads_.back().get(), false);
           creation_threads_.pop_back();
         }
-        bool await_creation_completion_event;
         {
           // Cleanup so additional threads can be created later again.
           std::lock_guard<std::mutex> lock(creation_request_lock_);
           creation_threads_shutdown_from_ = SIZE_MAX;
-          // If the invocation is blocking, all the shader storage
-          // initialization is expected to be done before proceeding, to avoid
-          // latency in the command processor after the invocation.
-          await_creation_completion_event = blocking && creation_threads_busy_ != 0;
+        }
+      }
+      // If the invocation is blocking, all the shader storage initialization
+      // is expected to be done before proceeding, to avoid latency in the
+      // command processor after the invocation. M10-003: also wait for the
+      // persistent threads (before, the wait only ran with extra threads, so
+      // the last pipelines could still be in creation when the guest started
+      // and the time below understated the creation).
+      if (!creation_threads_.empty()) {
+        bool await_creation_completion_event;
+        {
+          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          await_creation_completion_event =
+              StorageCreationMustAwait(blocking, creation_threads_busy_);
           if (await_creation_completion_event) {
             creation_completion_event_->Reset();
             creation_completion_set_event_ = true;
@@ -723,10 +736,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
     REXGPU_INFO(
         "Created {} graphics pipelines (not including reading the "
-        "descriptions) from the storage in {} milliseconds",
+        "descriptions) from the storage in {} milliseconds ({} creation threads, {} "
+        "persistent, blocking {})",
         pipelines_created,
         (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
-            rex::chrono::Clock::QueryHostTickFrequency());
+            rex::chrono::Clock::QueryHostTickFrequency(),
+        creation_thread_used_count, creation_thread_original_count, blocking);
     // If any pipeline descriptions were corrupted (or the whole file has excess
     // bytes in the end), truncate to the last valid pipeline description.
     rex::filesystem::TruncateStdioFile(
