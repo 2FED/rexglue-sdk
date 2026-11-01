@@ -306,6 +306,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   // switch changes and one MCLA_READBACK_SYNC v=1 line per minute.
   bool ReadbackSyncEnabled();
   std::string ReadbackSyncMinuteReport();
+  // d3d12_readback_sync_targeted (readback_sync.h): logs a line when the
+  // switch changes and returns it.
+  bool ReadbackSyncTargetedEnabled();
+  std::string ReadbackSyncTargetedReport();
+  // Ends the open submission holding a forced resolve's GPU copy and waits
+  // for exactly its fence value; `wait` gets the timings. Requires an open
+  // submission.
+  ReadbackTargetedResult AwaitReadbackCopySubmission(ReadbackTargetedWait& wait);
+  // Before a draw: executes the open submission early when
+  // ShouldKickReadbackSyncSubmission allows it.
+  void MaybeKickReadbackSyncSubmission();
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -792,6 +803,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool readback_sync_was_enabled_ = false;
   ReadbackSyncScope readback_sync_scope_ = ReadbackSyncScope::kComposite;
   ReadbackSyncCounters readback_sync_minute_;
+  bool readback_sync_targeted_was_enabled_ = false;
+  // Draws recorded into the open submission (reset when one is opened).
+  uint64_t readback_sync_submission_draws_ = 0;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

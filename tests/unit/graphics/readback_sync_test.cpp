@@ -269,6 +269,106 @@ TEST_CASE("Read-back sync counters count once per resolve and once per rule",
   CHECK(c.max_wait_us == 4000);
 }
 
+TEST_CASE("Read-back sync targeted wait covers the copy's own submission",
+          "[graphics][readback-sync][readback-targeted]") {
+  // Only with the switch on and an open submission (the copy is in it).
+  CHECK(ShouldUseReadbackTargetedWait(true, true));
+  CHECK_FALSE(ShouldUseReadbackTargetedWait(true, false));
+  CHECK_FALSE(ShouldUseReadbackTargetedWait(false, true));
+  CHECK_FALSE(ShouldUseReadbackTargetedWait(false, false));
+
+  // The copy was recorded into submission 41 (submission_current_ = 41).
+  // Ending it advanced the index to 42; the fence reached 41.
+  CHECK(ClassifyReadbackTargetedWait(41, 42, 41) == ReadbackTargetedResult::kCompleted);
+  // A later completion also covers it (in-order direct queue).
+  CHECK(ClassifyReadbackTargetedWait(41, 42, 43) == ReadbackTargetedResult::kCompleted);
+  // The fence is still behind the copy: not satisfied, not copied.
+  CHECK(ClassifyReadbackTargetedWait(41, 42, 40) == ReadbackTargetedResult::kFenceFailed);
+  // Ending the submission failed (index unchanged): the full wait decides.
+  CHECK(ClassifyReadbackTargetedWait(41, 41, 40) == ReadbackTargetedResult::kFallbackToFull);
+  CHECK(ClassifyReadbackTargetedWait(41, 41, 41) == ReadbackTargetedResult::kFallbackToFull);
+
+  // Same condition as AwaitAllQueueOperationsCompletion once the copy's
+  // submission is the last one: completed + 1 >= current.
+  for (uint64_t completed = 38; completed <= 43; ++completed) {
+    CHECK(ReadbackTargetedWaitSatisfied(completed, 41) == (completed + 1 >= 42));
+  }
+  CHECK(ReadbackTargetedSubmissionEnded(41, 42));
+  CHECK_FALSE(ReadbackTargetedSubmissionEnded(41, 41));
+}
+
+TEST_CASE("Read-back sync kick only when on, past the draw count and the GPU is idle",
+          "[graphics][readback-sync][readback-targeted]") {
+  ReadbackKickInput in;
+  in.targeted = true;
+  in.sync_enabled = true;
+  in.kick_draws = 512;
+  in.submission_open = true;
+  in.draws_in_submission = 512;
+  in.can_end_immediately = true;
+  in.occlusion_query_active = false;
+  in.submission_completed = 9;
+  in.submission_current = 10;
+  CHECK(ShouldKickReadbackSyncSubmission(in));
+
+  ReadbackKickInput t = in;
+  t.targeted = false;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  t = in;
+  t.sync_enabled = false;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  t = in;
+  t.kick_draws = 0;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  t = in;
+  t.submission_open = false;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  t = in;
+  t.draws_in_submission = 511;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  t.draws_in_submission = 5000;
+  CHECK(ShouldKickReadbackSyncSubmission(t));
+  // Pipelines being created: the primary-buffer-end submission waits too.
+  t = in;
+  t.can_end_immediately = false;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  // Ending a submission ends an active host occlusion query.
+  t = in;
+  t.occlusion_query_active = true;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+  // The GPU still runs submission 9: it has work, no kick.
+  t = in;
+  t.submission_completed = 8;
+  CHECK_FALSE(ShouldKickReadbackSyncSubmission(t));
+}
+
+TEST_CASE("Read-back sync targeted counters", "[graphics][readback-sync][readback-targeted]") {
+  ReadbackSyncCounters c;
+  ReadbackTargetedWait a;
+  a.submit_us = 300;
+  a.fence_us = 2700;
+  a.gpu_busy_at_submit = true;
+  a.backlog_draws = 400;
+  ReadbackTargetedWait b;
+  b.submit_us = 100;
+  b.fence_us = 900;
+  b.backlog_draws = 120;
+  c.CountTargeted(a);
+  c.CountTargeted(b);
+  CHECK(c.targeted_waits == 2);
+  CHECK(c.targeted_wait_us == 4000);
+  CHECK(c.targeted_max_wait_us == 3000);
+  CHECK(c.targeted_submit_us == 400);
+  CHECK(c.targeted_fence_us == 3600);
+  CHECK(c.targeted_gpu_busy == 1);
+  CHECK(c.targeted_backlog_draws == 520);
+  CHECK(c.fallbacks_to_full == 0);
+  CHECK(c.kicks == 0);
+  // The existing fields are untouched by the targeted counts.
+  CHECK(c.forced == 0);
+  CHECK(c.wait_us == 0);
+}
+
 TEST_CASE("Paced line budget: burst, then lines per second", "[graphics][livery-diag2]") {
   PacedLineBudget budget(2, 4);
   int allowed = 0;

@@ -104,6 +104,24 @@ REXCVAR_DEFINE_INT32(d3d12_readback_sync_scope, 0, "GPU/D3D12",
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_readback_sync_targeted, false, "GPU/D3D12",
+                    "M10 KI-047 cost: a resolve forced by d3d12_readback_sync_composite ends "
+                    "the submission holding its GPU copy and waits for exactly that "
+                    "submission's fence (falls back to the full wait when no submission is "
+                    "open or ending it fails); with d3d12_readback_sync_kick_draws > 0 the "
+                    "open submission is also executed early before a draw when the GPU is "
+                    "idle, so a forced wait only executes a short backlog. Adds targeted_* "
+                    "and kick* fields to the MCLA_READBACK_SYNC lines")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(d3d12_readback_sync_kick_draws, 512, "GPU/D3D12",
+                     "With d3d12_readback_sync_targeted and d3d12_readback_sync_composite on: "
+                     "draws in the open submission before it is executed early (only when "
+                     "every earlier submission has completed, no pipeline is being created "
+                     "and no host occlusion query is active); 0 disables the early submission")
+    .range(0, 1000000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_elide_unread, false, "GPU/D3D12",
                     "M10-002 step 1: with readback_resolve some, do not record the GPU copy "
                     "(downscale or shared-memory copy, slot copy and their barriers) of a "
@@ -2919,7 +2937,7 @@ bool D3D12CommandProcessor::ReadbackSyncEnabled() {
 
 std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
   const ReadbackSyncCounters& c = readback_sync_minute_;
-  return fmt::format(
+  std::string line = fmt::format(
       "frame={} enabled={} scope={} mode={} resolves={} misses={} matched={} matched_a={} "
       "matched_b={} matched_c={} forced={} forced_a={} forced_b={} forced_c={} "
       "forced_wait_failed={} wait_ms={:.3f} max_wait_ms={:.3f}",
@@ -2928,6 +2946,88 @@ std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
       c.resolves, c.misses, c.matched, c.matched_rule_a, c.matched_rule_b, c.matched_rule_c,
       c.forced, c.forced_rule_a, c.forced_rule_b, c.forced_rule_c, c.forced_wait_failed,
       double(c.wait_us) / 1000.0, double(c.max_wait_us) / 1000.0);
+  line += ReadbackSyncTargetedReport();
+  return line;
+}
+
+std::string D3D12CommandProcessor::ReadbackSyncTargetedReport() {
+  // d3d12_readback_sync_targeted: appended only while it is on or has counted
+  // in this minute (the line is unchanged otherwise).
+  const ReadbackSyncCounters& c = readback_sync_minute_;
+  if (!readback_sync_targeted_was_enabled_ && !c.targeted_waits && !c.fallbacks_to_full &&
+      !c.kicks) {
+    return std::string();
+  }
+  return fmt::format(
+      " targeted={} kick_draws={} targeted_waits={} targeted_wait_ms={:.3f} "
+      "targeted_max_wait_ms={:.3f} targeted_submit_ms={:.3f} targeted_fence_ms={:.3f} "
+      "targeted_gpu_busy={} targeted_backlog_draws={} fallbacks_to_full={} kicks={} "
+      "kick_ms={:.3f}",
+      int(readback_sync_targeted_was_enabled_), REXCVAR_GET(d3d12_readback_sync_kick_draws),
+      c.targeted_waits, double(c.targeted_wait_us) / 1000.0,
+      double(c.targeted_max_wait_us) / 1000.0, double(c.targeted_submit_us) / 1000.0,
+      double(c.targeted_fence_us) / 1000.0, c.targeted_gpu_busy, c.targeted_backlog_draws,
+      c.fallbacks_to_full, c.kicks, double(c.kick_us) / 1000.0);
+}
+
+bool D3D12CommandProcessor::ReadbackSyncTargetedEnabled() {
+  bool targeted = REXCVAR_GET(d3d12_readback_sync_targeted);
+  if (targeted != readback_sync_targeted_was_enabled_) {
+    readback_sync_targeted_was_enabled_ = targeted;
+    REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind={} frame={} kick_draws={}",
+                targeted ? "targeted_start" : "targeted_stop", frame_current_,
+                REXCVAR_GET(d3d12_readback_sync_kick_draws));
+  }
+  return targeted;
+}
+
+ReadbackTargetedResult D3D12CommandProcessor::AwaitReadbackCopySubmission(
+    ReadbackTargetedWait& wait) {
+  // The copy was recorded into the open submission, which signals
+  // submission_current_ on the direct queue when it is executed.
+  uint64_t copy_submission = submission_current_;
+  wait.backlog_draws = readback_sync_submission_draws_;
+  wait.gpu_busy_at_submit = submission_fence_->GetCompletedValue() + 1 < copy_submission;
+  uint64_t submit_start_us = LiveryDiag2NowUs();
+  EndSubmission(false);
+  uint64_t fence_start_us = LiveryDiag2NowUs();
+  wait.submit_us = fence_start_us - submit_start_us;
+  if (ReadbackTargetedSubmissionEnded(copy_submission, submission_current_)) {
+    // Below submission_current_: no submission is ended and no
+    // out-of-submission queue operation is awaited, only this fence value
+    // (then the usual reclamation of completed submissions).
+    CheckSubmissionFence(copy_submission);
+    wait.fence_us = LiveryDiag2NowUs() - fence_start_us;
+  }
+  return ClassifyReadbackTargetedWait(copy_submission, submission_current_, submission_completed_);
+}
+
+void D3D12CommandProcessor::MaybeKickReadbackSyncSubmission() {
+  // Cheap early outs on the draw path (the remembered switch states are
+  // refreshed by every read-back resolve and every frame end).
+  if (!readback_sync_targeted_was_enabled_ || !readback_sync_was_enabled_ || !submission_open_) {
+    return;
+  }
+  ReadbackKickInput in;
+  in.targeted = REXCVAR_GET(d3d12_readback_sync_targeted);
+  in.sync_enabled = REXCVAR_GET(d3d12_readback_sync_composite);
+  in.kick_draws = uint32_t(std::max(REXCVAR_GET(d3d12_readback_sync_kick_draws), int32_t(0)));
+  in.submission_open = submission_open_;
+  in.draws_in_submission = readback_sync_submission_draws_;
+  if (!in.kick_draws || in.draws_in_submission < in.kick_draws) {
+    return;
+  }
+  in.can_end_immediately = CanEndSubmissionImmediately();
+  in.occlusion_query_active = active_occlusion_query_.valid;
+  in.submission_completed = submission_fence_->GetCompletedValue();
+  in.submission_current = submission_current_;
+  if (!ShouldKickReadbackSyncSubmission(in)) {
+    return;
+  }
+  uint64_t kick_start_us = LiveryDiag2NowUs();
+  EndSubmission(false);
+  readback_sync_minute_.kick_us += LiveryDiag2NowUs() - kick_start_us;
+  ++readback_sync_minute_.kicks;
 }
 
 void D3D12CommandProcessor::LiveryDiag2OnPipelineWait(void* pipeline_handle, uint64_t wait_us,
@@ -3253,9 +3353,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  // d3d12_readback_sync_targeted: execute the draws recorded so far early
+  // while the GPU is idle (a host scheduling point, like the primary buffer
+  // end), so that a forced read-back wait has a short backlog.
+  MaybeKickReadbackSyncSubmission();
   if (!BeginSubmission(true)) {
     return false;
   }
+  ++readback_sync_submission_draws_;
   perf_chain.Mark(rex::perf::PerfPhase::kSetup);
 
   // Process primitives.
@@ -4302,7 +4407,25 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         {
           rex::perf::ScopedPerfRegion perf_wait(perf_split_active_,
                                                 rex::perf::PerfRegion::kReadbackWait);
-          awaited = AwaitAllQueueOperationsCompletion();
+          // d3d12_readback_sync_targeted: wait for the copy's own submission
+          // only; the full wait otherwise, and as the fallback.
+          bool targeted = ReadbackSyncTargetedEnabled();
+          ReadbackTargetedResult targeted_result = ReadbackTargetedResult::kFallbackToFull;
+          if (ShouldUseReadbackTargetedWait(targeted, submission_open_)) {
+            ReadbackTargetedWait targeted_wait;
+            targeted_result = AwaitReadbackCopySubmission(targeted_wait);
+            if (targeted_result != ReadbackTargetedResult::kFallbackToFull) {
+              sync_counters.CountTargeted(targeted_wait);
+            }
+          }
+          if (targeted_result == ReadbackTargetedResult::kFallbackToFull) {
+            if (targeted) {
+              ++sync_counters.fallbacks_to_full;
+            }
+            awaited = AwaitAllQueueOperationsCompletion();
+          } else {
+            awaited = targeted_result == ReadbackTargetedResult::kCompleted;
+          }
         }
         uint64_t sync_elapsed_us = LiveryDiag2NowUs() - sync_start_us;
         sync_counters.CountForced(diag.sync_rules, sync_elapsed_us);
@@ -4605,6 +4728,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    readback_sync_submission_draws_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
     // end of the submission (when async pipeline creation requests are
@@ -4936,6 +5060,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       }
     }
     ReadbackSyncEnabled();
+    ReadbackSyncTargetedEnabled();
     if (performance_timestamp_frame_active_) {
       const uint64_t cpu_us =
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(

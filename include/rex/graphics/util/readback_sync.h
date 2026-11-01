@@ -181,6 +181,100 @@ inline const char* ReadbackSyncRuleNames(const ReadbackSyncRules& rules) {
                 (rules.composite_shape ? 4 : 0)];
 }
 
+// d3d12_readback_sync_targeted (M10 KI-047 cost). A forced resolve records
+// its GPU copy into the open submission, ends that submission (the replay or
+// deferred list is closed and executed, then the submission fence is
+// signalled with the copy's submission index) and waits for exactly that
+// fence value, then copies its own slot to guest memory. The full wait
+// (AwaitAllQueueOperationsCompletion) did the same two steps and, only when
+// no submission was open or ending it failed, an extra wait for queue
+// operations outside submissions; the direct queue executes in order, so the
+// fence of the copy's submission already covers every earlier submission.
+// The targeted mode therefore only drops that never-needed extra step and
+// falls back to the full wait in exactly those cases.
+//
+// What can make the wait shorter is a smaller backlog: the GPU only starts a
+// submission when it is executed, so the fence wait pays for every draw
+// recorded since the last submission. With the targeted mode on and
+// d3d12_readback_sync_kick_draws > 0, the open submission is executed early
+// ("kick") before a draw when it already holds that many draws, the GPU has
+// finished every earlier submission (it would otherwise idle), no pipeline is
+// being created (the primary-buffer-end submission uses the same test) and no
+// host occlusion query is active (ending a submission ends the query). A kick
+// is a host scheduling point only: it adds no guest-visible write, and mid-
+// frame submissions already happen at every primary buffer end.
+
+// The copy's own submission was ended: the submission index advanced past it.
+inline bool ReadbackTargetedSubmissionEnded(uint64_t copy_submission,
+                                            uint64_t submission_current_after) {
+  return submission_current_after > copy_submission;
+}
+
+// The fence covers the copy: its submission (or a later one) completed.
+inline bool ReadbackTargetedWaitSatisfied(uint64_t submission_completed, uint64_t copy_submission) {
+  return submission_completed >= copy_submission;
+}
+
+// Whether a forced resolve may take the targeted wait (else the full wait).
+inline bool ShouldUseReadbackTargetedWait(bool targeted, bool submission_open) {
+  return targeted && submission_open;
+}
+
+enum class ReadbackTargetedResult : uint32_t {
+  // The copy's submission completed: read the own slot.
+  kCompleted,
+  // Ending the submission failed (it is still open): take the full wait, as
+  // without the targeted mode.
+  kFallbackToFull,
+  // The submission was executed but its fence did not complete: the failure
+  // the full wait reports too (the resolve is not copied).
+  kFenceFailed,
+};
+
+inline ReadbackTargetedResult ClassifyReadbackTargetedWait(uint64_t copy_submission,
+                                                           uint64_t submission_current_after,
+                                                           uint64_t submission_completed) {
+  if (!ReadbackTargetedSubmissionEnded(copy_submission, submission_current_after)) {
+    return ReadbackTargetedResult::kFallbackToFull;
+  }
+  return ReadbackTargetedWaitSatisfied(submission_completed, copy_submission)
+             ? ReadbackTargetedResult::kCompleted
+             : ReadbackTargetedResult::kFenceFailed;
+}
+
+struct ReadbackKickInput {
+  bool targeted = false;
+  bool sync_enabled = false;
+  uint32_t kick_draws = 0;
+  bool submission_open = false;
+  uint64_t draws_in_submission = 0;
+  // CanEndSubmissionImmediately (no pipeline creation pending).
+  bool can_end_immediately = false;
+  bool occlusion_query_active = false;
+  // Submission fence: completed value and the open submission's index.
+  uint64_t submission_completed = 0;
+  uint64_t submission_current = 0;
+};
+
+inline bool ShouldKickReadbackSyncSubmission(const ReadbackKickInput& in) {
+  if (!in.targeted || !in.sync_enabled || !in.kick_draws || !in.submission_open) {
+    return false;
+  }
+  if (in.draws_in_submission < in.kick_draws || !in.can_end_immediately ||
+      in.occlusion_query_active) {
+    return false;
+  }
+  // Every submission before the open one has completed: the GPU is idle.
+  return in.submission_completed + 1 >= in.submission_current;
+}
+
+struct ReadbackTargetedWait {
+  uint64_t submit_us = 0;
+  uint64_t fence_us = 0;
+  bool gpu_busy_at_submit = false;
+  uint64_t backlog_draws = 0;
+};
+
 // Per-minute counters of the MCLA_READBACK_SYNC line. A resolve matching
 // several rules counts once in `matched`/`forced` and once per matching rule.
 struct ReadbackSyncCounters {
@@ -216,6 +310,37 @@ struct ReadbackSyncCounters {
     forced_rule_c += rules.composite_shape ? 1 : 0;
     wait_us += elapsed_us;
     max_wait_us = elapsed_us > max_wait_us ? elapsed_us : max_wait_us;
+  }
+
+  // d3d12_readback_sync_targeted (all zero while it is off).
+  // Forced resolves that waited on their own copy's submission fence.
+  uint64_t targeted_waits = 0;
+  // Their whole wait (submit + fence), and the two parts.
+  uint64_t targeted_wait_us = 0;
+  uint64_t targeted_max_wait_us = 0;
+  uint64_t targeted_submit_us = 0;
+  uint64_t targeted_fence_us = 0;
+  // Forced resolves of the targeted mode that took the full wait instead
+  // (no open submission, or ending it failed).
+  uint64_t fallbacks_to_full = 0;
+  // Of the targeted waits: the previous submission was still running on the
+  // GPU when the copy was submitted, and the draws recorded in the copy's
+  // submission (the unsubmitted backlog the fence wait has to execute).
+  uint64_t targeted_gpu_busy = 0;
+  uint64_t targeted_backlog_draws = 0;
+  // Early submissions (kicks) and their CPU time.
+  uint64_t kicks = 0;
+  uint64_t kick_us = 0;
+
+  void CountTargeted(const ReadbackTargetedWait& wait) {
+    ++targeted_waits;
+    uint64_t total_us = wait.submit_us + wait.fence_us;
+    targeted_wait_us += total_us;
+    targeted_max_wait_us = total_us > targeted_max_wait_us ? total_us : targeted_max_wait_us;
+    targeted_submit_us += wait.submit_us;
+    targeted_fence_us += wait.fence_us;
+    targeted_gpu_busy += wait.gpu_busy_at_submit ? 1 : 0;
+    targeted_backlog_draws += wait.backlog_draws;
   }
 };
 
