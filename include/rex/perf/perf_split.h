@@ -676,6 +676,12 @@ void RequestPerfSplitMark(std::string_view reason);
 bool PerfSplitMarkPending();
 bool TakePerfSplitMark(std::string& reason);
 
+// KI-047 diag v3 flight recorder: MarkPerfSplit also requests a dump of the
+// livery diagnostics' kept lines, whether or not the split is active. The CP
+// takes it at the next frame close. A second request before that is merged.
+void RequestDiagFlightDump(std::string_view reason);
+bool TakeDiagFlightDump(std::string& reason);
+
 void PublishPerfSplitSnapshot(const PerfSplitWindow& window);
 PerfSplitSnapshot GetPerfSplitSnapshot();
 
@@ -686,6 +692,7 @@ bool HasInvariantTsc();
 
 namespace rex::graphics {
 // Host entry point for an F10 (or other) mark: same as
-// rex::perf::RequestPerfSplitMark. No effect while the split is off.
+// rex::perf::RequestPerfSplitMark (no effect while the split is off), and
+// always rex::perf::RequestDiagFlightDump.
 void MarkPerfSplit(const char* tag);
 }  // namespace rex::graphics

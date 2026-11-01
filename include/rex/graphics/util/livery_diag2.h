@@ -5,8 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <rex/graphics/util/livery_diag.h>
 
@@ -19,8 +22,8 @@ namespace rex::graphics {
 // range and texture-side staleness were invisible. v2 adds these line kinds,
 // each with its own per-minute budget:
 // - resolve2: every read-back resolve of a sporadic key (the previous resolve
-//   of the same key was 2 or more frames ago, or never), whatever the copy
-//   decision;
+//   of the same key was 8 or more frames ago, or never; 2 in v2), whatever
+//   the copy decision;
 // - overlap: a resolve whose destination overlaps a different live read-back
 //   key;
 // - tex_load / tex_inval: texture-cache loads of ranges that were read-back
@@ -30,11 +33,26 @@ namespace rex::graphics {
 //   read-back resolve from the RT0 EDRAM base of such waits.
 // Bounded and privacy-safe like v1: frame and draw numbers, guest addresses,
 // sizes, formats and flags only. No GPU is needed, so this is unit-tested.
+//
+// diag v3 (l55): budgets are paced per second (token bucket) instead of a
+// one-minute window that the first frames of every minute used up; the
+// sporadic threshold is 8 frames (2 matched about 16 per-frame-ish tiles per
+// frame); a "composite" kind with its own budget logs resolves of the
+// livery-composite family (d3d12_readback_sync_composite rules a and c); and
+// a flight recorder keeps the last 64 composite/sporadic resolve lines and
+// the last 64 atlas-shaped texture-load lines, logged or not, and writes them
+// to the log when F10 fires.
 
+// Paced line budget of each v2 kind: burst, then lines per second.
 constexpr uint32_t kLiveryDiag2LinesPerMinute = 64;
+constexpr uint32_t kLiveryDiag2LineBurst = 64;
+constexpr uint32_t kLiveryDiag2LinesPerSecond = 2;
+// The composite kind (car spawns only).
+constexpr uint32_t kLiveryDiag2CompositeLineBurst = 128;
+constexpr uint32_t kLiveryDiag2CompositeLinesPerSecond = 8;
 // A resolve whose previous same-key resolve is at least this many frames ago
 // is "sporadic" (per-frame scene, shadow and bloom tiles are not).
-constexpr uint64_t kLiveryDiag2SporadicMinFrames = 2;
+constexpr uint64_t kLiveryDiag2SporadicMinFrames = 8;
 // Texture loads overlapping a read-back destination of this many recent
 // frames are reported.
 constexpr uint64_t kLiveryDiag2ReadbackWindowFrames = 600;
@@ -46,6 +64,97 @@ constexpr uint64_t kLiveryDiag2WaitMatchFrames = 600;
 // An overlap between the same two keys is reported again only after this many
 // quiet frames.
 constexpr uint64_t kLiveryDiag2OverlapQuietFrames = 120;
+
+// Line budget paced per second (token bucket) instead of a one-minute window
+// that is spent in the first frames of the minute: up to `burst` lines at
+// once, refilled at `per_second` lines per second. Same interface as
+// WindowRateLimiter.
+class PacedLineBudget {
+ public:
+  PacedLineBudget(uint32_t per_second, uint32_t burst) : per_second_(per_second), burst_(burst) {}
+
+  bool Allow(uint64_t now_ms) {
+    // Tokens are kept in thousandths so slow rates refill exactly.
+    const uint64_t burst_milli = uint64_t(burst_) * 1000;
+    if (!started_) {
+      started_ = true;
+      milli_tokens_ = burst_milli;
+      last_ms_ = now_ms;
+    } else if (now_ms > last_ms_) {
+      uint64_t elapsed = now_ms - last_ms_;
+      uint64_t refill = elapsed >= burst_milli ? burst_milli : elapsed * per_second_;
+      milli_tokens_ = milli_tokens_ + refill >= burst_milli ? burst_milli : milli_tokens_ + refill;
+      last_ms_ = now_ms;
+    } else if (now_ms < last_ms_) {
+      // The clock went backwards: restart the reference without refilling.
+      last_ms_ = now_ms;
+    }
+    if (milli_tokens_ >= 1000) {
+      milli_tokens_ -= 1000;
+      return true;
+    }
+    ++suppressed_;
+    return false;
+  }
+
+  uint64_t TakeSuppressed() {
+    uint64_t suppressed = suppressed_;
+    suppressed_ = 0;
+    return suppressed;
+  }
+
+  uint32_t per_second() const { return per_second_; }
+  uint32_t burst() const { return burst_; }
+
+ private:
+  uint32_t per_second_;
+  uint32_t burst_;
+  bool started_ = false;
+  uint64_t last_ms_ = 0;
+  uint64_t milli_tokens_ = 0;
+  uint64_t suppressed_ = 0;
+};
+
+// The last kCapacity diagnostic lines of one kind, kept whether or not they
+// were logged, written to the log when F10 fires (flight recorder).
+// Internally locked: texture loads may be reported from other threads.
+class DiagLineRing {
+ public:
+  static constexpr size_t kCapacity = 64;
+
+  void Push(std::string line) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    lines_[pushed_ % kCapacity] = std::move(line);
+    ++pushed_;
+  }
+
+  // Oldest first, without removing them (a second F10 shows them again).
+  // `pushed_out` receives the number of lines pushed since the last Clear
+  // (more than kCapacity: the older ones were overwritten).
+  std::vector<std::string> Snapshot(uint64_t* pushed_out = nullptr) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> out;
+    uint64_t count = pushed_ < kCapacity ? pushed_ : kCapacity;
+    out.reserve(size_t(count));
+    for (uint64_t i = pushed_ - count; i < pushed_; ++i) {
+      out.push_back(lines_[i % kCapacity]);
+    }
+    if (pushed_out) {
+      *pushed_out = pushed_;
+    }
+    return out;
+  }
+
+  void Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pushed_ = 0;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::array<std::string, kCapacity> lines_;
+  uint64_t pushed_ = 0;
+};
 
 inline bool IsSporadicReadbackResolve(bool seen_before, uint64_t previous_frame, uint64_t frame) {
   return !seen_before || frame < previous_frame ||
@@ -228,6 +337,8 @@ class ReadbackKeyHistory {
     uint64_t previous_resolve_frame = 0;
     bool copied_before = false;
     uint64_t last_copy_frame = 0;
+    // The most recent resolve of the key was copied to guest memory.
+    bool last_copied = false;
   };
 
   explicit ReadbackKeyHistory(size_t capacity = 8192, uint64_t keep_frames = 3600)
@@ -241,6 +352,7 @@ class ReadbackKeyHistory {
       lookup.previous_resolve_frame = it->second.last_resolve_frame;
       lookup.copied_before = it->second.copied_before;
       lookup.last_copy_frame = it->second.last_copy_frame;
+      lookup.last_copied = it->second.last_copied;
     }
     return lookup;
   }
@@ -254,6 +366,7 @@ class ReadbackKeyHistory {
       it = entries_.emplace(key, Entry()).first;
     }
     it->second.last_resolve_frame = frame;
+    it->second.last_copied = copied;
     if (copied) {
       it->second.copied_before = true;
       it->second.last_copy_frame = frame;
@@ -268,6 +381,7 @@ class ReadbackKeyHistory {
     uint64_t last_resolve_frame = 0;
     bool copied_before = false;
     uint64_t last_copy_frame = 0;
+    bool last_copied = false;
   };
 
   void Prune(uint64_t frame) {
@@ -515,6 +629,7 @@ class LiveryDiag2TextureTracker {
     load_lines_.TakeSuppressed();
     invalidation_lines_.TakeSuppressed();
     counters_ = {};
+    atlas_lines_.Clear();
     enabled_.store(enabled, std::memory_order_relaxed);
   }
 
@@ -575,6 +690,9 @@ class LiveryDiag2TextureTracker {
     return counters;
   }
 
+  // Flight recorder of atlas-shaped texture loads (logged or not).
+  DiagLineRing& atlas_lines() { return atlas_lines_; }
+
   size_t waiting_loads() {
     std::lock_guard<std::mutex> lock(mutex_);
     return loads_.size();
@@ -588,9 +706,10 @@ class LiveryDiag2TextureTracker {
   RecentReadbackRanges ranges_;
   TextureLoadWatchList loads_;
   std::unordered_set<uint64_t> seen_parts_;
-  WindowRateLimiter load_lines_{kLiveryDiag2LinesPerMinute};
-  WindowRateLimiter invalidation_lines_{kLiveryDiag2LinesPerMinute};
+  PacedLineBudget load_lines_{kLiveryDiag2LinesPerSecond, kLiveryDiag2LineBurst};
+  PacedLineBudget invalidation_lines_{kLiveryDiag2LinesPerSecond, kLiveryDiag2LineBurst};
   Counters counters_;
+  DiagLineRing atlas_lines_;
 };
 
 // Per-minute counters of the command-processor side, reported in one
@@ -607,6 +726,10 @@ struct LiveryDiag2Counters {
   uint64_t long_pipeline_waits = 0;
   uint64_t long_pipeline_wait_us = 0;
   uint64_t wait_resolves = 0;
+  // diag v3: resolves of the livery-composite family (sync rules a or c).
+  uint64_t composite_resolves = 0;
+  uint64_t composite_not_copied = 0;
+  uint64_t composite_read_prev = 0;
 };
 
 }  // namespace rex::graphics

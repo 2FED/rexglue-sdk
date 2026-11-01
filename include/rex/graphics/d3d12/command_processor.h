@@ -38,6 +38,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/util/livery_diag2.h>
+#include <rex/graphics/util/readback_sync.h>
 #include <rex/graphics/xenos.h>
 #include <rex/perf/perf_split.h>
 #include <rex/system/kernel_state.h>
@@ -276,6 +277,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     // The read-back slot written by this resolve was created in this call
     // (CreateNotZeroed: it held recycled memory before the GPU copy).
     bool slot_created = false;
+    // d3d12_readback_sync_composite: the rules were evaluated for this
+    // resolve, which of them matched, and whether it was forced synchronous
+    // (with the wait in microseconds).
+    bool sync_evaluated = false;
+    ReadbackSyncRules sync_rules;
+    bool sync_forced = false;
+    uint64_t sync_wait_us = 0;
     ~LiveryResolveDiagScope();
   };
   void LiveryDiagReportResolve(const LiveryResolveDiagScope& scope);
@@ -288,6 +296,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   void LiveryDiag2OnPipelineWait(void* pipeline_handle, uint64_t wait_us, PendingWaitResult result,
                                  bool window);
   std::string LiveryDiag2MinuteReport();
+  // diag v3 flight recorder: writes the kept composite/sporadic resolve lines
+  // and atlas-shaped texture-load lines to the log (F10).
+  void LiveryDiag2DumpFlightRecorder(const std::string& reason);
+
+  // d3d12_readback_sync_composite (MCLA KI-047 fix candidate), command
+  // processor thread; see readback_sync.h. Logs a start/stop line when the
+  // switch changes and one MCLA_READBACK_SYNC v=1 line per minute.
+  bool ReadbackSyncEnabled();
+  std::string ReadbackSyncMinuteReport();
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -719,10 +736,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // except the tracker, which the texture cache also uses and which therefore
   // is declared before texture_cache_ to outlive it).
   bool livery_diag2_was_enabled_ = false;
-  WindowRateLimiter livery_diag2_resolve_lines_{kLiveryDiag2LinesPerMinute};
-  WindowRateLimiter livery_diag2_overlap_lines_{kLiveryDiag2LinesPerMinute};
-  WindowRateLimiter livery_diag2_wait_lines_{kLiveryDiag2LinesPerMinute};
-  WindowRateLimiter livery_diag2_wait_resolve_lines_{kLiveryDiag2LinesPerMinute};
+  PacedLineBudget livery_diag2_resolve_lines_{kLiveryDiag2LinesPerSecond, kLiveryDiag2LineBurst};
+  PacedLineBudget livery_diag2_overlap_lines_{kLiveryDiag2LinesPerSecond, kLiveryDiag2LineBurst};
+  PacedLineBudget livery_diag2_wait_lines_{kLiveryDiag2LinesPerSecond, kLiveryDiag2LineBurst};
+  PacedLineBudget livery_diag2_wait_resolve_lines_{kLiveryDiag2LinesPerSecond,
+                                                   kLiveryDiag2LineBurst};
+  PacedLineBudget livery_diag2_composite_lines_{kLiveryDiag2CompositeLinesPerSecond,
+                                                kLiveryDiag2CompositeLineBurst};
+  DiagLineRing livery_diag2_resolve_ring_;
   RecentKeyFilter livery_diag2_overlap_pairs_{kLiveryDiag2OverlapQuietFrames};
   ReadbackKeyHistory livery_diag2_keys_;
   PendingLongWaits livery_diag2_pending_waits_;
@@ -730,6 +751,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   FrameWaitWindow livery_diag2_pipeline_waits_;
   LiveryDiag2Counters livery_diag2_minute_;
   LiveryDiag2TextureTracker livery_diag2_textures_;
+
+  // d3d12_readback_sync_composite state (command processor thread).
+  bool readback_sync_was_enabled_ = false;
+  ReadbackSyncScope readback_sync_scope_ = ReadbackSyncScope::kComposite;
+  ReadbackSyncCounters readback_sync_minute_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

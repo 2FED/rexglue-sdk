@@ -87,6 +87,23 @@ REXCVAR_DEFINE_BOOL(d3d12_livery_diag2, false, "GPU/D3D12",
                     "guest memory contents). KI-047 diagnostic v2")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_readback_sync_composite, false, "GPU/D3D12",
+                    "KI-047 fix candidate: with readback_resolve fast or some, copy a read-back "
+                    "resolve synchronously and fenced (as full does) when its destination "
+                    "overlaps another live read-back key of a different length, its key was "
+                    "last resolved 8 or more frames ago, or it is a colour resolve from EDRAM "
+                    "base 0 of a square power-of-two size from 64 to 1024 (the livery "
+                    "composite); d3d12_readback_sync_scope limits the rules. Logs one "
+                    "MCLA_READBACK_SYNC v=1 line per minute")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(d3d12_readback_sync_scope, 0, "GPU/D3D12",
+                     "Scope of d3d12_readback_sync_composite: 0 the livery-composite family "
+                     "only (colour resolves to k_8_8_8_8; the shared-range and shape rules "
+                     "only from EDRAM base 0), 1 every read-back resolve")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2676,21 +2693,27 @@ bool D3D12CommandProcessor::LiveryDiag2Enabled() {
     livery_diag2_overlap_lines_.TakeSuppressed();
     livery_diag2_wait_lines_.TakeSuppressed();
     livery_diag2_wait_resolve_lines_.TakeSuppressed();
+    livery_diag2_composite_lines_.TakeSuppressed();
+    livery_diag2_resolve_ring_.Clear();
     livery_diag2_textures_.SetFrame(frame_current_);
     livery_diag2_textures_.SetEnabled(enabled);
     REXGPU_INFO(
-        "MCLA_LIVERY_DIAG2 v=1 kind={} frame={} async_shader_compilation={} "
+        "MCLA_LIVERY_DIAG2 v=1 kind={} frame={} diag=v3 async_shader_compilation={} "
         "async_pipeline_wait={} async_pipeline_wait_always={} readback={} scale={}x{} "
-        "lines_per_minute_per_kind={} sporadic_min_frames={} readback_window_frames={} "
-        "long_wait_us={} cp_wait_window_frames={}",
+        "line_burst={} lines_per_second={} composite_burst={} composite_per_second={} "
+        "flight_lines={} readback_sync={} "
+        "sporadic_min_frames={} readback_window_frames={} long_wait_us={} "
+        "cp_wait_window_frames={}",
         enabled ? "start" : "stop", frame_current_, int(REXCVAR_GET(async_shader_compilation)),
         int(REXCVAR_GET(d3d12_async_pipeline_wait)),
         int(REXCVAR_GET(d3d12_async_pipeline_wait_always)),
         LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
         texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 0,
-        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 0, kLiveryDiag2LinesPerMinute,
-        kLiveryDiag2SporadicMinFrames, kLiveryDiag2ReadbackWindowFrames, kLiveryDiag2LongWaitUs,
-        FrameWaitWindow::kFrames);
+        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 0, kLiveryDiag2LineBurst,
+        kLiveryDiag2LinesPerSecond, kLiveryDiag2CompositeLineBurst,
+        kLiveryDiag2CompositeLinesPerSecond, DiagLineRing::kCapacity,
+        int(REXCVAR_GET(d3d12_readback_sync_composite)), kLiveryDiag2SporadicMinFrames,
+        kLiveryDiag2ReadbackWindowFrames, kLiveryDiag2LongWaitUs, FrameWaitWindow::kFrames);
   }
   return enabled;
 }
@@ -2761,25 +2784,32 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
     }
   }
 
-  // Every resolve of a sporadic key.
-  if (!IsSporadicReadbackResolve(history.seen, history.previous_resolve_frame, frame)) {
+  bool sporadic = IsSporadicReadbackResolve(history.seen, history.previous_resolve_frame, frame);
+  bool composite = scope.sync_evaluated && scope.sync_rules.composite();
+  if (!sporadic && !composite) {
     return;
   }
-  ++c.sporadic_resolves;
-  c.sporadic_not_copied += scope.copied ? 0 : 1;
-  if (scope.read_previous_slot) {
-    ++c.sporadic_read_prev;
-    c.sporadic_read_prev_unfenced += scope.previous_slot_complete ? 0 : 1;
+  if (sporadic) {
+    ++c.sporadic_resolves;
+    c.sporadic_not_copied += scope.copied ? 0 : 1;
+    if (scope.read_previous_slot) {
+      ++c.sporadic_read_prev;
+      c.sporadic_read_prev_unfenced += scope.previous_slot_complete ? 0 : 1;
+    }
+    c.sporadic_new_slot += scope.slot_created ? 1 : 0;
   }
-  c.sporadic_new_slot += scope.slot_created ? 1 : 0;
-  if (!livery_diag2_resolve_lines_.Allow(LiveryDiagNowMs())) {
-    return;
+  if (composite) {
+    ++c.composite_resolves;
+    c.composite_not_copied += scope.copied ? 0 : 1;
+    c.composite_read_prev += scope.read_previous_slot ? 1 : 0;
   }
-  REXGPU_INFO(
-      "MCLA_LIVERY_DIAG2 v=1 kind=resolve2 frame={} draw={} mode={} scale={}x{} src={} "
-      "src_base={} size={}x{} fmt={} base={:08X} len={} since_prev={} since_copy={} miss={} "
-      "decision={} reason={} read={} prev_age={} prev_known_complete={} prev_len_ok={} "
-      "slot_new={} resolves_since_copy={} cp_wait5_us={} fence_wait5_us={} pso_wait5_us={}",
+  // Common fields of the resolve2 and composite lines.
+  std::string fields = fmt::format(
+      "frame={} draw={} mode={} scale={}x{} src={} src_base={} size={}x{} fmt={} base={:08X} "
+      "len={} since_prev={} since_copy={} miss={} decision={} reason={} read={} prev_age={} "
+      "prev_known_complete={} prev_len_ok={} slot_new={} resolves_since_copy={} "
+      "sync_rules={} sync_forced={} sync_wait_us={} cp_wait5_us={} fence_wait5_us={} "
+      "pso_wait5_us={}",
       frame, g_mcla_frame_draws, LiveryDiagReadbackModeName(scope.mode),
       texture_cache_->draw_resolution_scale_x(), texture_cache_->draw_resolution_scale_y(),
       source_is_depth ? "depth" : "color", info.source_edram_base, info.width, info.height,
@@ -2790,8 +2820,93 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
       scope.copied ? "copied" : scope.reason, scope.read_previous_slot ? "prev" : "this",
       scope.read_previous_slot ? int64_t(scope.previous_slot_age) : int64_t(0),
       int(scope.previous_slot_complete), int(scope.previous_slot_length_ok),
-      int(scope.slot_created), scope.resolves_since_copy, fence_wait_us + pipeline_wait_us,
-      fence_wait_us, pipeline_wait_us);
+      int(scope.slot_created), scope.resolves_since_copy,
+      scope.sync_evaluated ? ReadbackSyncRuleNames(scope.sync_rules) : "off",
+      int(scope.sync_forced), scope.sync_wait_us, fence_wait_us + pipeline_wait_us, fence_wait_us,
+      pipeline_wait_us);
+  std::string body;
+  bool allowed;
+  if (composite) {
+    // diag v3: the composite family (sync rules a or c), own budget, with the
+    // other key of a shared range and that key's last copy.
+    const ReadbackSyncRules& rules = scope.sync_rules;
+    ReadbackKeyHistory::Lookup other =
+        rules.shared_range ? livery_diag2_keys_.Get(rules.other_key) : ReadbackKeyHistory::Lookup();
+    body = fmt::format(
+        "kind=composite {} sporadic={} other_keys={} other_base={:08X} other_len={} "
+        "other_last_used_frames_ago={} other_since_prev={} other_last_copied={} "
+        "other_since_copy={}",
+        fields, int(sporadic), rules.other_keys,
+        rules.shared_range ? ReadbackKeyAddress(rules.other_key) : 0u,
+        rules.shared_range ? ReadbackKeyLength(rules.other_key) : 0u,
+        rules.shared_range ? int64_t(frame) - int64_t(rules.other_last_used_frame) : int64_t(-1),
+        other.seen ? int64_t(frame) - int64_t(other.previous_resolve_frame) : int64_t(-1),
+        int(other.last_copied),
+        other.copied_before ? int64_t(frame) - int64_t(other.last_copy_frame) : int64_t(-1));
+    allowed = livery_diag2_composite_lines_.Allow(LiveryDiagNowMs());
+  } else {
+    body = "kind=resolve2 " + fields;
+    allowed = livery_diag2_resolve_lines_.Allow(LiveryDiagNowMs());
+  }
+  if (allowed) {
+    REXGPU_INFO("MCLA_LIVERY_DIAG2 v=1 {}", body);
+  }
+  livery_diag2_resolve_ring_.Push(std::move(body));
+}
+
+void D3D12CommandProcessor::LiveryDiag2DumpFlightRecorder(const std::string& reason) {
+  uint64_t resolve_pushed = 0;
+  uint64_t atlas_pushed = 0;
+  std::vector<std::string> resolve_lines = livery_diag2_resolve_ring_.Snapshot(&resolve_pushed);
+  std::vector<std::string> atlas_lines =
+      livery_diag2_textures_.atlas_lines().Snapshot(&atlas_pushed);
+  REXGPU_INFO(
+      "MCLA_LIVERY_DIAG2 v=1 kind=flight_begin frame={} reason={} resolve_lines={} "
+      "resolve_pushed={} atlas_lines={} atlas_pushed={}",
+      frame_current_, reason, resolve_lines.size(), resolve_pushed, atlas_lines.size(),
+      atlas_pushed);
+  for (size_t i = 0; i < resolve_lines.size(); ++i) {
+    REXGPU_INFO("MCLA_LIVERY_DIAG2_FLIGHT v=1 ring=resolve i={}/{} {}", i + 1, resolve_lines.size(),
+                resolve_lines[i]);
+  }
+  for (size_t i = 0; i < atlas_lines.size(); ++i) {
+    REXGPU_INFO("MCLA_LIVERY_DIAG2_FLIGHT v=1 ring=atlas i={}/{} {}", i + 1, atlas_lines.size(),
+                atlas_lines[i]);
+  }
+  REXGPU_INFO("MCLA_LIVERY_DIAG2 v=1 kind=flight_end frame={} reason={}", frame_current_, reason);
+}
+
+bool D3D12CommandProcessor::ReadbackSyncEnabled() {
+  bool enabled = REXCVAR_GET(d3d12_readback_sync_composite);
+  ReadbackSyncScope scope = NormalizeReadbackSyncScope(REXCVAR_GET(d3d12_readback_sync_scope));
+  if (enabled != readback_sync_was_enabled_ || (enabled && scope != readback_sync_scope_)) {
+    readback_sync_was_enabled_ = enabled;
+    readback_sync_minute_ = {};
+    REXGPU_INFO(
+        "MCLA_READBACK_SYNC v=1 kind={} frame={} scope={} readback={} scale={}x{} "
+        "sporadic_min_frames={} composite_sizes={}-{} composite_format={}",
+        enabled ? "start" : "stop", frame_current_, ReadbackSyncScopeName(scope),
+        LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
+        texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 0,
+        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 0,
+        kReadbackSyncSporadicMinFrames, kReadbackSyncCompositeMinSize,
+        kReadbackSyncCompositeMaxSize, kReadbackSyncFormat8888);
+  }
+  readback_sync_scope_ = scope;
+  return enabled;
+}
+
+std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
+  const ReadbackSyncCounters& c = readback_sync_minute_;
+  return fmt::format(
+      "frame={} enabled={} scope={} mode={} resolves={} misses={} matched={} matched_a={} "
+      "matched_b={} matched_c={} forced={} forced_a={} forced_b={} forced_c={} "
+      "forced_wait_failed={} wait_ms={:.3f} max_wait_ms={:.3f}",
+      frame_current_, int(readback_sync_was_enabled_), ReadbackSyncScopeName(readback_sync_scope_),
+      LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
+      c.resolves, c.misses, c.matched, c.matched_rule_a, c.matched_rule_b, c.matched_rule_c,
+      c.forced, c.forced_rule_a, c.forced_rule_b, c.forced_rule_c, c.forced_wait_failed,
+      double(c.wait_us) / 1000.0, double(c.max_wait_us) / 1000.0);
 }
 
 void D3D12CommandProcessor::LiveryDiag2OnPipelineWait(void* pipeline_handle, uint64_t wait_us,
@@ -2832,18 +2947,22 @@ std::string D3D12CommandProcessor::LiveryDiag2MinuteReport() {
       "MCLA_LIVERY_DIAG2 v=1 kind=minute frame={} resolves={} sporadic={} sporadic_not_copied={} "
       "sporadic_read_prev={} sporadic_read_prev_unfenced={} sporadic_new_slot={} "
       "overlapping_resolves={} pipeline_waits={} long_waits={} long_wait_us={} "
-      "wait_resolves={} tex_loads_tracked={} tex_loads_rb_overlap={} tex_loads_atlas={} "
+      "wait_resolves={} composite_resolves={} composite_not_copied={} composite_read_prev={} "
+      "tex_loads_tracked={} tex_loads_rb_overlap={} tex_loads_atlas={} "
       "tex_reloads_without_inval={} tex_invals={} tex_invals_by_gpu={} tex_expired={} "
       "tex_waiting={} resolve2_suppressed={} overlap_suppressed={} pso_wait_suppressed={} "
-      "wait_resolve_suppressed={} tex_load_suppressed={} tex_inval_suppressed={}",
+      "wait_resolve_suppressed={} composite_suppressed={} tex_load_suppressed={} "
+      "tex_inval_suppressed={}",
       frame_current_, c.resolves, c.sporadic_resolves, c.sporadic_not_copied, c.sporadic_read_prev,
       c.sporadic_read_prev_unfenced, c.sporadic_new_slot, c.overlapping_resolves, c.pipeline_waits,
-      c.long_pipeline_waits, c.long_pipeline_wait_us, c.wait_resolves, t.loads_tracked,
-      t.loads_readback_overlap, t.loads_atlas_shape, t.reloads_without_invalidation,
-      t.invalidations, t.invalidations_by_gpu, t.expired, livery_diag2_textures_.waiting_loads(),
+      c.long_pipeline_waits, c.long_pipeline_wait_us, c.wait_resolves, c.composite_resolves,
+      c.composite_not_copied, c.composite_read_prev, t.loads_tracked, t.loads_readback_overlap,
+      t.loads_atlas_shape, t.reloads_without_invalidation, t.invalidations, t.invalidations_by_gpu,
+      t.expired, livery_diag2_textures_.waiting_loads(),
       livery_diag2_resolve_lines_.TakeSuppressed(), livery_diag2_overlap_lines_.TakeSuppressed(),
       livery_diag2_wait_lines_.TakeSuppressed(), livery_diag2_wait_resolve_lines_.TakeSuppressed(),
-      t.load_lines_suppressed, t.invalidation_lines_suppressed);
+      livery_diag2_composite_lines_.TakeSuppressed(), t.load_lines_suppressed,
+      t.invalidation_lines_suppressed);
   livery_diag2_minute_ = {};
   return report;
 }
@@ -3863,6 +3982,34 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     diag.written_length = written_length;
   }
   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+  // d3d12_readback_sync_composite: the rules see the live keys before this
+  // resolve updates its own entry. Also evaluated for the diagnostics.
+  bool sync_enabled = ReadbackSyncEnabled();
+  ReadbackResolveMode sync_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  if ((sync_mode == ReadbackResolveMode::kFast || sync_mode == ReadbackResolveMode::kSome) &&
+      (sync_enabled || diag.diag2)) {
+    const D3D12RenderTargetCache::LastResolveDiagInfo& info =
+        render_target_cache_->last_resolve_diag_info();
+    ReadbackSyncResolve sync_resolve;
+    sync_resolve.source_is_color = info.copy_src_select < xenos::kMaxColorRenderTargets;
+    sync_resolve.source_edram_base = info.source_edram_base;
+    sync_resolve.width = info.width;
+    sync_resolve.height = info.height;
+    sync_resolve.dest_format = info.copy_dest_format;
+    const FormatInfo* sync_format_info = FormatInfo::Get(info.copy_dest_format);
+    sync_resolve.bits_per_pixel = sync_format_info ? sync_format_info->bits_per_pixel : 0;
+    sync_resolve.address = written_address;
+    sync_resolve.length = written_length;
+    sync_resolve.frame = frame_current_;
+    auto existing = readback_buffers_.find(resolve_key);
+    if (existing != readback_buffers_.end()) {
+      sync_resolve.key_live = true;
+      sync_resolve.previous_frame = existing->second.last_used_frame;
+    }
+    diag.sync_rules = EvaluateReadbackSyncRules(sync_resolve, readback_sync_scope_,
+                                                readback_buffers_, resolve_key);
+    diag.sync_evaluated = true;
+  }
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
 
@@ -4073,9 +4220,43 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
+  // d3d12_readback_sync_composite: a matching resolve that is not a cache
+  // miss waits for its own copy and reads it, as the full mode does.
+  bool sync_forced = false;
+  if (diag.sync_evaluated) {
+    ReadbackSyncCounters& sync_counters = readback_sync_minute_;
+    ++sync_counters.resolves;
+    if (is_cache_miss) {
+      ++sync_counters.misses;
+    } else if (diag.sync_rules.any()) {
+      sync_counters.CountMatched(diag.sync_rules);
+      if (ShouldForceReadbackSync(sync_enabled, use_delayed_sync, is_cache_miss, diag.sync_rules)) {
+        read_index = write_index;
+        uint64_t sync_start_us = LiveryDiag2NowUs();
+        bool awaited;
+        {
+          rex::perf::ScopedPerfRegion perf_wait(perf_split_active_,
+                                                rex::perf::PerfRegion::kReadbackWait);
+          awaited = AwaitAllQueueOperationsCompletion();
+        }
+        uint64_t sync_elapsed_us = LiveryDiag2NowUs() - sync_start_us;
+        sync_counters.CountForced(diag.sync_rules, sync_elapsed_us);
+        diag.sync_forced = true;
+        diag.sync_wait_us = sync_elapsed_us;
+        if (!awaited) {
+          ++sync_counters.forced_wait_failed;
+          diag.reason = "await_failed";
+          return true;
+        }
+        sync_forced = true;
+      }
+    }
+  }
+
   bool should_copy = true;
   if (readback_mode == ReadbackResolveMode::kSome) {
-    should_copy = is_cache_miss || ++rb.resolves_since_copy >= kReadbackSomeRefreshInterval;
+    should_copy =
+        sync_forced || is_cache_miss || ++rb.resolves_since_copy >= kReadbackSomeRefreshInterval;
     if (should_copy) {
       rb.resolves_since_copy = 0;
     }
@@ -4624,6 +4805,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         if (livery_diag2_was_enabled_) {
           REXGPU_INFO("{}", LiveryDiag2MinuteReport());
         }
+        if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
+          REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=minute {}", ReadbackSyncMinuteReport());
+          readback_sync_minute_ = {};
+        }
         frame_intervals_us.clear();
         if (!frame_draws.empty()) {
           std::sort(frame_draws.begin(), frame_draws.end());
@@ -4647,6 +4832,21 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     // d3d12_perf_split: on the pacing minute boundary, and at F10 marks.
     PerfSplitFrameClose(pacing_minute_reported);
+    // KI-047 diag v3: F10 writes the flight recorder and the read-back sync
+    // counters of the current minute so far.
+    {
+      std::string flight_reason;
+      if (rex::perf::TakeDiagFlightDump(flight_reason)) {
+        if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
+          REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=mark reason={} {}", flight_reason,
+                      ReadbackSyncMinuteReport());
+        }
+        if (livery_diag2_was_enabled_) {
+          LiveryDiag2DumpFlightRecorder(flight_reason);
+        }
+      }
+    }
+    ReadbackSyncEnabled();
     if (performance_timestamp_frame_active_) {
       const uint64_t cpu_us =
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(

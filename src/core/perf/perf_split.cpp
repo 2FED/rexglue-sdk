@@ -35,6 +35,10 @@ std::atomic<bool> g_mark_pending{false};
 std::mutex g_mark_mutex;
 std::string g_mark_reason;
 
+std::atomic<bool> g_flight_pending{false};
+std::mutex g_flight_mutex;
+std::string g_flight_reason;
+
 std::mutex g_snapshot_mutex;
 PerfSplitSnapshot g_snapshot;
 
@@ -124,6 +128,27 @@ bool TakePerfSplitMark(std::string& reason) {
   return true;
 }
 
+void RequestDiagFlightDump(std::string_view reason) {
+  std::lock_guard<std::mutex> lock(g_flight_mutex);
+  if (!g_flight_pending.load(std::memory_order_relaxed)) {
+    g_flight_reason = SanitizePerfSplitReason(reason);
+  }
+  g_flight_pending.store(true, std::memory_order_release);
+}
+
+bool TakeDiagFlightDump(std::string& reason) {
+  if (!g_flight_pending.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_flight_mutex);
+  if (!g_flight_pending.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  reason = g_flight_reason;
+  g_flight_pending.store(false, std::memory_order_relaxed);
+  return true;
+}
+
 void PublishPerfSplitSnapshot(const PerfSplitWindow& window) {
   std::lock_guard<std::mutex> lock(g_snapshot_mutex);
   g_snapshot.available = true;
@@ -166,6 +191,7 @@ bool HasInvariantTsc() {
 namespace rex::graphics {
 
 void MarkPerfSplit(const char* tag) {
+  rex::perf::RequestDiagFlightDump(tag ? std::string_view(tag) : std::string_view("mark"));
   if (!rex::perf::PerfSplitActive()) {
     return;
   }

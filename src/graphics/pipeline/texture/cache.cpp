@@ -789,12 +789,14 @@ void TextureCache::LiveryDiag2ReportLoad(LiveryDiag2TextureTracker& tracker, Tex
     LiveryDiag2TextureTracker::LoadDecision decision =
         tracker.OnTextureLoad(LiveryDiag2TexturePartId(page, width, height, format, is_mip),
                               address, length, width, height, format, LiveryDiag2TextureNowMs());
-    if (!decision.log) {
+    // diag v3: atlas-shaped loads also go to the F10 flight recorder,
+    // whether or not the budget lets them into the log.
+    if (!decision.log && !decision.atlas_shape) {
       continue;
     }
     const RecentReadbackRanges::Match& rb = decision.readback;
-    REXGPU_INFO(
-        "MCLA_LIVERY_DIAG2 v=1 kind=tex_load frame={} part={} base={:08X} len={} size={}x{} "
+    std::string body = fmt::format(
+        "kind=tex_load frame={} part={} base={:08X} len={} size={}x{} "
         "fmt={} tiled={} packed_mips={} mip_max={} scaled_resolve={} atlas_shape={} first={} "
         "reload_without_inval={} rb_overlap={} rb_count={} rb_base={:08X} rb_len={} "
         "rb_frames_ago={} rb_copied={} rb_copy_frames_ago={}",
@@ -805,6 +807,12 @@ void TextureCache::LiveryDiag2ReportLoad(LiveryDiag2TextureTracker& tracker, Tex
         rb.found ? int64_t(decision.frame) - int64_t(rb.last_resolve_frame) : int64_t(-1),
         int(rb.copied),
         rb.copied ? int64_t(decision.frame) - int64_t(rb.last_copy_frame) : int64_t(-1));
+    if (decision.log) {
+      REXGPU_INFO("MCLA_LIVERY_DIAG2 v=1 {}", body);
+    }
+    if (decision.atlas_shape) {
+      tracker.atlas_lines().Push(std::move(body));
+    }
   }
 }
 

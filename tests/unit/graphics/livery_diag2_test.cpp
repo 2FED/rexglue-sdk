@@ -6,10 +6,14 @@ namespace rex::graphics::test {
 TEST_CASE("Sporadic read-back resolve predicate", "[graphics][livery-diag2]") {
   CHECK(IsSporadicReadbackResolve(false, 0, 0));
   CHECK(IsSporadicReadbackResolve(false, 0, 500));
-  // Same frame and the next frame: per-frame keys are not sporadic.
+  // Up to 7 frames: per-frame and every-other-frame keys are not sporadic
+  // (diag v3; 2 frames in v2 matched about 16 tiles per frame).
+  CHECK(kLiveryDiag2SporadicMinFrames == 8);
   CHECK_FALSE(IsSporadicReadbackResolve(true, 100, 100));
   CHECK_FALSE(IsSporadicReadbackResolve(true, 100, 101));
-  CHECK(IsSporadicReadbackResolve(true, 100, 102));
+  CHECK_FALSE(IsSporadicReadbackResolve(true, 100, 102));
+  CHECK_FALSE(IsSporadicReadbackResolve(true, 100, 107));
+  CHECK(IsSporadicReadbackResolve(true, 100, 108));
   CHECK(IsSporadicReadbackResolve(true, 100, 5000));
   // A frame counter that went backwards (restart) counts as sporadic.
   CHECK(IsSporadicReadbackResolve(true, 100, 50));
@@ -238,8 +242,7 @@ TEST_CASE("LiveryDiag2TextureTracker tracks atlas and read-back loads",
   CHECK(load.first_upload);
 }
 
-TEST_CASE("LiveryDiag2TextureTracker load lines have a per-minute budget",
-          "[graphics][livery-diag2]") {
+TEST_CASE("LiveryDiag2TextureTracker load lines have a paced budget", "[graphics][livery-diag2]") {
   LiveryDiag2TextureTracker tracker;
   tracker.SetEnabled(true);
   int logged = 0;
@@ -250,10 +253,20 @@ TEST_CASE("LiveryDiag2TextureTracker load lines have a per-minute budget",
             ? 1
             : 0;
   }
-  CHECK(logged == int(kLiveryDiag2LinesPerMinute));
+  CHECK(logged == int(kLiveryDiag2LineBurst));
   LiveryDiag2TextureTracker::Counters counters = tracker.TakeCounters();
   CHECK(counters.loads_tracked == 100);
-  CHECK(counters.load_lines_suppressed == 100 - kLiveryDiag2LinesPerMinute);
+  CHECK(counters.load_lines_suppressed == 100 - kLiveryDiag2LineBurst);
+  // One second later the budget has refilled kLiveryDiag2LinesPerSecond lines.
+  logged = 0;
+  for (uint32_t i = 0; i < 10; ++i) {
+    uint64_t id = LiveryDiag2TexturePartId(i, 1024, 1024, kLiveryDiag2FormatDxt45, false);
+    logged +=
+        tracker.OnTextureLoad(id, i << 12, 0x1000, 1024, 1024, kLiveryDiag2FormatDxt45, 2000).log
+            ? 1
+            : 0;
+  }
+  CHECK(logged == int(kLiveryDiag2LinesPerSecond));
   // The invalidation budget is separate.
   uint64_t id = LiveryDiag2TexturePartId(0, 1024, 1024, kLiveryDiag2FormatDxt45, false);
   CHECK(tracker.OnTextureInvalidated(id, true, 1000).log);
