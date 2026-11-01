@@ -104,6 +104,20 @@ REXCVAR_DEFINE_INT32(d3d12_readback_sync_scope, 0, "GPU/D3D12",
     .range(0, 1)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_readback_elide_unread, false, "GPU/D3D12",
+                    "M10-002 step 1: with readback_resolve some, do not record the GPU copy "
+                    "(downscale or shared-memory copy, slot copy and their barriers) of a "
+                    "read-back resolve whose slot can never be read: not copied to guest memory "
+                    "by this resolve (no miss, not forced) and not by the next resolve of the "
+                    "same key (its every-4th copy is not due). The bytes copied to guest memory "
+                    "are unchanged")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_readback_gpu_timing, true, "GPU/D3D12",
+                    "M10-002 step 0: GPU timestamps around every recorded read-back block, "
+                    "summed into gpu_readback_ms of the MCLA_READBACK v=1 lines")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1753,6 +1767,7 @@ void D3D12CommandProcessor::ShutdownContext() {
     ConsumePerformanceTimestamp(slot);
   }
   ShutdownPerformanceTelemetry();
+  ShutdownReadbackGpuTimers();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2516,6 +2531,12 @@ uint64_t LiveryDiagNowMs() {
 
 uint64_t LiveryDiag2NowUs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+uint64_t ReadbackNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
 }
@@ -3985,9 +4006,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   // d3d12_readback_sync_composite: the rules see the live keys before this
   // resolve updates its own entry. Also evaluated for the diagnostics.
   bool sync_enabled = ReadbackSyncEnabled();
-  ReadbackResolveMode sync_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if ((sync_mode == ReadbackResolveMode::kFast || sync_mode == ReadbackResolveMode::kSome) &&
-      (sync_enabled || diag.diag2)) {
+  // Read once for the whole resolve (M10-002 plans the slots before recording).
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  bool use_delayed_sync =
+      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  if (use_delayed_sync && (sync_enabled || diag.diag2)) {
     const D3D12RenderTargetCache::LastResolveDiagInfo& info =
         render_target_cache_->last_resolve_diag_info();
     ReadbackSyncResolve sync_resolve;
@@ -4012,6 +4035,47 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
+
+  // M10-002: decide before recording which slot this resolve reads and
+  // whether the GPU copy into its own slot can ever be read
+  // (readback_slots.h). The previous slot is not touched by the allocation
+  // of the own slot below, so its usability is known here.
+  static_assert(kReadbackSomeRefreshInterval == kReadbackSlotsSomeInterval);
+  ReadbackPlanInput plan_input;
+  if (readback_mode == ReadbackResolveMode::kFast) {
+    plan_input.mode = ReadbackPlanMode::kFast;
+  } else if (readback_mode == ReadbackResolveMode::kSome) {
+    plan_input.mode = ReadbackPlanMode::kSome;
+  } else {
+    plan_input.mode = ReadbackPlanMode::kFull;
+  }
+  {
+    uint32_t previous_index = 1 - rb.current_index;
+    plan_input.previous_slot_usable = rb.buffers[previous_index] &&
+                                      written_length <= rb.sizes[previous_index] &&
+                                      rb.mapped_data[previous_index];
+  }
+  plan_input.force_unless_miss =
+      diag.sync_evaluated &&
+      ShouldForceReadbackSync(sync_enabled, use_delayed_sync, false, diag.sync_rules);
+  plan_input.elide_unread = REXCVAR_GET(d3d12_readback_elide_unread);
+  ReadbackSlotState slot_state;
+  slot_state.current_index = rb.current_index;
+  slot_state.resolves_since_copy = rb.resolves_since_copy;
+  slot_state.slot_elided[0] = rb.slot_elided[0];
+  slot_state.slot_elided[1] = rb.slot_elided[1];
+  const ReadbackPlan plan = PlanReadbackResolve(slot_state, plan_input);
+  readback_counters_.CountPlan(plan, written_length);
+  // Counts a resolve that leaves before the guest copy step.
+  struct AbortCounter {
+    ReadbackCounters* counters;
+    bool reached = false;
+    ~AbortCounter() {
+      if (!reached) {
+        ++counters->aborted;
+      }
+    }
+  } abort_counter{&readback_counters_};
 
   uint32_t write_index = rb.current_index;
   uint32_t size = AlignReadbackBufferSize(written_length);
@@ -4134,87 +4198,88 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return true;
     }
 
-    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
-    ID3D12Device* device = provider.GetDevice();
-    uint32_t aligned_scaled_length =
-        rex::align(scaled_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
-    ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
-                                        scaled_resolve_buffer, aligned_scaled_length,
-                                        source_offset);
-    uint32_t aligned_written_length =
-        rex::align(written_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
-    ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
-                                        resolve_downscale_buffer_.Get(), aligned_written_length, 0);
+    // M10-002: the checks and allocations above are kept for an elided
+    // resolve (its exits are identical); only the recording is skipped.
+    if (plan.record_gpu) {
+      uint32_t timer_pair = BeginReadbackGpuTimer();
 
-    PushUAVBarrier(scaled_resolve_buffer);
-    texture_cache_->TransitionCurrentScaledResolveRange(
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    SubmitBarriers();
+      const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+      ID3D12Device* device = provider.GetDevice();
+      uint32_t aligned_scaled_length =
+          rex::align(scaled_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+      ui::d3d12::util::CreateBufferRawSRV(device, downscale_descriptors[0].first,
+                                          scaled_resolve_buffer, aligned_scaled_length,
+                                          source_offset);
+      uint32_t aligned_written_length =
+          rex::align(written_length, uint32_t(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT));
+      ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
+                                          resolve_downscale_buffer_.Get(), aligned_written_length,
+                                          0);
 
-    SetExternalPipeline(resolve_downscale_pipeline_.Get());
-    deferred_command_list_.D3DSetComputeRootSignature(resolve_downscale_root_signature_.Get());
-    ResolveDownscaleConstants constants;
-    constants.scale_x = texture_cache_->draw_resolution_scale_x();
-    constants.scale_y = texture_cache_->draw_resolution_scale_y();
-    constants.pixel_size_log2 = pixel_size_log2;
-    constants.tile_count = tile_count;
-    constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
-                                   (constants.scale_x > 1 || constants.scale_y > 1))
-                                      ? 1u
-                                      : 0u;
-    deferred_command_list_.D3DSetComputeRoot32BitConstants(
-        UINT(ResolveDownscaleRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
-        &constants, 0);
-    deferred_command_list_.D3DSetComputeRootDescriptorTable(
-        UINT(ResolveDownscaleRootParameter::kSource), downscale_descriptors[0].second);
-    deferred_command_list_.D3DSetComputeRootDescriptorTable(
-        UINT(ResolveDownscaleRootParameter::kDestination), downscale_descriptors[1].second);
-    deferred_command_list_.D3DDispatch(tile_count, 1, 1);
+      PushUAVBarrier(scaled_resolve_buffer);
+      texture_cache_->TransitionCurrentScaledResolveRange(
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      SubmitBarriers();
 
-    PushUAVBarrier(resolve_downscale_buffer_.Get());
-    PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                          D3D12_RESOURCE_STATE_COPY_SOURCE);
-    SubmitBarriers();
-    deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0,
-                                               resolve_downscale_buffer_.Get(), 0, written_length);
-    PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
-                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    SubmitBarriers();
-  } else {
+      SetExternalPipeline(resolve_downscale_pipeline_.Get());
+      deferred_command_list_.D3DSetComputeRootSignature(resolve_downscale_root_signature_.Get());
+      ResolveDownscaleConstants constants;
+      constants.scale_x = texture_cache_->draw_resolution_scale_x();
+      constants.scale_y = texture_cache_->draw_resolution_scale_y();
+      constants.pixel_size_log2 = pixel_size_log2;
+      constants.tile_count = tile_count;
+      constants.half_pixel_offset = (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
+                                     (constants.scale_x > 1 || constants.scale_y > 1))
+                                        ? 1u
+                                        : 0u;
+      deferred_command_list_.D3DSetComputeRoot32BitConstants(
+          UINT(ResolveDownscaleRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
+          &constants, 0);
+      deferred_command_list_.D3DSetComputeRootDescriptorTable(
+          UINT(ResolveDownscaleRootParameter::kSource), downscale_descriptors[0].second);
+      deferred_command_list_.D3DSetComputeRootDescriptorTable(
+          UINT(ResolveDownscaleRootParameter::kDestination), downscale_descriptors[1].second);
+      deferred_command_list_.D3DDispatch(tile_count, 1, 1);
+
+      PushUAVBarrier(resolve_downscale_buffer_.Get());
+      PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE);
+      SubmitBarriers();
+      deferred_command_list_.D3DCopyBufferRegion(
+          rb.buffers[write_index], 0, resolve_downscale_buffer_.Get(), 0, written_length);
+      PushTransitionBarrier(resolve_downscale_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      texture_cache_->TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      SubmitBarriers();
+      EndReadbackGpuTimer(timer_pair);
+    }
+  } else if (plan.record_gpu) {
+    uint32_t timer_pair = BeginReadbackGpuTimer();
     shared_memory_->UseAsCopySource();
     SubmitBarriers();
     ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
     deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0, shared_memory_buffer,
                                                written_address, written_length);
+    EndReadbackGpuTimer(timer_pair);
   }
-  if (diag.processor) {
+  rb.slot_elided[write_index] = !plan.record_gpu;
+  if (diag.processor && plan.record_gpu) {
     rb.submission_written[write_index] = submission_current_;
     rb.written_size[write_index] = written_length;
   }
 
   perf_readback_gpu.End();
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  bool use_delayed_sync =
-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
-  uint32_t read_index = write_index;
-  if (use_delayed_sync) {
-    read_index = 1 - write_index;
-  } else {
+  // The plan's read slot: the own slot for full, a miss (previous slot
+  // missing, too small or unmapped), the elision guard and a forced
+  // resolve; else the previous slot.
+  uint32_t read_index = plan.read_index;
+  bool is_cache_miss = plan.miss || plan.guard_miss;
+  if (plan.wait_full || is_cache_miss) {
     rex::perf::ScopedPerfRegion perf_wait(perf_split_active_, rex::perf::PerfRegion::kReadbackWait);
-    if (!AwaitAllQueueOperationsCompletion()) {
-      diag.reason = "await_failed";
-      return true;
-    }
-  }
-
-  bool is_cache_miss = false;
-  if (use_delayed_sync && (!rb.buffers[read_index] || written_length > rb.sizes[read_index] ||
-                           !rb.mapped_data[read_index])) {
-    is_cache_miss = true;
-    read_index = write_index;
-    rex::perf::ScopedPerfRegion perf_wait(perf_split_active_, rex::perf::PerfRegion::kReadbackWait);
-    if (!AwaitAllQueueOperationsCompletion()) {
+    uint64_t wait_start_ns = ReadbackNowNs();
+    bool awaited = AwaitAllQueueOperationsCompletion();
+    readback_counters_.readback_wait_ns += ReadbackNowNs() - wait_start_ns;
+    if (!awaited) {
       diag.reason = "await_failed";
       return true;
     }
@@ -4222,7 +4287,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   // d3d12_readback_sync_composite: a matching resolve that is not a cache
   // miss waits for its own copy and reads it, as the full mode does.
-  bool sync_forced = false;
   if (diag.sync_evaluated) {
     ReadbackSyncCounters& sync_counters = readback_sync_minute_;
     ++sync_counters.resolves;
@@ -4230,7 +4294,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       ++sync_counters.misses;
     } else if (diag.sync_rules.any()) {
       sync_counters.CountMatched(diag.sync_rules);
-      if (ShouldForceReadbackSync(sync_enabled, use_delayed_sync, is_cache_miss, diag.sync_rules)) {
+      // Planned with the same inputs: ShouldForceReadbackSync and not a miss.
+      if (plan.forced) {
         read_index = write_index;
         uint64_t sync_start_us = LiveryDiag2NowUs();
         bool awaited;
@@ -4241,6 +4306,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         }
         uint64_t sync_elapsed_us = LiveryDiag2NowUs() - sync_start_us;
         sync_counters.CountForced(diag.sync_rules, sync_elapsed_us);
+        ++readback_counters_.forced;
+        readback_counters_.readback_wait_ns += sync_elapsed_us * 1000;
         diag.sync_forced = true;
         diag.sync_wait_us = sync_elapsed_us;
         if (!awaited) {
@@ -4248,19 +4315,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           diag.reason = "await_failed";
           return true;
         }
-        sync_forced = true;
       }
     }
   }
 
-  bool should_copy = true;
+  // some: a miss, a forced resolve or every 4th resolve of the key.
+  bool should_copy = plan.copies_now;
   if (readback_mode == ReadbackResolveMode::kSome) {
-    should_copy =
-        sync_forced || is_cache_miss || ++rb.resolves_since_copy >= kReadbackSomeRefreshInterval;
-    if (should_copy) {
-      rb.resolves_since_copy = 0;
-    }
+    rb.resolves_since_copy = plan.next_resolves_since_copy;
   }
+  abort_counter.reached = true;
   perf_outcome.should_copy = should_copy;
   if (diag.processor) {
     diag.should_copy = should_copy;
@@ -4287,8 +4351,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       {
         rex::perf::ScopedPerfRegion perf_memcpy(perf_split_active_,
                                                 rex::perf::PerfRegion::kReadbackMemcpy);
+        uint64_t memcpy_start_ns = ReadbackNowNs();
         std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+        readback_counters_.memcpy_ns += ReadbackNowNs() - memcpy_start_ns;
       }
+      readback_counters_.bytes_cpu_copied += written_length;
       if (perf_split_active_) {
         perf_split_active_->counters.readback_bytes += written_length;
       }
@@ -4297,6 +4364,14 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     } else {
       diag.reason = "no_destination";
     }
+  }
+
+  if (perf_outcome.copied) {
+    ++readback_counters_.copies_now;
+  } else if (!should_copy) {
+    ++readback_counters_.copies_deferred;
+  } else {
+    ++readback_counters_.copies_skipped;
   }
 
   rb.current_index = 1 - rb.current_index;
@@ -4368,6 +4443,9 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 
   if (submission_timestamp_mapping_) {
     CollectSubmissionTimestamps();
+  }
+  if (readback_timestamp_mapping_) {
+    CollectReadbackGpuTimers();
   }
 
   // Reclaim command allocators.
@@ -4712,6 +4790,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       WriteSubmissionStartTimestamp();
       deferred_command_list_.Execute(command_list_, command_list_1_);
     }
+    ResolveReadbackGpuTimers();
     WriteSubmissionEndTimestamp();
     if (is_closing_frame && performance_timestamp_query_heap_ &&
         performance_timestamp_frame_active_) {
@@ -4756,6 +4835,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     if (async_pipeline_wait_always_.enabled()) {
       ObserveAlwaysPipelineWait();
     }
+    ++readback_counters_.frames;
     bool pacing_minute_reported = false;
     {
       // Host frame pacing, reported once a minute (command processor thread).
@@ -4811,6 +4891,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
         // M10-CPU-B: WAIT_REG_MEM episodes of the minute (always on).
         REXGPU_INFO("{}", WaitRegMemReport("minute", "minute", frame_current_, true));
+        // M10-002 step 0: read-back counters of the minute (always on).
+        REXGPU_INFO("{}", ReadbackCountersReport("minute", "minute"));
+        readback_counters_ = {};
         frame_intervals_us.clear();
         if (!frame_draws.empty()) {
           std::sort(frame_draws.begin(), frame_draws.end());
@@ -4841,6 +4924,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       if (rex::perf::TakeDiagFlightDump(flight_reason)) {
         // M10-CPU-B: the current minute's WAIT_REG_MEM counters so far.
         REXGPU_INFO("{}", WaitRegMemReport("mark", flight_reason, frame_current_, false));
+        // M10-002 step 0: the current minute's read-back counters so far.
+        REXGPU_INFO("{}", ReadbackCountersReport("mark", flight_reason.c_str()));
         if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
           REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=mark reason={} {}", flight_reason,
                       ReadbackSyncMinuteReport());
@@ -4991,6 +5076,131 @@ void D3D12CommandProcessor::CollectSubmissionTimestamps() {
       ++perf_gpu_busy_submissions_total_;
     }
   }
+}
+
+uint32_t D3D12CommandProcessor::BeginReadbackGpuTimer() {
+  if (!REXCVAR_GET(d3d12_readback_gpu_timing)) {
+    return UINT32_MAX;
+  }
+  if (!readback_timestamp_heap_) {
+    if (readback_timestamp_init_failed_) {
+      return UINT32_MAX;
+    }
+    readback_timestamp_init_failed_ = true;
+    ID3D12Device* device = GetD3D12Provider().GetDevice();
+    ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
+    if (FAILED(queue->GetTimestampFrequency(&readback_timestamp_frequency_)) ||
+        !readback_timestamp_frequency_) {
+      readback_timestamp_frequency_ = 0;
+      return UINT32_MAX;
+    }
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = kReadbackTimestampPairs * 2;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> heap;
+    if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&heap)))) {
+      return UINT32_MAX;
+    }
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(
+        buffer_desc, sizeof(uint64_t) * kReadbackTimestampPairs * 2, D3D12_RESOURCE_FLAG_NONE);
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                               GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                               &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                               nullptr, IID_PPV_ARGS(&readback)))) {
+      return UINT32_MAX;
+    }
+    D3D12_RANGE read_range = {0, sizeof(uint64_t) * kReadbackTimestampPairs * 2};
+    void* mapping = nullptr;
+    if (FAILED(readback->Map(0, &read_range, &mapping))) {
+      return UINT32_MAX;
+    }
+    readback_timestamp_heap_ = heap;
+    readback_timestamp_readback_ = readback;
+    readback_timestamp_mapping_ = reinterpret_cast<uint64_t*>(mapping);
+    readback_timestamp_init_failed_ = false;
+  }
+  if (readback_timestamp_in_flight_ >= kReadbackTimestampPairs) {
+    ++readback_counters_.gpu_blocks_dropped;
+    return UINT32_MAX;
+  }
+  if (!readback_timestamp_open_count_) {
+    readback_timestamp_open_first_ = readback_timestamp_next_;
+  }
+  uint32_t pair = readback_timestamp_next_;
+  readback_timestamp_next_ = (pair + 1) % kReadbackTimestampPairs;
+  ++readback_timestamp_open_count_;
+  ++readback_timestamp_in_flight_;
+  SubmitBarriers();
+  deferred_command_list_.D3DEndQuery(readback_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     pair * 2);
+  return pair;
+}
+
+void D3D12CommandProcessor::EndReadbackGpuTimer(uint32_t pair) {
+  if (pair == UINT32_MAX) {
+    return;
+  }
+  deferred_command_list_.D3DEndQuery(readback_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     pair * 2 + 1);
+}
+
+void D3D12CommandProcessor::ResolveReadbackGpuTimers() {
+  uint32_t count = readback_timestamp_open_count_;
+  if (!count) {
+    return;
+  }
+  readback_timestamp_open_count_ = 0;
+  uint32_t first = readback_timestamp_open_first_;
+  uint32_t head = std::min(count, kReadbackTimestampPairs - first);
+  command_list_->ResolveQueryData(readback_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                  first * 2, head * 2, readback_timestamp_readback_.Get(),
+                                  uint64_t(first) * 2 * sizeof(uint64_t));
+  if (count > head) {
+    command_list_->ResolveQueryData(readback_timestamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                    (count - head) * 2, readback_timestamp_readback_.Get(), 0);
+  }
+  readback_timestamp_pending_.push_back({submission_current_, first, count});
+}
+
+void D3D12CommandProcessor::CollectReadbackGpuTimers() {
+  while (!readback_timestamp_pending_.empty() &&
+         readback_timestamp_pending_.front().submission <= submission_completed_) {
+    ReadbackTimestampBatch batch = readback_timestamp_pending_.front();
+    readback_timestamp_pending_.pop_front();
+    for (uint32_t i = 0; i < batch.count; ++i) {
+      uint32_t pair = (batch.first + i) % kReadbackTimestampPairs;
+      uint64_t begin = readback_timestamp_mapping_[pair * 2];
+      uint64_t end = readback_timestamp_mapping_[pair * 2 + 1];
+      if (end > begin) {
+        readback_counters_.gpu_ticks += end - begin;
+        ++readback_counters_.gpu_blocks;
+      }
+    }
+    readback_timestamp_in_flight_ -= std::min(readback_timestamp_in_flight_, batch.count);
+  }
+}
+
+void D3D12CommandProcessor::ShutdownReadbackGpuTimers() {
+  if (readback_timestamp_readback_ && readback_timestamp_mapping_) {
+    readback_timestamp_readback_->Unmap(0, nullptr);
+  }
+  readback_timestamp_mapping_ = nullptr;
+  readback_timestamp_readback_.Reset();
+  readback_timestamp_heap_.Reset();
+  readback_timestamp_pending_.clear();
+  readback_timestamp_in_flight_ = 0;
+  readback_timestamp_open_count_ = 0;
+  readback_timestamp_next_ = 0;
+}
+
+std::string D3D12CommandProcessor::ReadbackCountersReport(const char* kind, const char* reason) {
+  return ReadbackReport(
+      readback_counters_, kind, reason, frame_current_,
+      LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
+      REXCVAR_GET(d3d12_readback_elide_unread), REXCVAR_GET(d3d12_readback_gpu_timing),
+      readback_timestamp_frequency_);
 }
 
 bool D3D12CommandProcessor::InitializePerformanceTelemetry() {

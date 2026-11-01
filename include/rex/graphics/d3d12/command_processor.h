@@ -38,6 +38,7 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/util/livery_diag2.h>
+#include <rex/graphics/util/readback_slots.h>
 #include <rex/graphics/util/readback_sync.h>
 #include <rex/graphics/xenos.h>
 #include <rex/perf/perf_split.h>
@@ -472,6 +473,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint64_t last_used_frame = 0;
     // Resolves since the last CPU copy, for the "some" readback mode.
     uint32_t resolves_since_copy = 0;
+    // M10-002 (d3d12_readback_elide_unread): the last resolve that wrote the
+    // slot elided its GPU copy (see readback_slots.h).
+    bool slot_elided[2] = {false, false};
   };
   // In "some" mode a resolve target is copied to guest memory on a cache miss
   // and additionally every this many resolves, so CPU readers such as Photo
@@ -559,6 +563,38 @@ class D3D12CommandProcessor : public CommandProcessor {
   void WriteSubmissionStartTimestamp();
   void WriteSubmissionEndTimestamp();
   void CollectSubmissionTimestamps();
+
+  // M10-002 step 0: MCLA_READBACK v=1 counters (always on) and GPU
+  // timestamps around each recorded read-back block (d3d12_readback_gpu_timing),
+  // command processor thread. Pairs of timestamps live in a ring; the pairs of
+  // a submission are contiguous (modulo the ring) and resolved at its end.
+  ReadbackCounters readback_counters_;
+  static constexpr uint32_t kReadbackTimestampPairs = 2048;
+  struct ReadbackTimestampBatch {
+    uint64_t submission;
+    uint32_t first;
+    uint32_t count;
+  };
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> readback_timestamp_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback_timestamp_readback_;
+  uint64_t* readback_timestamp_mapping_ = nullptr;
+  uint64_t readback_timestamp_frequency_ = 0;
+  bool readback_timestamp_init_failed_ = false;
+  uint32_t readback_timestamp_next_ = 0;
+  uint32_t readback_timestamp_in_flight_ = 0;
+  uint32_t readback_timestamp_open_first_ = 0;
+  uint32_t readback_timestamp_open_count_ = 0;
+  std::deque<ReadbackTimestampBatch> readback_timestamp_pending_;
+  // Returns the pair index, or UINT32_MAX when timing is off or the ring is
+  // full. Submits the pending barriers first so that they are not attributed
+  // to the block.
+  uint32_t BeginReadbackGpuTimer();
+  void EndReadbackGpuTimer(uint32_t pair);
+  // On command_list_ at the end of a submission, after its commands.
+  void ResolveReadbackGpuTimers();
+  void CollectReadbackGpuTimers();
+  void ShutdownReadbackGpuTimers();
+  std::string ReadbackCountersReport(const char* kind, const char* reason);
 
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> performance_timestamp_query_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> performance_timestamp_readback_;
