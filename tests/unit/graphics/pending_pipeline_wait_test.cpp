@@ -211,4 +211,22 @@ TEST_CASE("Capture window and always-on wait compose with separate budgets",
   CHECK(minute.NextTimeoutMs() == PendingWaitMinuteBudget::kPerWaitTimeoutMs);
 }
 
+TEST_CASE("Root signature after a pending-pipeline wait is the pipeline's current one",
+          "[graphics][pipeline-wait]") {
+  int placeholder = 0;
+  int real = 0;
+  // Ready pipeline (no wait): the configured root signature.
+  CHECK(SelectRootSignatureForDraw(false, &placeholder, &real) == &placeholder);
+  CHECK(SelectRootSignatureForDraw(false, &placeholder, static_cast<int*>(nullptr)) ==
+        &placeholder);
+  // After a successful wait: the root signature of the created pipeline,
+  // which may differ from the placeholder chosen before the pixel shader was
+  // translated.
+  CHECK(SelectRootSignatureForDraw(true, &placeholder, &real) == &real);
+  // Unknown current root signature: keep the configured one.
+  CHECK(SelectRootSignatureForDraw(true, &placeholder, static_cast<int*>(nullptr)) == &placeholder);
+  // Same object both ways (no replacement happened).
+  CHECK(SelectRootSignatureForDraw(true, &placeholder, &placeholder) == &placeholder);
+}
+
 }  // namespace rex::graphics::test

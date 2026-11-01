@@ -231,4 +231,17 @@ inline PendingWaitMode SelectPendingWaitMode(bool window_on, bool always_on) {
   return always_on ? PendingWaitMode::kAlways : PendingWaitMode::kNone;
 }
 
+// Root signature to bind for a draw. ConfigurePipeline returns the root
+// signature the pipeline had when it was configured; for a pipeline that was
+// still pending that is the placeholder chosen before the pixel shader was
+// translated, and the creation path may replace it (the real pixel shader can
+// need more texture or sampler bindings). After a successful pending-pipeline
+// wait the pipeline's current root signature is used; otherwise (and if it
+// is not known) the configured one.
+template <typename RootSignature>
+RootSignature* SelectRootSignatureForDraw(bool waited_for_pipeline, RootSignature* configured,
+                                          RootSignature* current) {
+  return (waited_for_pipeline && current) ? current : configured;
+}
+
 }  // namespace rex::graphics

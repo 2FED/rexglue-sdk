@@ -37,6 +37,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/livery_diag.h>
+#include <rex/graphics/util/livery_diag2.h>
 #include <rex/graphics/xenos.h>
 #include <rex/perf/perf_split.h>
 #include <rex/system/kernel_state.h>
@@ -268,9 +269,25 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool previous_slot_length_ok = false;
     uint64_t previous_slot_age = 0;
     uint32_t resolves_since_copy = 0;
+    // Which diagnostics this scope reports to (v1 d3d12_livery_diag, v2
+    // d3d12_livery_diag2).
+    bool diag1 = false;
+    bool diag2 = false;
+    // The read-back slot written by this resolve was created in this call
+    // (CreateNotZeroed: it held recycled memory before the GPU copy).
+    bool slot_created = false;
     ~LiveryResolveDiagScope();
   };
   void LiveryDiagReportResolve(const LiveryResolveDiagScope& scope);
+  void LiveryDiag1ReportResolve(const LiveryResolveDiagScope& scope);
+
+  // d3d12_livery_diag2 diagnostics (MCLA KI-047 diag v2), command processor
+  // thread. Lines are tagged MCLA_LIVERY_DIAG2 v=1; see livery_diag2.h.
+  bool LiveryDiag2Enabled();
+  void LiveryDiag2ReportResolve(const LiveryResolveDiagScope& scope);
+  void LiveryDiag2OnPipelineWait(void* pipeline_handle, uint64_t wait_us, PendingWaitResult result,
+                                 bool window);
+  std::string LiveryDiag2MinuteReport();
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -697,6 +714,22 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t livery_diag_skip_base_count_ = 0;
   std::array<uint32_t, kLiveryDiagSkipBaseLimit> livery_diag_skip_color_bases_ = {};
   std::array<uint32_t, kLiveryDiagSkipBaseLimit> livery_diag_skip_depth_bases_ = {};
+
+  // d3d12_livery_diag2 state (command processor thread; untouched while off,
+  // except the tracker, which the texture cache also uses and which therefore
+  // is declared before texture_cache_ to outlive it).
+  bool livery_diag2_was_enabled_ = false;
+  WindowRateLimiter livery_diag2_resolve_lines_{kLiveryDiag2LinesPerMinute};
+  WindowRateLimiter livery_diag2_overlap_lines_{kLiveryDiag2LinesPerMinute};
+  WindowRateLimiter livery_diag2_wait_lines_{kLiveryDiag2LinesPerMinute};
+  WindowRateLimiter livery_diag2_wait_resolve_lines_{kLiveryDiag2LinesPerMinute};
+  RecentKeyFilter livery_diag2_overlap_pairs_{kLiveryDiag2OverlapQuietFrames};
+  ReadbackKeyHistory livery_diag2_keys_;
+  PendingLongWaits livery_diag2_pending_waits_;
+  FrameWaitWindow livery_diag2_fence_waits_;
+  FrameWaitWindow livery_diag2_pipeline_waits_;
+  LiveryDiag2Counters livery_diag2_minute_;
+  LiveryDiag2TextureTracker livery_diag2_textures_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

@@ -103,6 +103,12 @@ class PipelineCache {
   // processor) thread meanwhile. kCompleted means creation has finished; the
   // pipeline state may still be nullptr if creation failed.
   PendingWaitResult AwaitPipeline(void* handle, uint64_t timeout_ms, uint64_t* elapsed_ms_out);
+  // The pipeline's current root signature (creation of a pending pipeline may
+  // replace the placeholder one returned by ConfigurePipeline).
+  ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->root_signature.load(
+        std::memory_order_acquire);
+  }
 
   enum class PipelineAuditStatus { kPending, kReady, kFailed };
   PipelineAuditStatus GetPipelineAuditStatus(void* handle) const {

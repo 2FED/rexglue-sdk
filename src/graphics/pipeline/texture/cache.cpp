@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <utility>
 
@@ -22,6 +23,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/util/livery_diag2.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -442,6 +444,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+  LiveryDiag2TextureTracker* livery_diag2 = livery_diag2_tracker_.load(std::memory_order_acquire);
+  if (livery_diag2 && livery_diag2->enabled()) {
+    LiveryDiag2ReportLoad(*livery_diag2, texture, pending_load.load_base, pending_load.load_mips);
+  }
 
   return true;
 }
@@ -748,7 +754,81 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
-  texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
+  TextureCache& texture_cache = texture.texture_cache();
+  texture_cache.texture_became_outdated_.store(true, std::memory_order_release);
+  LiveryDiag2TextureTracker* livery_diag2 =
+      texture_cache.livery_diag2_tracker_.load(std::memory_order_acquire);
+  if (livery_diag2 && livery_diag2->enabled()) {
+    texture_cache.LiveryDiag2ReportInvalidation(*livery_diag2, texture, argument != 0,
+                                                invalidated_by_gpu);
+  }
+}
+
+namespace {
+uint64_t LiveryDiag2TextureNowMs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
+
+void TextureCache::LiveryDiag2ReportLoad(LiveryDiag2TextureTracker& tracker, Texture& texture,
+                                         bool base, bool mips) {
+  TextureKey key = texture.key();
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  uint32_t format = uint32_t(key.format);
+  for (int part = 0; part < 2; ++part) {
+    bool is_mip = part != 0;
+    if (is_mip ? !mips : !base) {
+      continue;
+    }
+    uint32_t page = is_mip ? uint32_t(key.mip_page) : uint32_t(key.base_page);
+    uint32_t address = page << 12;
+    uint32_t length = is_mip ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+    LiveryDiag2TextureTracker::LoadDecision decision =
+        tracker.OnTextureLoad(LiveryDiag2TexturePartId(page, width, height, format, is_mip),
+                              address, length, width, height, format, LiveryDiag2TextureNowMs());
+    if (!decision.log) {
+      continue;
+    }
+    const RecentReadbackRanges::Match& rb = decision.readback;
+    REXGPU_INFO(
+        "MCLA_LIVERY_DIAG2 v=1 kind=tex_load frame={} part={} base={:08X} len={} size={}x{} "
+        "fmt={} tiled={} packed_mips={} mip_max={} scaled_resolve={} atlas_shape={} first={} "
+        "reload_without_inval={} rb_overlap={} rb_count={} rb_base={:08X} rb_len={} "
+        "rb_frames_ago={} rb_copied={} rb_copy_frames_ago={}",
+        decision.frame, is_mip ? "mips" : "base", address, length, width, height, format,
+        uint32_t(key.tiled), uint32_t(key.packed_mips), uint32_t(key.mip_max_level),
+        uint32_t(key.scaled_resolve), int(decision.atlas_shape), int(decision.first_upload),
+        int(decision.reload_without_invalidation), int(rb.found), rb.count, rb.address, rb.length,
+        rb.found ? int64_t(decision.frame) - int64_t(rb.last_resolve_frame) : int64_t(-1),
+        int(rb.copied),
+        rb.copied ? int64_t(decision.frame) - int64_t(rb.last_copy_frame) : int64_t(-1));
+  }
+}
+
+void TextureCache::LiveryDiag2ReportInvalidation(LiveryDiag2TextureTracker& tracker,
+                                                 Texture& texture, bool is_mip,
+                                                 bool invalidated_by_gpu) {
+  TextureKey key = texture.key();
+  uint32_t width = key.GetWidth();
+  uint32_t height = key.GetHeight();
+  uint32_t format = uint32_t(key.format);
+  uint32_t page = is_mip ? uint32_t(key.mip_page) : uint32_t(key.base_page);
+  LiveryDiag2TextureTracker::InvalidationDecision decision =
+      tracker.OnTextureInvalidated(LiveryDiag2TexturePartId(page, width, height, format, is_mip),
+                                   invalidated_by_gpu, LiveryDiag2TextureNowMs());
+  if (!decision.log) {
+    return;
+  }
+  REXGPU_INFO(
+      "MCLA_LIVERY_DIAG2 v=1 kind=tex_inval frame={} part={} base={:08X} len={} size={}x{} "
+      "fmt={} load_frame={} frames_since_load={} by_gpu={}",
+      decision.frame, is_mip ? "mips" : "base", page << 12,
+      is_mip ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize(), width, height, format,
+      decision.load_frame, int64_t(decision.frame) - int64_t(decision.load_frame),
+      int(invalidated_by_gpu));
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {

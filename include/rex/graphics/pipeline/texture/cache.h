@@ -28,6 +28,8 @@
 
 namespace rex::graphics {
 
+class LiveryDiag2TextureTracker;
+
 // Manages host copies of guest textures, performing untiling, format and endian
 // conversion of textures stored in the shared memory, and also handling
 // invalidation.
@@ -68,6 +70,13 @@ class TextureCache {
 
   // Returns whether the actual scale is not smaller than the requested one.
   static bool GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out);
+
+  // d3d12_livery_diag2 (MCLA KI-047): texture loads and their first
+  // write-watch invalidation are reported to the tracker while it is enabled.
+  // The tracker must outlive the texture cache.
+  void SetLiveryDiag2Tracker(LiveryDiag2TextureTracker* tracker) {
+    livery_diag2_tracker_.store(tracker, std::memory_order_release);
+  }
   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
   bool IsDrawResolutionScaled() const {
@@ -559,6 +568,10 @@ class TextureCache {
                           PendingSharedMemoryRange* pending_ranges_out,
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
+  void LiveryDiag2ReportLoad(LiveryDiag2TextureTracker& tracker, Texture& texture, bool base,
+                             bool mips);
+  void LiveryDiag2ReportInvalidation(LiveryDiag2TextureTracker& tracker, Texture& texture,
+                                     bool is_mip, bool invalidated_by_gpu);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
@@ -612,6 +625,8 @@ class TextureCache {
   // so need to recheck if textures aren't outdated, disregarding whether fetch
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
+
+  std::atomic<LiveryDiag2TextureTracker*> livery_diag2_tracker_{nullptr};
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
