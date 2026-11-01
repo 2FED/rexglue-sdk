@@ -277,6 +277,64 @@ TEST_CASE("Watch census page bitmaps", "[watch-census][ahead]") {
   CHECK(wc::AllPagesSet(bits.data(), 0, 255));
 }
 
+TEST_CASE("Watch census SetPages counts new bits like a page-by-page reference",
+          "[watch-census][ahead]") {
+  uint64_t state = 0xD1B54A32D192ED03ull;
+  const auto next = [&state] {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  for (int i = 0; i < 5000; ++i) {
+    std::vector<uint64_t> bits(4);
+    for (uint64_t& word : bits) {
+      word = (next() & 1) ? next() & next() : next();
+    }
+    std::vector<uint64_t> expected_bits = bits;
+    const uint32_t first = uint32_t(next() % 256);
+    const uint32_t last = first + uint32_t(next() % (256 - first));
+    uint64_t expected_added = 0;
+    for (uint32_t page = first; page <= last; ++page) {
+      const uint64_t bit = uint64_t(1) << (page & 63);
+      if (!(expected_bits[page >> 6] & bit)) {
+        ++expected_added;
+        expected_bits[page >> 6] |= bit;
+      }
+    }
+    REQUIRE(wc::SetPages(bits.data(), first, last) == expected_added);
+    REQUIRE(bits == expected_bits);
+  }
+}
+
+TEST_CASE("Watch census block histories advance by the closed frame's fault bits",
+          "[watch-census]") {
+  // 130 blocks: three fault words, the last one partly used.
+  constexpr size_t kBlocks = 130;
+  std::vector<uint8_t> history(kBlocks);
+  for (size_t b = 0; b < kBlocks; ++b) {
+    history[b] = uint8_t(b * 37);
+  }
+  std::vector<uint64_t> faulted(3, 0);
+  for (size_t b : {size_t(0), size_t(63), size_t(64), size_t(100), size_t(129)}) {
+    faulted[b >> 6] |= uint64_t(1) << (b & 63);
+  }
+  std::vector<uint8_t> next_history(kBlocks, 0xAA);
+  wc::AdvanceHistories(next_history.data(), history.data(), faulted.data(), kBlocks);
+  for (size_t b = 0; b < kBlocks; ++b) {
+    const bool hit = (faulted[b >> 6] >> (b & 63)) & 1;
+    REQUIRE(next_history[b] == wc::AdvanceHistory(history[b], hit));
+  }
+  // In place (out == in) gives the same result.
+  std::vector<uint8_t> in_place = history;
+  wc::AdvanceHistories(in_place.data(), in_place.data(), faulted.data(), kBlocks);
+  CHECK(in_place == next_history);
+  // Zero blocks touch nothing.
+  std::vector<uint8_t> untouched(4, 0x55);
+  wc::AdvanceHistories(untouched.data(), history.data(), faulted.data(), 0);
+  CHECK(untouched == std::vector<uint8_t>(4, 0x55));
+}
+
 TEST_CASE("Watch census snapshot difference and memory fields", "[watch-census]") {
   wc::Snapshot a, b;
   a.protect_calls[0][1] = 5;

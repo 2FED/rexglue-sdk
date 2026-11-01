@@ -117,6 +117,15 @@ constexpr uint8_t AdvanceHistory(uint8_t history, bool faulted_this_frame) {
   return uint8_t((history << 1) | (faulted_this_frame ? 1 : 0));
 }
 
+// Advances every block's history by one closed frame: out[b] =
+// AdvanceHistory(in[b], bit b of faulted). out may be the same array as in.
+constexpr void AdvanceHistories(uint8_t* out, const uint8_t* in, const uint64_t* faulted,
+                                size_t block_count) {
+  for (size_t block = 0; block < block_count; ++block) {
+    out[block] = AdvanceHistory(in[block], ((faulted[block >> 6] >> (block & 63)) & 1) != 0);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Step 1: disarm run building. Pages are fed in ascending order, every page of
 // the window exactly once.
@@ -262,9 +271,7 @@ constexpr uint64_t SetPages(uint64_t* bits, uint32_t first, uint32_t last) {
   uint64_t added = 0;
   for (uint32_t word = first >> 6; word <= (last >> 6); ++word) {
     const uint64_t mask = WordMask(word, first, last);
-    for (uint64_t fresh = mask & ~bits[word]; fresh; fresh &= fresh - 1) {
-      ++added;
-    }
+    added += uint64_t(std::popcount(mask & ~bits[word]));
     bits[word] |= mask;
   }
   return added;

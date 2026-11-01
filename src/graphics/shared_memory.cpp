@@ -172,6 +172,8 @@ void SharedMemory::InitializeCommon() {
 
   census_.history.assign(num_system_page_flags_, 0);
   census_.faulted.assign((num_system_page_flags_ + 63) / 64, 0);
+  census_.history_next.assign(num_system_page_flags_, 0);
+  census_.faulted_closed.assign((num_system_page_flags_ + 63) / 64, 0);
   census_.shadow[0].assign(num_system_page_flags_, 0);
   census_.shadow[1].assign(num_system_page_flags_, 0);
 
@@ -256,7 +258,9 @@ void SharedMemory::InvalidateAllPages() {
   // Force a refresh on the next frame-end sync.
   dirty_blocks_.store(UINT32_MAX, std::memory_order_relaxed);
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
-  ClearCensusShadowsLocked();
+  if (census_enabled_.load(std::memory_order_relaxed)) {
+    ClearCensusShadowsLocked();
+  }
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
@@ -295,8 +299,10 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
   staging_valid_flags_.store(old_active, std::memory_order_release);
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
-  {
-    // Valid is now GPU-written only: no CPU upload stays in the step 2 shadow.
+  // Valid is now GPU-written only: no CPU upload stays in the step 2 shadow.
+  // The shadow is kept only while the census is on (switching the census on
+  // clears it), so without the census nothing is locked or cleared here.
+  if (census_enabled_.load(std::memory_order_relaxed)) {
     auto global_lock = global_critical_region_.Acquire();
     ClearCensusShadowsLocked();
   }
@@ -532,7 +538,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         census ? &arm : nullptr);
   }
   if (census) {
-    const uint32_t source = uint32_t(written_by_gpu ? RequestSource::kGpuWritten : request_source_);
+    const uint32_t source =
+        uint32_t(written_by_gpu ? RequestSource::kGpuWritten
+                                : request_source_.load(std::memory_order_relaxed));
     ++census_.valid_calls[source];
     census_.arm_calls[source] += arm.calls;
     census_.arm_ticks[source] += arm.ticks;
@@ -680,7 +688,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     ++perf_split_->counters.request_calls;
   }
   const bool census = CensusCounting();
-  const uint32_t census_source = uint32_t(request_source_);
+  const uint32_t census_source = uint32_t(request_source_.load(std::memory_order_relaxed));
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
   // Called for every draw and texture request: reuse per-thread storage
@@ -967,7 +975,9 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
   dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
 
-  if (census_.shadow[0].size() == num_system_page_flags_) {
+  // Step 2 shadow: only while the census is on (switching it on clears it).
+  if (census_enabled_.load(std::memory_order_relaxed) &&
+      census_.shadow[0].size() == num_system_page_flags_) {
     for (auto& shadow : census_.shadow) {
       wc::ClearPages(shadow.data(), page_first, page_last);
     }
@@ -987,7 +997,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
 void SharedMemory::WatchCensusFrameEnd() {
   const uint32_t tid = rex::thread::current_thread_system_id();
-  census_thread_id_ = tid;
+  census_thread_id_.store(tid, std::memory_order_relaxed);
   wc::SetCommandProcessorThread(tid);
   const bool enabled = wc::Enabled();
   if (enabled != census_enabled_.load(std::memory_order_relaxed)) {
@@ -1003,19 +1013,28 @@ void SharedMemory::WatchCensusFrameEnd() {
   if (!enabled) {
     return;
   }
-  auto global_lock = global_critical_region_.Acquire();
-  if (census_.base_tsc == 0) {
-    // The first window starts with the first counted frame.
-    ResetCensusWindow(true);
+  // The global lock is held only for O(1) swaps: the closed frame's fault
+  // bits are taken out under it (faulted_closed is all zero here), the next
+  // history is built outside it (history is written only by this thread, so
+  // reading it here needs no lock), and swapped in under it again.
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (census_.base_tsc == 0) {
+      // The first window starts with the first counted frame.
+      ResetCensusWindow(true);
+    }
+    census_.active_in_window = true;
+    ++census_.frames;
+    census_.faulted.swap(census_.faulted_closed);
   }
-  census_.active_in_window = true;
-  ++census_.frames;
-  const size_t block_count = census_.history.size();
-  for (size_t block = 0; block < block_count; ++block) {
-    census_.history[block] = wc::AdvanceHistory(
-        census_.history[block], ((census_.faulted[block >> 6] >> (block & 63)) & 1) != 0);
+  const size_t block_count = std::min(census_.history.size(), census_.history_next.size());
+  wc::AdvanceHistories(census_.history_next.data(), census_.history.data(),
+                       census_.faulted_closed.data(), block_count);
+  std::fill(census_.faulted_closed.begin(), census_.faulted_closed.end(), uint64_t(0));
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    census_.history.swap(census_.history_next);
   }
-  std::fill(census_.faulted.begin(), census_.faulted.end(), uint64_t(0));
 }
 
 void SharedMemory::ResetCensusWindow(bool clear_lock_counters) {
@@ -1089,31 +1108,70 @@ std::string SharedMemory::WatchCensusReport(std::string_view kind, std::string_v
                    ms(c.arm_ticks[s]));
   }
 
-  auto global_lock = global_critical_region_.Acquire();
+  // Under the global lock only the block walk and copies of the lock-side
+  // counters (no allocation, no formatting); everything is formatted after
+  // the lock is released.
   // Blocks by hotness class (faulted in K of the last 8 closed frames), with
   // texture/range watches and GPU-written pages.
   uint64_t hot_blocks[wc::kHotnessClassCount] = {};
   uint64_t hot_tex[wc::kHotnessClassCount] = {};
   uint64_t hot_gpu[wc::kHotnessClassCount] = {};
-  for (uint32_t block = 0; block < c.history.size(); ++block) {
-    if (!c.history[block]) {
-      continue;
-    }
-    const uint32_t h = wc::HotnessClass(c.history[block]);
-    ++hot_blocks[h];
-    if (block < system_page_flags_valid_and_gpu_written_.size() &&
-        system_page_flags_valid_and_gpu_written_[block]) {
-      ++hot_gpu[h];
-    }
-    const uint32_t page_first = block << 6;
-    const uint32_t page_last = page_first + 63;
-    const uint32_t bucket = (page_first << page_size_log2_) >> kWatchBucketSizeLog2;
-    for (const WatchNode* node = bucket < kWatchBucketCount ? watch_buckets_[bucket] : nullptr;
-         node != nullptr; node = node->bucket_node_next) {
-      if (node->range->page_first <= page_last && node->range->page_last >= page_first) {
-        ++hot_tex[h];
-        break;
+  uint64_t cpu_faults = 0;
+  uint64_t class_faults[wc::kHotnessClassCount] = {};
+  uint64_t shadow_saved_uploads[2] = {};
+  uint64_t shadow_saved_pages[2] = {};
+  uint64_t shadow_saved_arms[2] = {};
+  uint64_t shadow_ext_pages[2] = {};
+  uint64_t ahead_extended_runs = 0;
+  uint64_t ahead_extra_pages = 0;
+  uint64_t ahead_lock_misses = 0;
+  // The command-processor-thread counters, copied before a reset.
+  uint64_t class_requests[wc::kHotnessClassCount] = {};
+  uint64_t class_fast[wc::kHotnessClassCount] = {};
+  uint64_t class_uploads[wc::kHotnessClassCount] = {};
+  uint64_t class_upload_pages[wc::kHotnessClassCount] = {};
+  uint64_t class_arm_calls[wc::kHotnessClassCount] = {};
+  std::copy(std::begin(c.class_requests), std::end(c.class_requests), class_requests);
+  std::copy(std::begin(c.class_fast), std::end(c.class_fast), class_fast);
+  std::copy(std::begin(c.class_uploads), std::end(c.class_uploads), class_uploads);
+  std::copy(std::begin(c.class_upload_pages), std::end(c.class_upload_pages), class_upload_pages);
+  std::copy(std::begin(c.class_arm_calls), std::end(c.class_arm_calls), class_arm_calls);
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    for (uint32_t block = 0; block < c.history.size(); ++block) {
+      if (!c.history[block]) {
+        continue;
       }
+      const uint32_t h = wc::HotnessClass(c.history[block]);
+      ++hot_blocks[h];
+      if (block < system_page_flags_valid_and_gpu_written_.size() &&
+          system_page_flags_valid_and_gpu_written_[block]) {
+        ++hot_gpu[h];
+      }
+      const uint32_t page_first = block << 6;
+      const uint32_t page_last = page_first + 63;
+      const uint32_t bucket = (page_first << page_size_log2_) >> kWatchBucketSizeLog2;
+      for (const WatchNode* node = bucket < kWatchBucketCount ? watch_buckets_[bucket] : nullptr;
+           node != nullptr; node = node->bucket_node_next) {
+        if (node->range->page_first <= page_last && node->range->page_last >= page_first) {
+          ++hot_tex[h];
+          break;
+        }
+      }
+    }
+    cpu_faults = c.cpu_faults;
+    std::copy(std::begin(c.class_faults), std::end(c.class_faults), class_faults);
+    for (uint32_t k = 0; k < 2; ++k) {
+      shadow_saved_uploads[k] = c.shadow_saved_uploads[k];
+      shadow_saved_pages[k] = c.shadow_saved_pages[k];
+      shadow_saved_arms[k] = c.shadow_saved_arms[k];
+      shadow_ext_pages[k] = c.shadow_ext_pages[k];
+    }
+    ahead_extended_runs = c.ahead_extended_runs;
+    ahead_extra_pages = c.ahead_extra_pages;
+    ahead_lock_misses = c.ahead_lock_misses;
+    if (reset) {
+      ResetCensusWindow(true);
     }
   }
   const auto classes = [&](std::string_view name, const uint64_t* values, uint32_t count) {
@@ -1126,26 +1184,23 @@ std::string SharedMemory::WatchCensusReport(std::string_view kind, std::string_v
   classes("hot_blocks", hot_blocks, wc::kHotnessClassCount - 1);
   classes("hot_blocks_tex", hot_tex, wc::kHotnessClassCount - 1);
   classes("hot_blocks_gpu", hot_gpu, wc::kHotnessClassCount - 1);
-  fmt::format_to(std::back_inserter(out), " cpu_faults={}", c.cpu_faults);
-  classes("by_hot_faults", c.class_faults, wc::kHotnessClassCount);
-  classes("by_hot_requests", c.class_requests, wc::kHotnessClassCount);
-  classes("by_hot_fast", c.class_fast, wc::kHotnessClassCount);
-  classes("by_hot_uploads", c.class_uploads, wc::kHotnessClassCount);
-  classes("by_hot_upload_pages", c.class_upload_pages, wc::kHotnessClassCount);
-  classes("by_hot_arms", c.class_arm_calls, wc::kHotnessClassCount);
+  fmt::format_to(std::back_inserter(out), " cpu_faults={}", cpu_faults);
+  classes("by_hot_faults", class_faults, wc::kHotnessClassCount);
+  classes("by_hot_requests", class_requests, wc::kHotnessClassCount);
+  classes("by_hot_fast", class_fast, wc::kHotnessClassCount);
+  classes("by_hot_uploads", class_uploads, wc::kHotnessClassCount);
+  classes("by_hot_upload_pages", class_upload_pages, wc::kHotnessClassCount);
+  classes("by_hot_arms", class_arm_calls, wc::kHotnessClassCount);
   static constexpr uint32_t kCaps[2] = {16, 64};
   for (uint32_t k = 0; k < 2; ++k) {
     fmt::format_to(std::back_inserter(out),
                    " ahead_shadow{}=saved_uploads:{},saved_pages:{},saved_arms:{},ext_pages:{}",
-                   kCaps[k], c.shadow_saved_uploads[k], c.shadow_saved_pages[k],
-                   c.shadow_saved_arms[k], c.shadow_ext_pages[k]);
+                   kCaps[k], shadow_saved_uploads[k], shadow_saved_pages[k], shadow_saved_arms[k],
+                   shadow_ext_pages[k]);
   }
   fmt::format_to(std::back_inserter(out),
                  " ahead_extended_runs={} ahead_extra_pages={} ahead_lock_misses={}",
-                 c.ahead_extended_runs, c.ahead_extra_pages, c.ahead_lock_misses);
-  if (reset) {
-    ResetCensusWindow(true);
-  }
+                 ahead_extended_runs, ahead_extra_pages, ahead_lock_misses);
   return out;
 }
 

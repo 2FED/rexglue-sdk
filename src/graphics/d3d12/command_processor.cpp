@@ -3608,24 +3608,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (memexport_used_pixel) {
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
-  SharedMemory::ScopedRequestSource memexport_census_source(
-      *shared_memory_, SharedMemory::RequestSource::kMemexport);
-  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-    if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
-                                      memexport_range.size_bytes)) {
-      REXGPU_ERROR(
-          "Failed to request memexport stream at 0x{:08X} (size {}) in the "
-          "shared memory",
-          memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
-      return false;
+  if (memexport_used) {
+    // M10 watch census: only the memexport requests are attributed to it.
+    SharedMemory::ScopedRequestSource memexport_census_source(
+        *shared_memory_, SharedMemory::RequestSource::kMemexport);
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      if (!shared_memory_->RequestRange(memexport_range.base_address_dwords << 2,
+                                        memexport_range.size_bytes)) {
+        REXGPU_ERROR(
+            "Failed to request memexport stream at 0x{:08X} (size {}) in the "
+            "shared memory",
+            memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
+        return false;
+      }
     }
-  }
-  if (memexport_used && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
-      REXGPU_ERROR(
-          "Failed to request full shared memory residency for unresolved "
-          "memexport destinations");
-      return false;
+    if (memexport_ranges_.empty()) {
+      if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+        REXGPU_ERROR(
+            "Failed to request full shared memory residency for unresolved "
+            "memexport destinations");
+        return false;
+      }
     }
   }
   perf_chain.Mark(rex::perf::PerfPhase::kVertexRanges);

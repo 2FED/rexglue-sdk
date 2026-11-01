@@ -59,10 +59,13 @@ class SharedMemory {
   class ScopedRequestSource {
    public:
     ScopedRequestSource(SharedMemory& shared_memory, RequestSource source)
-        : shared_memory_(shared_memory), previous_(shared_memory.request_source_) {
-      shared_memory.request_source_ = source;
+        : shared_memory_(shared_memory),
+          previous_(shared_memory.request_source_.load(std::memory_order_relaxed)) {
+      shared_memory.request_source_.store(source, std::memory_order_relaxed);
     }
-    ~ScopedRequestSource() { shared_memory_.request_source_ = previous_; }
+    ~ScopedRequestSource() {
+      shared_memory_.request_source_.store(previous_, std::memory_order_relaxed);
+    }
     ScopedRequestSource(const ScopedRequestSource&) = delete;
     ScopedRequestSource& operator=(const ScopedRequestSource&) = delete;
 
@@ -162,6 +165,12 @@ class SharedMemory {
   // much).
   static constexpr uint32_t kHostGpuMemoryOptimalSparseAllocationLog2 = 22;
   static_assert(kHostGpuMemoryOptimalSparseAllocationLog2 <= kBufferSizeLog2);
+  // M10 upload-ahead (shared_memory_upload_ahead_pages) extends runs inside
+  // their 256 KiB block (64 pages of 4 KiB) after EnsureHostGpuMemoryAllocated
+  // ran on the unextended ranges: every sparse allocation unit must cover and
+  // align to whole blocks.
+  static_assert(kHostGpuMemoryOptimalSparseAllocationLog2 >= 6 + 12,
+                "the sparse allocation unit must cover a 256 KiB upload-ahead block");
 
   memory::Memory& memory() const { return memory_; }
 
@@ -232,12 +241,15 @@ class SharedMemory {
   uint32_t perf_split_thread_id_ = 0;
 
   // M10 watch census and upload-ahead (shared_memory_upload_ahead_pages).
-  RequestSource request_source_ = RequestSource::kOther;
+  // Relaxed atomics: written by the command processor thread, read by any
+  // thread that requests or validates ranges.
+  std::atomic<RequestSource> request_source_{RequestSource::kOther};
   std::atomic<bool> census_enabled_{false};
-  uint32_t census_thread_id_ = 0;
+  std::atomic<uint32_t> census_thread_id_{0};
   bool CensusCounting() const {
     return census_enabled_.load(std::memory_order_relaxed) &&
-           census_thread_id_ == rex::thread::current_thread_system_id();
+           census_thread_id_.load(std::memory_order_relaxed) ==
+               rex::thread::current_thread_system_id();
   }
   uint32_t CensusBlockClass(uint32_t page) const;
   struct WatchCensus {
@@ -262,8 +274,14 @@ class SharedMemory {
     // Global critical region.
     uint64_t cpu_faults = 0;
     uint64_t class_faults[memory::watch_census::kHotnessClassCount] = {};
+    // history is written only by the command processor thread (swapped in
+    // under the lock); other threads read it under the lock.
     std::vector<uint8_t> history;   // per 256 KiB block
     std::vector<uint64_t> faulted;  // per block bit, this frame
+    // Command processor thread only: the closed frame's fault bits and the
+    // next history, built outside the lock (swapped with the two above).
+    std::vector<uint64_t> faulted_closed;
+    std::vector<uint8_t> history_next;
     // Step 2 shadow at 16 and 64 pages (upload-ahead off only).
     std::vector<uint64_t> shadow[2];
     uint64_t shadow_saved_uploads[2] = {};
