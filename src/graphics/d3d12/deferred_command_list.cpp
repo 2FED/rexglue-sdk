@@ -11,6 +11,7 @@
  */
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
@@ -30,6 +31,13 @@
 #include <immintrin.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(d3d12_replay_batched_wake, false, "GPU/D3D12",
+                    "M10-CPU-F: the streaming replay worker spins 128 instead of 4096 pauses "
+                    "before sleeping, and the command processor wakes it only every 512 "
+                    "commands (at once after a block seal and at the end of a submission). "
+                    "Read at the start of each submission")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -44,6 +52,8 @@ struct ReplayStats {
   uint64_t replay_us = 0;
   uint64_t finish_wait_us = 0;
   uint64_t worker_sleeps = 0;
+  // M10-CPU-F idle and wake counters (MCLA_REPLAY_WAKE).
+  ReplayWakeCounters wake;
   std::chrono::steady_clock::time_point next_report{};
 };
 ReplayStats g_replay_stats;
@@ -78,6 +88,9 @@ void ReportReplayStats() {
       "worker sleeps {}, commands {}, barriers {}; by id{}",
       s.submissions, s.streamed_submissions, s.replay_us, s.finish_wait_us, s.worker_sleeps, total,
       s.barrier_count, top);
+  s.wake.sleeps = s.worker_sleeps;
+  REXGPU_INFO("{}", FormatReplayWakeLine(REXCVAR_GET(d3d12_replay_batched_wake), s.wake));
+  s.wake = {};
   s.command_count.fill(0);
   s.barrier_count = s.submissions = s.streamed_submissions = 0;
   s.replay_us = s.finish_wait_us = s.worker_sleeps = 0;
@@ -131,18 +144,36 @@ void DeferredCommandList::Reset() {
   published_.store(0, std::memory_order_relaxed);
 }
 
-void DeferredCommandList::Publish() {
+void DeferredCommandList::Publish(bool force_wake) {
   // Everything up to the current write position is complete. The fence pairs
   // with the worker's seq_cst store of worker_sleeping_ before it re-checks the
-  // published position, so a wake-up cannot be lost.
+  // published position, so a wake-up cannot be lost. With the batched wake a
+  // sleeping worker may be left asleep for up to one wake batch; it is always
+  // woken after a block seal and by FinishStreaming.
+  const uint32_t commands = unpublished_commands_;
   unpublished_commands_ = 0;
   published_.store((uint64_t(write_block_) << 32) | uint64_t(write_used_),
                    std::memory_order_release);
   std::atomic_thread_fence(std::memory_order_seq_cst);
-  if (streaming_ && worker_sleeping_.load(std::memory_order_relaxed)) {
-    std::lock_guard<std::mutex> lock(worker_mutex_);
-    worker_cond_.notify_all();
+  if (!streaming_) {
+    return;
   }
+  switch (wake_batcher_.OnPublish(commands, worker_sleeping_.load(std::memory_order_relaxed),
+                                  force_wake)) {
+    case ReplayWakeBatcher::Decision::kNone:
+      return;
+    case ReplayWakeBatcher::Decision::kDeferred:
+      ++g_replay_stats.wake.deferred_wakes;
+      return;
+    case ReplayWakeBatcher::Decision::kWake:
+      ++g_replay_stats.wake.wakes;
+      break;
+    case ReplayWakeBatcher::Decision::kForced:
+      ++g_replay_stats.wake.forced_wakes;
+      break;
+  }
+  std::lock_guard<std::mutex> lock(worker_mutex_);
+  worker_cond_.notify_all();
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
@@ -158,6 +189,9 @@ void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_b
   if (write_used_ + command_size_elements > block->capacity) {
     // Seal the current block before moving to the next one.
     block->used.store(write_used_, std::memory_order_release);
+    if (streaming_) {
+      wake_batcher_.NoteSeal();
+    }
     EnsureBlock(write_block_ + 1, std::max(kBlockElements, command_size_elements));
     ++write_block_;
     write_used_ = 0;
@@ -205,17 +239,24 @@ void DeferredCommandList::BeginStreaming(ID3D12GraphicsCommandList* command_list
   if (!worker_.joinable()) {
     worker_ = std::thread([this] { WorkerMain(); });
   }
+  const bool batched_wake = REXCVAR_GET(d3d12_replay_batched_wake);
+  wake_batcher_.Begin(batched_wake);
+  ++g_replay_stats.wake.submissions;
+  if (batched_wake) {
+    ++g_replay_stats.wake.batched_submissions;
+  }
   {
     std::lock_guard<std::mutex> lock(worker_mutex_);
     assert_true(worker_state_ == WorkerState::kIdle);
     worker_command_list_ = command_list;
     worker_command_list_1_ = command_list_1;
+    worker_batched_wake_ = batched_wake;
     worker_finish_requested_.store(false, std::memory_order_relaxed);
     worker_state_ = WorkerState::kStreaming;
   }
   streaming_ = true;
   // Commands written before streaming started (after Reset) become visible.
-  Publish();
+  Publish(true);
   worker_cond_.notify_all();
 }
 
@@ -223,7 +264,7 @@ void DeferredCommandList::FinishStreaming() {
   assert_true(streaming_);
   const auto wait_begin = std::chrono::steady_clock::now();
   blocks_[write_block_]->used.store(write_used_, std::memory_order_release);
-  Publish();
+  Publish(true);
   {
     std::unique_lock<std::mutex> lock(worker_mutex_);
     worker_finish_requested_.store(true, std::memory_order_seq_cst);
@@ -244,6 +285,7 @@ void DeferredCommandList::WorkerMain() {
   rex::thread::set_current_thread_name("D3D12 Replay");
   while (true) {
     ReplayState state;
+    uint32_t spin_limit = kReplaySpinPausesDefault;
     {
       std::unique_lock<std::mutex> lock(worker_mutex_);
       worker_cond_.wait(lock, [this] { return worker_state_ != WorkerState::kIdle; });
@@ -252,11 +294,27 @@ void DeferredCommandList::WorkerMain() {
       }
       state.command_list = worker_command_list_;
       state.command_list_1 = worker_command_list_1_;
+      spin_limit = ReplaySpinLimit(worker_batched_wake_);
     }
     size_t cursor_block = 0;
     size_t cursor_offset = 0;
     uint64_t replay_ns = 0;
     uint32_t idle_spins = 0;
+    // M10-CPU-F: idle-spin accounting (one clock read at each end of an idle
+    // episode, none per pause).
+    uint64_t idle_episodes = 0;
+    uint64_t spin_pauses = 0;
+    uint64_t spin_ns = 0;
+    std::chrono::steady_clock::time_point spin_begin{};
+    const auto end_spin = [&]() {
+      if (idle_spins) {
+        spin_pauses += idle_spins;
+        spin_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - spin_begin)
+                                .count());
+        idle_spins = 0;
+      }
+    };
     while (true) {
       uint64_t published = published_.load(std::memory_order_acquire);
       size_t published_block = size_t(published >> 32);
@@ -274,7 +332,7 @@ void DeferredCommandList::WorkerMain() {
         }
         ++cursor_block;
         cursor_offset = 0;
-        idle_spins = 0;
+        end_spin();
         continue;
       }
       if (cursor_offset < published_offset) {
@@ -285,7 +343,7 @@ void DeferredCommandList::WorkerMain() {
                                   std::chrono::steady_clock::now() - begin)
                                   .count());
         cursor_offset = published_offset;
-        idle_spins = 0;
+        end_spin();
         continue;
       }
       // Caught up with the writer.
@@ -293,15 +351,20 @@ void DeferredCommandList::WorkerMain() {
         // FinishStreaming publishes the final position before requesting the
         // finish, so if nothing new is visible now, everything is replayed.
         if (published_.load(std::memory_order_acquire) == published) {
+          end_spin();
           break;
         }
         continue;
       }
-      if (++idle_spins < 4096) {
+      if (!idle_spins) {
+        ++idle_episodes;
+        spin_begin = std::chrono::steady_clock::now();
+      }
+      if (++idle_spins < spin_limit) {
         SpinPause();
         continue;
       }
-      idle_spins = 0;
+      end_spin();
       std::unique_lock<std::mutex> lock(worker_mutex_);
       worker_sleeping_.store(true, std::memory_order_seq_cst);
       if (published_.load(std::memory_order_seq_cst) == published &&
@@ -318,6 +381,9 @@ void DeferredCommandList::WorkerMain() {
       std::lock_guard<std::mutex> lock(worker_mutex_);
       g_replay_stats.replay_us += replay_ns / 1000;
       g_replay_total_us.fetch_add(replay_ns / 1000, std::memory_order_relaxed);
+      g_replay_stats.wake.idle_episodes += idle_episodes;
+      g_replay_stats.wake.spin_pauses += spin_pauses;
+      g_replay_stats.wake.spin_us += spin_ns / 1000;
       worker_state_ = WorkerState::kIdle;
     }
     worker_done_cond_.notify_all();

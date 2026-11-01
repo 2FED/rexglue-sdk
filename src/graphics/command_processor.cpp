@@ -40,6 +40,12 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(d3d12_wrm_event_wake, false, "GPU",
+                    "M10-CPU-B: with vsync on, a failed WAIT_REG_MEM poll waits on an event set "
+                    "after every guest interrupt dispatch (bounded by the old sleep) instead of "
+                    "sleeping a timer quantum; the predicate is re-checked after every wake")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -113,8 +119,37 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
-      write_ptr_index_(0) {
+      write_ptr_index_(0),
+      wrm_wake_event_(rex::thread::Event::CreateAutoResetEvent(false)) {
   assert_not_null(write_ptr_index_event_);
+  assert_not_null(wrm_wake_event_);
+}
+
+void CommandProcessor::NotifyWaitRegMemWake() {
+  if (!REXCVAR_GET(d3d12_wrm_event_wake) || !wrm_wake_event_) {
+    return;
+  }
+  // The command processor's own INTERRUPT packets run the callback on its
+  // thread, before its next poll: no signal needed (it would only be stale).
+  if (rex::thread::current_thread_system_id() ==
+      wrm_cp_thread_id_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  wrm_wake_event_->Set();
+  wrm_signals_.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string CommandProcessor::WaitRegMemReport(std::string_view kind, std::string_view reason,
+                                               uint64_t frame, bool reset) {
+  const uint64_t signals = wrm_signals_.load(std::memory_order_relaxed);
+  wrm_window_.signals = signals - wrm_signals_reported_;
+  std::string line =
+      FormatWrmLine(kind, reason, frame, REXCVAR_GET(d3d12_wrm_event_wake), wrm_window_);
+  if (reset) {
+    wrm_window_ = {};
+    wrm_signals_reported_ = signals;
+  }
+  return line;
 }
 
 CommandProcessor::~CommandProcessor() = default;
@@ -319,6 +354,7 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  wrm_cp_thread_id_.store(rex::thread::current_thread_system_id(), std::memory_order_relaxed);
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
@@ -1202,22 +1238,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   // Immediately satisfied packets need no clock reads. A waited packet records
   // one completed episode, not a clock read on each polling iteration.
-  bool wait_started = false;
   std::chrono::steady_clock::time_point wait_begin;
-  const auto record_wait = [&]() {
-    if (wait_started) {
-      const auto waited_us =
-          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - wait_begin)
-                                    .count());
-      performance_command_wait_reg_mem_us_.fetch_add(waited_us, std::memory_order_relaxed);
-      if (is_memory) {
-        performance_command_wait_reg_mem_memory_us_.fetch_add(waited_us, std::memory_order_relaxed);
-      }
-    }
-  };
-  bool matched = false;
-  do {
+  const auto poll = [&]() {
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1233,60 +1255,88 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
     switch (wait_info & 0x7) {
       case 0x0:  // Never.
-        matched = false;
-        break;
+        return false;
       case 0x1:  // Less than reference.
-        matched = (value & mask) < ref;
-        break;
+        return (value & mask) < ref;
       case 0x2:  // Less than or equal to reference.
-        matched = (value & mask) <= ref;
-        break;
+        return (value & mask) <= ref;
       case 0x3:  // Equal to reference.
-        matched = (value & mask) == ref;
-        break;
+        return (value & mask) == ref;
       case 0x4:  // Not equal to reference.
-        matched = (value & mask) != ref;
-        break;
+        return (value & mask) != ref;
       case 0x5:  // Greater than or equal to reference.
-        matched = (value & mask) >= ref;
-        break;
+        return (value & mask) >= ref;
       case 0x6:  // Greater than reference.
-        matched = (value & mask) > ref;
-        break;
+        return (value & mask) > ref;
       case 0x7:  // Always
-        matched = true;
-        break;
+      default:
+        return true;
     }
-    if (!matched) {
-      if (!wait_started) {
-        wait_begin = std::chrono::steady_clock::now();
-        wait_started = true;
+  };
+  const auto block = [&](uint32_t failed_polls) {
+    WrmBlockResult result;
+    if (failed_polls == 1) {
+      wait_begin = std::chrono::steady_clock::now();
+    }
+    // Wait.
+    if (wait < 0x100) {
+      rex::thread::MaybeYield();
+      return result;
+    }
+    PrepareForWait();
+    if (!REXCVAR_GET(vsync)) {
+      // User wants it fast and dangerous.
+      result.kind = WrmBlockKind::kYieldLong;
+      rex::thread::MaybeYield();
+    } else {
+      const auto timeout = std::chrono::milliseconds(wait / 0x100);
+      const bool event_wake = REXCVAR_GET(d3d12_wrm_event_wake);
+      if (event_wake != wrm_event_wake_logged_) {
+        wrm_event_wake_logged_ = event_wake;
+        REXGPU_INFO("MCLA WRM event wake: {}", event_wake ? "on" : "off");
       }
-      // Wait.
-      if (wait >= 0x100) {
-        PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
-          // User wants it fast and dangerous.
-          rex::thread::MaybeYield();
-        } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
-        }
-        rex::thread::SyncMemory();
-        ReturnFromWait();
-
-        if (!worker_running_) {
-          // Short-circuited exit.
-          record_wait();
-          return false;
-        }
+      const auto block_begin = std::chrono::steady_clock::now();
+      if (event_wake) {
+        // Auto-reset: a signal set before this wait is kept and returns at
+        // once; the loop re-polls after every return, so none is missed.
+        result.kind = WrmBlockKind::kEvent;
+        result.signaled = rex::thread::Wait(wrm_wake_event_.get(), false, timeout) ==
+                          rex::thread::WaitResult::kSuccess;
       } else {
-        rex::thread::MaybeYield();
+        result.kind = WrmBlockKind::kSleep;
+        rex::thread::Sleep(timeout);
       }
+      result.blocked_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - block_begin)
+                                       .count());
     }
-  } while (!matched);
+    rex::thread::SyncMemory();
+    ReturnFromWait();
+    return result;
+  };
+  const WrmLoopResult loop = RunWaitRegMemLoop(
+      poll, block, [&](const WrmBlockResult& step) { wrm_window_.CountBlock(step); },
+      [&]() { return worker_running_.load(); });
 
-  record_wait();
-  return true;
+  uint64_t waited_us = 0;
+  if (loop.failed_polls) {
+    waited_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - wait_begin)
+                             .count());
+    performance_command_wait_reg_mem_us_.fetch_add(waited_us, std::memory_order_relaxed);
+    if (is_memory) {
+      performance_command_wait_reg_mem_memory_us_.fetch_add(waited_us, std::memory_order_relaxed);
+    }
+  }
+  WrmPredicate predicate;
+  predicate.is_memory = is_memory;
+  predicate.address = poll_reg_addr;
+  predicate.function = wait_info & 0x7;
+  predicate.ref = ref;
+  predicate.mask = mask;
+  wrm_window_.CountPacket(predicate, loop.matched, loop.failed_polls, loop.stale_wakes, waited_us);
+  // Short-circuited exit when the command processor stopped.
+  return loop.matched;
 }
 
 bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, uint32_t packet,

@@ -4809,6 +4809,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
           REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=minute {}", ReadbackSyncMinuteReport());
           readback_sync_minute_ = {};
         }
+        // M10-CPU-B: WAIT_REG_MEM episodes of the minute (always on).
+        REXGPU_INFO("{}", WaitRegMemReport("minute", "minute", frame_current_, true));
         frame_intervals_us.clear();
         if (!frame_draws.empty()) {
           std::sort(frame_draws.begin(), frame_draws.end());
@@ -4837,6 +4839,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     {
       std::string flight_reason;
       if (rex::perf::TakeDiagFlightDump(flight_reason)) {
+        // M10-CPU-B: the current minute's WAIT_REG_MEM counters so far.
+        REXGPU_INFO("{}", WaitRegMemReport("mark", flight_reason, frame_current_, false));
         if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
           REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=mark reason={} {}", flight_reason,
                       ReadbackSyncMinuteReport());

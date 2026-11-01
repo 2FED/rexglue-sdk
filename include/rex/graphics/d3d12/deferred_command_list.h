@@ -23,6 +23,7 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/util/replay_wake.h>
 #include <rex/literals.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_api.h>
@@ -685,7 +686,8 @@ class DeferredCommandList {
     std::atomic<size_t> used{0};
   };
   void EnsureBlock(size_t index, size_t min_elements);
-  void Publish();
+  // `force_wake` notifies a sleeping worker regardless of the wake batch.
+  void Publish(bool force_wake = false);
   std::array<std::unique_ptr<Block>, kMaxBlocks> blocks_;
   size_t write_block_ = 0;
   size_t write_used_ = 0;
@@ -693,6 +695,8 @@ class DeferredCommandList {
   // cache line the worker polls from bouncing on every command.
   static constexpr uint32_t kPublishBatchCommands = 32;
   uint32_t unpublished_commands_ = 0;
+  // M10-CPU-F (d3d12_replay_batched_wake): CP-side wake decisions.
+  ReplayWakeBatcher wake_batcher_;
   // (block << 32) | elements: everything before this position is complete.
   // Kept on its own cache line, apart from the writer-only state above.
   alignas(64) std::atomic<uint64_t> published_{0};
@@ -709,6 +713,8 @@ class DeferredCommandList {
   std::atomic<bool> worker_finish_requested_{false};
   ID3D12GraphicsCommandList* worker_command_list_ = nullptr;
   ID3D12GraphicsCommandList1* worker_command_list_1_ = nullptr;
+  // The batched wake of the current submission (guarded by worker_mutex_).
+  bool worker_batched_wake_ = false;
 };
 
 }  // namespace rex::graphics::d3d12

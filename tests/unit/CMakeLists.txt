@@ -31,6 +31,8 @@ add_executable(unit_tests
     graphics/livery_diag_test.cpp
     graphics/livery_diag2_test.cpp
     graphics/readback_sync_test.cpp
+    graphics/wait_reg_mem_stats_test.cpp
+    graphics/replay_wake_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

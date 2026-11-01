@@ -19,12 +19,14 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
+#include <rex/graphics/util/wait_reg_mem_stats.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
@@ -238,7 +240,17 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  // M10-CPU-B: called after every guest interrupt dispatch. While
+  // d3d12_wrm_event_wake is on, sets the WAIT_REG_MEM wake event (not from the
+  // command processor thread itself). Any thread.
+  void NotifyWaitRegMemWake();
+
  protected:
+  // MCLA_WRM line of the current window (command processor thread); `reset`
+  // starts a new window.
+  std::string WaitRegMemReport(std::string_view kind, std::string_view reason, uint64_t frame,
+                               bool reset);
+
   // Stack-only diagnostic scope: no allocation, logging or per-iteration
   // clock reads. Completion is recorded on early returns and unwinding too.
   // Separate relaxed counters are intentionally not a transactional snapshot;
@@ -402,6 +414,15 @@ class CommandProcessor {
 
   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+
+  // M10-CPU-B WAIT_REG_MEM event wake and counters. The event is auto-reset;
+  // the window counters are command processor thread only.
+  std::unique_ptr<rex::thread::Event> wrm_wake_event_;
+  std::atomic<uint32_t> wrm_cp_thread_id_{0};
+  std::atomic<uint64_t> wrm_signals_{0};
+  uint64_t wrm_signals_reported_ = 0;
+  WrmCounters wrm_window_;
+  bool wrm_event_wake_logged_ = false;
 
   std::atomic<uint64_t> performance_command_ring_idle_us_{0};
   std::atomic<uint64_t> performance_command_wait_reg_mem_us_{0};

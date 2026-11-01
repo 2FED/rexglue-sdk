@@ -385,6 +385,11 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+  // M10-CPU-B: the callback is the writer of the guest release flag that
+  // WAIT_REG_MEM polls; wake a command processor waiting on it.
+  if (command_processor_) {
+    command_processor_->NotifyWaitRegMemWake();
+  }
 }
 
 void MclaReportGuestFrameDraws(uint32_t draw_count) {
