@@ -267,6 +267,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     const char* reason = "early_exit";
     bool cache_miss = false;
     bool read_previous_slot = false;
+    // The previous slot holds a recorded copy of its last resolve (false:
+    // elided or never recorded; see ClassifyReadbackPreviousSlot).
+    bool previous_slot_written = false;
     bool previous_slot_complete = false;
     bool previous_slot_length_ok = false;
     uint64_t previous_slot_age = 0;

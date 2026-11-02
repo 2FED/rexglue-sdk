@@ -5,6 +5,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rex::graphics::test {
@@ -70,6 +71,17 @@ class Model {
   uint64_t copies_now = 0;
   uint64_t evictions = 0;
   uint64_t elided_reads = 0;
+  // Resolves whose read_index is the previous slot, by the diagnostic class
+  // of that slot (ClassifyReadbackPreviousSlot; no submission is ever known
+  // complete in the model, so a written slot is kUnfenced), split by whether
+  // the guest copy happened.
+  uint64_t prev_unwritten_deferred = 0;
+  uint64_t prev_unwritten_copied = 0;
+  uint64_t prev_written_deferred = 0;
+  uint64_t prev_written_copied = 0;
+  // The diagnostic class disagrees with the slot contents (written iff the
+  // contents are the bytes of the last resolve that used the slot).
+  uint64_t class_mismatches = 0;
 
  private:
   struct Entry {
@@ -77,6 +89,11 @@ class Model {
     bool exists[2] = {false, false};
     bool mapped[2] = {false, false};
     uint64_t content[2] = {0, 0};
+    // The id of the last resolve that used the slot as its own slot.
+    uint64_t last_writer[2] = {0, 0};
+    // D3D12 submission_written: the last recorded copy, 0 after an elided
+    // copy or a new buffer.
+    uint64_t submission_written[2] = {0, 0};
     uint64_t last_used = 0;
   };
 
@@ -111,6 +128,7 @@ class Model {
       entry.exists[w] = true;
       entry.mapped[w] = !e.map_fail;
       entry.content[w] = 0;  // CreateNotZeroed: unknown bytes
+      entry.submission_written[w] = 0;
     }
     if (plan.record_gpu) {
       entry.content[w] = id;
@@ -118,11 +136,26 @@ class Model {
     } else {
       ++elided;
     }
+    entry.last_writer[w] = id;
+    entry.submission_written[w] = plan.record_gpu ? id : 0;
     NoteReadbackSlotWrite(entry.state, w, plan.record_gpu);
     misses += plan.miss ? 1 : 0;
     guard_misses += plan.guard_miss ? 1 : 0;
     forced += plan.forced ? 1 : 0;
     uint32_t r = plan.read_index;
+    if (r != w) {
+      ReadbackPreviousSlot c =
+          ClassifyReadbackPreviousSlot(entry.state.slot_elided[r], entry.submission_written[r], 0);
+      bool written = c != ReadbackPreviousSlot::kUnwritten;
+      bool holds_last =
+          entry.exists[r] && entry.last_writer[r] && entry.content[r] == entry.last_writer[r];
+      class_mismatches += written != holds_last ? 1 : 0;
+      if (plan.copies_now) {
+        (written ? prev_written_copied : prev_unwritten_copied) += 1;
+      } else {
+        (written ? prev_written_deferred : prev_unwritten_deferred) += 1;
+      }
+    }
     if (plan.copies_now && entry.exists[r] && entry.mapped[r]) {
       if (entry.state.slot_elided[r]) {
         ++elided_reads;
@@ -303,6 +336,87 @@ TEST_CASE("Readback slots: a switch from some to fast hits the guard",
   CHECK(p.copies_now);
 }
 
+TEST_CASE("Readback slots: previous slot classes", "[graphics][readback-slots]") {
+  CHECK(ClassifyReadbackPreviousSlot(false, 0, 100) == ReadbackPreviousSlot::kUnwritten);
+  CHECK(ClassifyReadbackPreviousSlot(true, 5, 100) == ReadbackPreviousSlot::kUnwritten);
+  CHECK(ClassifyReadbackPreviousSlot(true, 0, 0) == ReadbackPreviousSlot::kUnwritten);
+  CHECK(ClassifyReadbackPreviousSlot(false, 5, 4) == ReadbackPreviousSlot::kUnfenced);
+  CHECK(ClassifyReadbackPreviousSlot(false, 5, 5) == ReadbackPreviousSlot::kComplete);
+}
+
+// The l63 "all" loading-minute line: read=prev prev_age=-1 decision=deferred
+// reason=some_interval. A key resolved for the first time (miss, own slot,
+// recorded), then: counter 1 (deferred, elided), counter 2 (deferred, elided,
+// read_index on the slot elided by counter 1: never written), counter 3
+// (deferred, recorded, read_index on the slot elided by counter 2), then the
+// every-4th copy, which reads the slot recorded by counter 3. Only deferred
+// resolves point at an unwritten slot; they copy nothing.
+TEST_CASE("Readback slots: a deferred resolve may point at an elided slot, never copies from it",
+          "[graphics][readback-slots]") {
+  ReadbackSlotState s;
+  uint64_t submission_written[2] = {0, 0};
+  uint64_t submission = 0;
+  ReadbackPlanInput in;
+  in.mode = ReadbackPlanMode::kSome;
+  in.elide_unread = true;
+  auto resolve = [&](bool previous_usable) {
+    in.previous_slot_usable = previous_usable;
+    ReadbackPlan p = PlanReadbackResolve(s, in);
+    ++submission;
+    ReadbackPreviousSlot c = ReadbackPreviousSlot::kComplete;
+    if (!p.own_slot()) {
+      c = ClassifyReadbackPreviousSlot(s.slot_elided[p.read_index],
+                                       submission_written[p.read_index], 0);
+    }
+    submission_written[p.write_index] = p.record_gpu ? submission : 0;
+    NoteReadbackSlotWrite(s, p.write_index, p.record_gpu);
+    CommitReadbackResolve(s, p, in.mode);
+    return std::pair<ReadbackPlan, ReadbackPreviousSlot>(p, c);
+  };
+  // Slot 0: miss, recorded, copied.
+  auto [p0, c0] = resolve(false);
+  CHECK(p0.miss);
+  CHECK(p0.record_gpu);
+  CHECK(p0.copies_now);
+  // Counter 1: writes slot 1 (new, elided), points at slot 0 (recorded).
+  auto [p1, c1] = resolve(true);
+  CHECK_FALSE(p1.copies_now);
+  CHECK_FALSE(p1.record_gpu);
+  CHECK(p1.read_index == 0);
+  CHECK(c1 == ReadbackPreviousSlot::kUnfenced);
+  // Counter 2: writes slot 0 (elided), points at slot 1 (elided): the l63 line.
+  auto [p2, c2] = resolve(true);
+  CHECK_FALSE(p2.copies_now);
+  CHECK_FALSE(p2.record_gpu);
+  CHECK(p2.read_index == 1);
+  CHECK(c2 == ReadbackPreviousSlot::kUnwritten);
+  // Counter 3: writes slot 1 (recorded: the next resolve reads it), points
+  // at slot 0 (elided by counter 2).
+  auto [p3, c3] = resolve(true);
+  CHECK_FALSE(p3.copies_now);
+  CHECK(p3.record_gpu);
+  CHECK(p3.read_index == 0);
+  CHECK(c3 == ReadbackPreviousSlot::kUnwritten);
+  // Every 4th: copies from slot 1, written by counter 3.
+  auto [p4, c4] = resolve(true);
+  CHECK(p4.copies_now);
+  CHECK_FALSE(p4.guard_miss);
+  CHECK(p4.read_index == 1);
+  CHECK(c4 == ReadbackPreviousSlot::kUnfenced);
+  CHECK_FALSE(p4.record_gpu);
+  // A switch to fast right after an elided resolve: the guard turns the copy
+  // into a miss on the own slot, so an unwritten slot never goes with a guest
+  // copy.
+  in.mode = ReadbackPlanMode::kFast;
+  auto [p5, c5] = resolve(true);
+  CHECK(p5.guard_miss);
+  CHECK(p5.own_slot());
+  CHECK(p5.record_gpu);
+  CHECK(p5.copies_now);
+  (void)c0;
+  (void)c5;
+}
+
 TEST_CASE("Readback slots: elision delivers identical guest bytes (random sequences)",
           "[graphics][readback-slots]") {
   uint64_t total_elided = 0;
@@ -311,6 +425,7 @@ TEST_CASE("Readback slots: elision delivers identical guest bytes (random sequen
   uint64_t total_forced = 0;
   uint64_t total_misses = 0;
   uint64_t total_copies = 0;
+  uint64_t total_unwritten_deferred = 0;
   for (uint64_t seed = 1; seed <= 300; ++seed) {
     GenOptions o;
     if (seed % 3 == 0) {
@@ -335,6 +450,14 @@ TEST_CASE("Readback slots: elision delivers identical guest bytes (random sequen
     REQUIRE(on.guard_misses == 0);
     REQUIRE(on.elided_reads == 0);
     REQUIRE(off.elided == 0);
+    // A copy never reads an unwritten slot; without elision no slot that a
+    // resolve points at is unwritten; the class matches the contents.
+    REQUIRE(on.prev_unwritten_copied == 0);
+    REQUIRE(off.prev_unwritten_copied == 0);
+    REQUIRE(off.prev_unwritten_deferred == 0);
+    REQUIRE(on.class_mismatches == 0);
+    REQUIRE(off.class_mismatches == 0);
+    total_unwritten_deferred += on.prev_unwritten_deferred;
     REQUIRE(on.misses == off.misses);
     REQUIRE(on.forced == off.forced);
     REQUIRE(on.copies_now == off.copies_now);
@@ -351,6 +474,8 @@ TEST_CASE("Readback slots: elision delivers identical guest bytes (random sequen
   CHECK(total_forced > 1000);
   CHECK(total_misses > 1000);
   CHECK(total_copies > 10000);
+  // The l63 artifact occurs (deferred resolves pointing at elided slots).
+  CHECK(total_unwritten_deferred > 1000);
 }
 
 TEST_CASE("Readback slots: steady sequences elide about three copies in four",
@@ -383,6 +508,8 @@ TEST_CASE("Readback slots: mode switches never read an elided slot", "[graphics]
     off.Run(events);
     on.Run(events);
     REQUIRE(on.elided_reads == 0);
+    REQUIRE(on.prev_unwritten_copied == 0);
+    REQUIRE(on.class_mismatches == 0);
     REQUIRE(off.guard_misses == 0);
     REQUIRE(off.delivered().size() == on.delivered().size());
     for (size_t i = 0; i < off.delivered().size(); ++i) {

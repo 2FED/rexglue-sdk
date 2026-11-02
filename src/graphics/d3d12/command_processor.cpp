@@ -2677,7 +2677,11 @@ void D3D12CommandProcessor::LiveryDiag1ReportResolve(const LiveryResolveDiagScop
   livery_diag_minute_.Count(decision);
   if (scope.read_previous_slot) {
     ++livery_diag_minute_.reads_previous_slot;
-    if (!scope.previous_slot_complete) {
+    // See LiveryDiag2ReportResolve (sporadic_read_prev_*).
+    if (!scope.previous_slot_written) {
+      ++livery_diag_minute_.reads_previous_slot_unwritten;
+    }
+    if (scope.should_copy && !scope.previous_slot_complete) {
       ++livery_diag_minute_.reads_previous_slot_unfenced;
     }
   }
@@ -2704,9 +2708,9 @@ void D3D12CommandProcessor::LiveryDiag1ReportResolve(const LiveryResolveDiagScop
   REXGPU_INFO(
       "MCLA_LIVERY_DIAG v=1 kind=resolve frame={} draw={} mode={} scale={}x{} src={} "
       "src_base={} size={}x{} fmt={} base={:08X} extent={:08X} len={} h3={} h3_offset={} "
-      "key_fresh={} miss={} decision={} reason={} read={} prev_known_complete={} "
-      "prev_len_ok={} prev_age={} since_copy={} skips_since_resolve={} skips_same_base={} "
-      "frame_skips={}",
+      "key_fresh={} miss={} decision={} reason={} read={} prev_written={} "
+      "prev_known_complete={} prev_len_ok={} prev_age={} since_copy={} skips_since_resolve={} "
+      "skips_same_base={} frame_skips={}",
       frame_current_, g_mcla_frame_draws, LiveryDiagReadbackModeName(scope.mode),
       texture_cache_->draw_resolution_scale_x(), texture_cache_->draw_resolution_scale_y(),
       source_is_depth ? "depth" : "color", info.source_edram_base, info.width, info.height,
@@ -2714,9 +2718,9 @@ void D3D12CommandProcessor::LiveryDiag1ReportResolve(const LiveryResolveDiagScop
       int(shifted), int64_t(scope.written_address) - int64_t(info.copy_dest_base), int(key_fresh),
       int(scope.cache_miss), ReadbackCopyDecisionName(decision),
       scope.copied ? "copied" : scope.reason, scope.read_previous_slot ? "prev" : "this",
-      int(scope.previous_slot_complete), int(scope.previous_slot_length_ok),
-      scope.previous_slot_age, scope.resolves_since_copy, skips_since_resolve, skips_same_base,
-      frame_skips);
+      int(scope.previous_slot_written), int(scope.previous_slot_complete),
+      int(scope.previous_slot_length_ok), scope.previous_slot_age, scope.resolves_since_copy,
+      skips_since_resolve, skips_same_base, frame_skips);
 }
 
 bool D3D12CommandProcessor::LiveryDiag2Enabled() {
@@ -2833,7 +2837,19 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
     c.sporadic_not_copied += scope.copied ? 0 : 1;
     if (scope.read_previous_slot) {
       ++c.sporadic_read_prev;
-      c.sporadic_read_prev_unfenced += scope.previous_slot_complete ? 0 : 1;
+      // read_index is the previous slot also for a deferred resolve, which
+      // copies nothing. unwritten: the slot holds no recorded copy of its
+      // last resolve (elided, or none recorded); with elision only deferred
+      // resolves point at such a slot (the plan turns a copy into a guard
+      // miss). unfenced: the guest copy reads a slot not known complete, the
+      // real hazard (it would include an unwritten slot, which the plan
+      // prevents).
+      if (!scope.previous_slot_written) {
+        ++c.sporadic_read_prev_unwritten;
+      }
+      if (scope.should_copy && !scope.previous_slot_complete) {
+        ++c.sporadic_read_prev_unfenced;
+      }
     }
     c.sporadic_new_slot += scope.slot_created ? 1 : 0;
   }
@@ -2846,7 +2862,7 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
   std::string fields = fmt::format(
       "frame={} draw={} mode={} scale={}x{} src={} src_base={} size={}x{} fmt={} base={:08X} "
       "len={} since_prev={} since_copy={} miss={} decision={} reason={} read={} prev_age={} "
-      "prev_known_complete={} prev_len_ok={} slot_new={} resolves_since_copy={} "
+      "prev_written={} prev_known_complete={} prev_len_ok={} slot_new={} resolves_since_copy={} "
       "sync_rules={} sync_forced={} sync_wait_us={} cp_wait5_us={} fence_wait5_us={} "
       "pso_wait5_us={}",
       frame, g_mcla_frame_draws, LiveryDiagReadbackModeName(scope.mode),
@@ -2858,8 +2874,8 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
       int(scope.cache_miss), ReadbackCopyDecisionName(decision),
       scope.copied ? "copied" : scope.reason, scope.read_previous_slot ? "prev" : "this",
       scope.read_previous_slot ? int64_t(scope.previous_slot_age) : int64_t(0),
-      int(scope.previous_slot_complete), int(scope.previous_slot_length_ok),
-      int(scope.slot_created), scope.resolves_since_copy,
+      int(scope.previous_slot_written), int(scope.previous_slot_complete),
+      int(scope.previous_slot_length_ok), int(scope.slot_created), scope.resolves_since_copy,
       scope.sync_evaluated ? ReadbackSyncRuleNames(scope.sync_rules) : "off",
       int(scope.sync_forced), scope.sync_wait_us, fence_wait_us + pipeline_wait_us, fence_wait_us,
       pipeline_wait_us);
@@ -3066,7 +3082,8 @@ std::string D3D12CommandProcessor::LiveryDiag2MinuteReport() {
   LiveryDiag2TextureTracker::Counters t = livery_diag2_textures_.TakeCounters();
   std::string report = fmt::format(
       "MCLA_LIVERY_DIAG2 v=1 kind=minute frame={} resolves={} sporadic={} sporadic_not_copied={} "
-      "sporadic_read_prev={} sporadic_read_prev_unfenced={} sporadic_new_slot={} "
+      "sporadic_read_prev={} sporadic_read_prev_unfenced={} sporadic_read_prev_unwritten={} "
+      "sporadic_new_slot={} "
       "overlapping_resolves={} pipeline_waits={} long_waits={} long_wait_us={} "
       "wait_resolves={} composite_resolves={} composite_not_copied={} composite_read_prev={} "
       "tex_loads_tracked={} tex_loads_rb_overlap={} tex_loads_atlas={} "
@@ -3075,13 +3092,14 @@ std::string D3D12CommandProcessor::LiveryDiag2MinuteReport() {
       "wait_resolve_suppressed={} composite_suppressed={} tex_load_suppressed={} "
       "tex_inval_suppressed={}",
       frame_current_, c.resolves, c.sporadic_resolves, c.sporadic_not_copied, c.sporadic_read_prev,
-      c.sporadic_read_prev_unfenced, c.sporadic_new_slot, c.overlapping_resolves, c.pipeline_waits,
-      c.long_pipeline_waits, c.long_pipeline_wait_us, c.wait_resolves, c.composite_resolves,
-      c.composite_not_copied, c.composite_read_prev, t.loads_tracked, t.loads_readback_overlap,
-      t.loads_atlas_shape, t.reloads_without_invalidation, t.invalidations, t.invalidations_by_gpu,
-      t.expired, livery_diag2_textures_.waiting_loads(),
-      livery_diag2_resolve_lines_.TakeSuppressed(), livery_diag2_overlap_lines_.TakeSuppressed(),
-      livery_diag2_wait_lines_.TakeSuppressed(), livery_diag2_wait_resolve_lines_.TakeSuppressed(),
+      c.sporadic_read_prev_unfenced, c.sporadic_read_prev_unwritten, c.sporadic_new_slot,
+      c.overlapping_resolves, c.pipeline_waits, c.long_pipeline_waits, c.long_pipeline_wait_us,
+      c.wait_resolves, c.composite_resolves, c.composite_not_copied, c.composite_read_prev,
+      t.loads_tracked, t.loads_readback_overlap, t.loads_atlas_shape,
+      t.reloads_without_invalidation, t.invalidations, t.invalidations_by_gpu, t.expired,
+      livery_diag2_textures_.waiting_loads(), livery_diag2_resolve_lines_.TakeSuppressed(),
+      livery_diag2_overlap_lines_.TakeSuppressed(), livery_diag2_wait_lines_.TakeSuppressed(),
+      livery_diag2_wait_resolve_lines_.TakeSuppressed(),
       livery_diag2_composite_lines_.TakeSuppressed(), t.load_lines_suppressed,
       t.invalidation_lines_suppressed);
   livery_diag2_minute_ = {};
@@ -3094,10 +3112,11 @@ std::string D3D12CommandProcessor::LiveryDiagMinuteReport() {
       "MCLA_LIVERY_DIAG v=1 kind=minute frame={} pso_pending_skip_per_minute={} "
       "pso_failed_skip={} resolves={} scaled_resolves={} h3_resolves={} copies_now={} "
       "copies_deferred={} copies_skipped={} reads_prev_slot={} reads_prev_slot_unfenced={} "
+      "reads_prev_slot_unwritten={} "
       "resolves_after_skip={} skip_lines_suppressed={} resolve_lines_suppressed={}",
       frame_current_, c.pso_pending_skips, c.pso_failed_skips, c.resolves, c.scaled_resolves,
       c.h3_resolves, c.copies_now, c.copies_deferred, c.copies_skipped, c.reads_previous_slot,
-      c.reads_previous_slot_unfenced, c.resolves_after_skip,
+      c.reads_previous_slot_unfenced, c.reads_previous_slot_unwritten, c.resolves_after_skip,
       livery_diag_skip_lines_.TakeSuppressed(), livery_diag_resolve_lines_.TakeSuppressed());
   livery_diag_minute_ = {};
   return report;
@@ -4214,6 +4233,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
     rb.buffers[write_index] = buffer;
     rb.sizes[write_index] = size;
+    // The new buffer holds no recorded copy yet.
+    rb.submission_written[write_index] = 0;
+    rb.written_size[write_index] = 0;
     diag.slot_created = true;
     D3D12_RANGE read_range = {0, size};
     if (FAILED(buffer->Map(0, &read_range, &rb.mapped_data[write_index]))) {
@@ -4375,10 +4397,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     EndReadbackGpuTimer(timer_pair);
   }
   rb.slot_elided[write_index] = !plan.record_gpu;
-  if (diag.processor && plan.record_gpu) {
-    rb.submission_written[write_index] = submission_current_;
-    rb.written_size[write_index] = written_length;
-  }
+  // Diagnostics only (the plan uses slot_elided): the submission of the last
+  // recorded copy into the slot, 0 when the last copy was elided. Kept
+  // whether or not a diagnostic is on, so that one switched on later sees
+  // the true state of the slots.
+  rb.submission_written[write_index] = plan.record_gpu ? submission_current_ : 0;
+  rb.written_size[write_index] = plan.record_gpu ? written_length : 0;
 
   perf_readback_gpu.End();
   // The plan's read slot: the own slot for full, a miss (previous slot
@@ -4463,12 +4487,15 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     diag.read_previous_slot = read_index != write_index;
     if (diag.read_previous_slot) {
       uint64_t previous_submission = rb.submission_written[read_index];
-      diag.previous_slot_complete =
-          previous_submission && previous_submission <= submission_completed_;
+      ReadbackPreviousSlot previous = ClassifyReadbackPreviousSlot(
+          rb.slot_elided[read_index], previous_submission, submission_completed_);
+      diag.previous_slot_written = previous != ReadbackPreviousSlot::kUnwritten;
+      diag.previous_slot_complete = previous == ReadbackPreviousSlot::kComplete;
       diag.previous_slot_length_ok = rb.written_size[read_index] == written_length;
       diag.previous_slot_age =
-          previous_submission ? submission_current_ - previous_submission : UINT64_MAX;
+          diag.previous_slot_written ? submission_current_ - previous_submission : UINT64_MAX;
     } else {
+      diag.previous_slot_written = true;
       diag.previous_slot_complete = true;
       diag.previous_slot_length_ok = true;
     }

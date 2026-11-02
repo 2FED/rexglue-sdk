@@ -719,7 +719,12 @@ struct LiveryDiag2Counters {
   uint64_t sporadic_resolves = 0;
   uint64_t sporadic_not_copied = 0;
   uint64_t sporadic_read_prev = 0;
+  // A guest copy from a previous slot whose submission is not known
+  // complete (deferred resolves, which copy nothing, are not counted).
   uint64_t sporadic_read_prev_unfenced = 0;
+  // Previous slot without a recorded copy of its last resolve (elided by
+  // d3d12_readback_elide_unread, or never recorded).
+  uint64_t sporadic_read_prev_unwritten = 0;
   uint64_t sporadic_new_slot = 0;
   uint64_t overlapping_resolves = 0;
   uint64_t pipeline_waits = 0;

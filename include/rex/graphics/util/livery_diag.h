@@ -136,7 +136,12 @@ struct LiveryDiagCounters {
   uint64_t copies_deferred = 0;
   uint64_t copies_skipped = 0;
   uint64_t reads_previous_slot = 0;
+  // A guest copy from a previous slot whose submission is not known
+  // complete (deferred resolves, which copy nothing, are not counted).
   uint64_t reads_previous_slot_unfenced = 0;
+  // Previous slot without a recorded copy of its last resolve (elided by
+  // d3d12_readback_elide_unread, or never recorded).
+  uint64_t reads_previous_slot_unwritten = 0;
   uint64_t resolves_after_skip = 0;
 
   void Count(ReadbackCopyDecision decision) {

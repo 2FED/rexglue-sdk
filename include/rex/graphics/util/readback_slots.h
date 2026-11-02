@@ -145,6 +145,33 @@ inline ReadbackPlan PlanReadbackResolve(const ReadbackSlotState& state,
   return plan;
 }
 
+// What a resolve that reads the previous slot finds there (diagnostics:
+// d3d12_livery_diag v1, d3d12_livery_diag2 v2/v3). A slot is written when the
+// last resolve that used it as its own slot recorded its GPU copy; a slot
+// whose last copy was elided (slot_elided) or that no recorded copy ever
+// reached (submission_written == 0) holds no bytes of that resolve. With
+// elision only a deferred resolve (no guest copy) can have read_index on such
+// a slot: a guest copy from it is turned into a guard miss by the plan.
+// - kUnwritten: the slot holds no bytes of its last resolve (nothing the
+//   guest could be given; the elision artifact, not a hazard by itself);
+// - kUnfenced: written, but its submission is not known complete;
+// - kComplete: written and its submission is known complete.
+enum class ReadbackPreviousSlot : uint8_t {
+  kComplete,
+  kUnfenced,
+  kUnwritten,
+};
+
+inline ReadbackPreviousSlot ClassifyReadbackPreviousSlot(bool slot_elided,
+                                                         uint64_t submission_written,
+                                                         uint64_t submission_completed) {
+  if (slot_elided || !submission_written) {
+    return ReadbackPreviousSlot::kUnwritten;
+  }
+  return submission_written <= submission_completed ? ReadbackPreviousSlot::kComplete
+                                                    : ReadbackPreviousSlot::kUnfenced;
+}
+
 // The GPU copy into slot `index` was recorded (or elided).
 inline void NoteReadbackSlotWrite(ReadbackSlotState& state, uint32_t index, bool recorded) {
   state.slot_elided[index & 1] = !recorded;
