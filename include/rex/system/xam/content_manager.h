@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <rex/content_log.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/string/key.h>
@@ -39,6 +40,14 @@ namespace xam {
 // titles ID
 // TODO: check if actual x360 kernel/xam has a value similar to this
 constexpr uint32_t kCurrentlyRunningTitleId = 0xFFFFFFFF;
+
+// Saved-game transactions between Begin and Commit/Rollback plus content
+// operations mutating the save tree right now, across all ContentManagers
+// (KI-065). Cheap; a host copying the live save tree polls it. Hosts that must
+// also link against older SDKs use rex_xam_content_transactions_active().
+inline uint32_t ContentTransactionsActive() {
+  return rex::content_log::TransactionsActive();
+}
 
 struct XCONTENT_DATA {
   be<uint32_t> device_id;

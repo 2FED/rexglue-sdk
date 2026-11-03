@@ -16,6 +16,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/content_log.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
@@ -38,6 +39,25 @@ static constexpr std::string_view kTransactionBackupSuffix = ".rexbackup";
 static constexpr std::string_view kTransactionMarkerSuffix = ".rexpending";
 
 static int content_device_id_ = 0;
+
+namespace cl = rex::content_log;
+using cl::Kind;
+
+// KI-065: one paced WARN line per failed step of the content layer. Names the
+// package by its file name and content type, never by its host path.
+static void LogContentFailure(Kind kind, std::string_view op, std::string_view stage,
+                              const XCONTENT_AGGREGATE_DATA& data, X_RESULT result,
+                              uint32_t system_error) {
+  cl::Warn(kind, "{} failed: stage={} content='{}' type={:08X} result={:#x} win32={} ({})", op,
+           stage, data.file_name(), uint32_t(XContentType(data.content_type)), result, system_error,
+           cl::SystemErrorText(system_error));
+}
+
+static void LogContentFailure(Kind kind, std::string_view op, std::string_view stage,
+                              const XCONTENT_AGGREGATE_DATA& data, X_RESULT result,
+                              const std::error_code& error) {
+  LogContentFailure(kind, op, stage, data, result, uint32_t(error.value()));
+}
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
                                const XCONTENT_AGGREGATE_DATA& data,
@@ -84,7 +104,13 @@ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_p
 ContentManager::ContentManager(KernelState* kernel_state, const std::filesystem::path& root_path)
     : kernel_state_(kernel_state), root_path_(root_path) {}
 
-ContentManager::~ContentManager() = default;
+ContentManager::~ContentManager() {
+  // Transactions still open at teardown (a terminated title) no longer count
+  // as active; their markers stay on disk for the next start's recovery.
+  if (!active_content_transactions_.empty()) {
+    cl::NoteTransactionsEnded(uint32_t(active_content_transactions_.size()));
+  }
+}
 
 std::filesystem::path ContentManager::ResolvePackageRoot(uint64_t xuid, XContentType content_type,
                                                          uint32_t title_id) {
@@ -139,6 +165,7 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
 
 X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
                                                    const XCONTENT_AGGREGATE_DATA& data) {
+  cl::BusyScope busy;
   auto global_lock = global_critical_region_.Acquire();
   auto package_path = ResolvePackagePath(xuid, data);
   auto package_backup_path = package_path;
@@ -166,11 +193,15 @@ X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
 
   std::filesystem::remove_all(package_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Recover", "remove-package", data, X_ERROR_ACCESS_DENIED,
+                      error);
     return X_ERROR_ACCESS_DENIED;
   }
   error.clear();
   std::filesystem::remove(header_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Recover", "remove-header", data, X_ERROR_ACCESS_DENIED,
+                      error);
     return X_ERROR_ACCESS_DENIED;
   }
 
@@ -181,6 +212,8 @@ X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
     std::filesystem::copy(package_backup_path, package_path,
                           std::filesystem::copy_options::recursive, error);
     if (error) {
+      LogContentFailure(Kind::kTransaction, "Recover", "restore-package", data,
+                        X_ERROR_ACCESS_DENIED, error);
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -189,22 +222,37 @@ X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
     std::filesystem::copy_file(header_backup_path, header_path,
                                std::filesystem::copy_options::overwrite_existing, error);
     if (error) {
+      LogContentFailure(Kind::kTransaction, "Recover", "restore-header", data,
+                        X_ERROR_ACCESS_DENIED, error);
       return X_ERROR_ACCESS_DENIED;
     }
   }
   error.clear();
   std::filesystem::remove(marker_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Recover", "remove-marker", data, X_ERROR_ACCESS_DENIED,
+                      error);
     return X_ERROR_ACCESS_DENIED;
   }
   error.clear();
   std::filesystem::remove_all(package_backup_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Recover", "remove-package-backup", data,
+                      X_ERROR_ACCESS_DENIED, error);
     return X_ERROR_ACCESS_DENIED;
   }
   error.clear();
   std::filesystem::remove(header_backup_path, error);
-  return error ? X_ERROR_ACCESS_DENIED : X_ERROR_SUCCESS;
+  if (error) {
+    LogContentFailure(Kind::kTransaction, "Recover", "remove-header-backup", data,
+                      X_ERROR_ACCESS_DENIED, error);
+    return X_ERROR_ACCESS_DENIED;
+  }
+  cl::Warn(Kind::kTransaction,
+           "Recover restored the previous save after an interrupted transaction: content='{}' "
+           "type={:08X}",
+           data.file_name(), uint32_t(XContentType(data.content_type)));
+  return X_ERROR_SUCCESS;
 }
 
 void ContentManager::RecoverContentTransactions(uint64_t xuid, XContentType content_type,
@@ -232,8 +280,10 @@ void ContentManager::RecoverContentTransactions(uint64_t xuid, XContentType cont
 
 X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
                                                  const XCONTENT_AGGREGATE_DATA& data) {
+  cl::BusyScope busy;
   auto recovery_result = RecoverContentTransaction(xuid, data);
   if (recovery_result != X_ERROR_SUCCESS) {
+    LogContentFailure(Kind::kTransaction, "Begin", "recover", data, recovery_result, 0u);
     return recovery_result;
   }
 
@@ -250,6 +300,7 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
   marker_path += kTransactionMarkerSuffix;
 
   if (active_content_transactions_.contains(marker_path)) {
+    LogContentFailure(Kind::kTransaction, "Begin", "already-active", data, X_ERROR_BUSY, 0u);
     return X_ERROR_BUSY;
   }
 
@@ -262,6 +313,8 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
     std::filesystem::copy(package_path, package_backup_path,
                           std::filesystem::copy_options::recursive, error);
     if (error) {
+      LogContentFailure(Kind::kTransaction, "Begin", "backup-package", data, X_ERROR_ACCESS_DENIED,
+                        error);
       std::filesystem::remove_all(package_backup_path, error);
       return X_ERROR_ACCESS_DENIED;
     }
@@ -271,6 +324,8 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
     std::filesystem::copy_file(header_path, header_backup_path,
                                std::filesystem::copy_options::overwrite_existing, error);
     if (error) {
+      LogContentFailure(Kind::kTransaction, "Begin", "backup-header", data, X_ERROR_ACCESS_DENIED,
+                        error);
       std::filesystem::remove_all(package_backup_path, error);
       std::filesystem::remove(header_backup_path, error);
       return X_ERROR_ACCESS_DENIED;
@@ -278,17 +333,28 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
   }
   error.clear();
   std::filesystem::create_directories(marker_path.parent_path(), error);
-  if (error || !rex::filesystem::CreateEmptyFile(marker_path)) {
+  if (error) {
+    LogContentFailure(Kind::kTransaction, "Begin", "create-marker-directory", data,
+                      X_ERROR_ACCESS_DENIED, error);
+  } else if (!rex::filesystem::CreateEmptyFile(marker_path)) {
+    LogContentFailure(Kind::kTransaction, "Begin", "create-marker", data, X_ERROR_ACCESS_DENIED,
+                      cl::LastSystemError());
+    error = std::make_error_code(std::errc::io_error);
+  }
+  if (error) {
     std::filesystem::remove_all(package_backup_path, error);
     std::filesystem::remove(header_backup_path, error);
     return X_ERROR_ACCESS_DENIED;
   }
-  active_content_transactions_.insert(marker_path);
+  if (active_content_transactions_.insert(marker_path).second) {
+    cl::NoteTransactionBegun();
+  }
   return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::CommitContentTransaction(uint64_t xuid,
                                                   const XCONTENT_AGGREGATE_DATA& data) {
+  cl::BusyScope busy;
   auto global_lock = global_critical_region_.Acquire();
   auto package_backup_path = ResolvePackagePath(xuid, data);
   package_backup_path += kTransactionBackupSuffix;
@@ -304,17 +370,28 @@ X_RESULT ContentManager::CommitContentTransaction(uint64_t xuid,
   std::error_code error;
   std::filesystem::remove(marker_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Commit", "remove-marker", data, X_ERROR_ACCESS_DENIED,
+                      error);
     return X_ERROR_ACCESS_DENIED;
   }
-  active_content_transactions_.erase(marker_path);
+  if (active_content_transactions_.erase(marker_path)) {
+    cl::NoteTransactionsEnded();
+  }
   error.clear();
   std::filesystem::remove_all(package_backup_path, error);
   if (error) {
+    LogContentFailure(Kind::kTransaction, "Commit", "remove-package-backup", data,
+                      X_ERROR_ACCESS_DENIED, error);
     return X_ERROR_ACCESS_DENIED;
   }
   error.clear();
   std::filesystem::remove(header_backup_path, error);
-  return error ? X_ERROR_ACCESS_DENIED : X_ERROR_SUCCESS;
+  if (error) {
+    LogContentFailure(Kind::kTransaction, "Commit", "remove-header-backup", data,
+                      X_ERROR_ACCESS_DENIED, error);
+    return X_ERROR_ACCESS_DENIED;
+  }
+  return X_ERROR_SUCCESS;
 }
 
 X_RESULT ContentManager::RollbackContentTransaction(uint64_t xuid,
@@ -323,11 +400,18 @@ X_RESULT ContentManager::RollbackContentTransaction(uint64_t xuid,
   auto marker_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
   marker_path += kTransactionMarkerSuffix;
+  cl::BusyScope busy;
   {
     auto global_lock = global_critical_region_.Acquire();
-    active_content_transactions_.erase(marker_path);
+    if (active_content_transactions_.erase(marker_path)) {
+      cl::NoteTransactionsEnded();
+    }
   }
-  return RecoverContentTransaction(xuid, data);
+  const X_RESULT result = RecoverContentTransaction(xuid, data);
+  if (result != X_ERROR_SUCCESS) {
+    LogContentFailure(Kind::kTransaction, "Rollback", "recover", data, result, 0u);
+  }
+  return result;
 }
 
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
@@ -419,7 +503,10 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   auto parent_path = header_path.parent_path();
 
   if (!std::filesystem::exists(parent_path)) {
-    if (!std::filesystem::create_directories(parent_path)) {
+    std::error_code directory_error;
+    if (!std::filesystem::create_directories(parent_path, directory_error)) {
+      LogContentFailure(Kind::kHeader, "WriteHeader", "create-directory", data,
+                        X_ERROR_ACCESS_DENIED, directory_error);
       return X_ERROR_ACCESS_DENIED;
     }
   }
@@ -428,6 +515,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
 
   auto file = rex::filesystem::OpenFile(header_path, "wb");
   if (!file) {
+    LogContentFailure(Kind::kHeader, "WriteHeader", "open", data, X_ERROR_FILE_NOT_FOUND,
+                      cl::LastSystemError());
     return X_ERROR_FILE_NOT_FOUND;
   }
   bool write_succeeded =
@@ -438,6 +527,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
   }
   write_succeeded = fclose(file) == 0 && write_succeeded;
   if (!write_succeeded) {
+    LogContentFailure(Kind::kHeader, "WriteHeader", "write", data, X_ERROR_ACCESS_DENIED,
+                      cl::LastSystemError());
     std::error_code error;
     std::filesystem::remove(header_path, error);
     return X_ERROR_ACCESS_DENIED;
@@ -494,9 +585,14 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
 
   auto package_path = ResolvePackagePath(xuid, data);
   if (std::filesystem::exists(package_path)) {
+    LogContentFailure(Kind::kCreate, "CreateContent", "package-exists", data,
+                      X_ERROR_ALREADY_EXISTS, 0u);
     return X_ERROR_ALREADY_EXISTS;
   }
-  if (!std::filesystem::create_directories(package_path)) {
+  std::error_code directory_error;
+  if (!std::filesystem::create_directories(package_path, directory_error)) {
+    LogContentFailure(Kind::kCreate, "CreateContent", "create-directory", data,
+                      X_ERROR_ACCESS_DENIED, directory_error);
     return X_ERROR_ACCESS_DENIED;
   }
   auto package = ResolvePackage(root_name, xuid, data);
@@ -573,6 +669,11 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   auto thumb_path = package_path / kThumbnailFileName;
   if (std::filesystem::exists(thumb_path)) {
     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
+    if (!file) {
+      LogContentFailure(Kind::kHeader, "GetThumbnail", "open", data, X_ERROR_ACCESS_DENIED,
+                        cl::LastSystemError());
+      return X_ERROR_ACCESS_DENIED;
+    }
     fseek(file, 0, SEEK_END);
     size_t file_len = ftell(file);
     fseek(file, 0, SEEK_SET);
@@ -593,6 +694,11 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
   if (std::filesystem::exists(package_path)) {
     auto thumb_path = package_path / kThumbnailFileName;
     auto file = rex::filesystem::OpenFile(thumb_path, "wb");
+    if (!file) {
+      LogContentFailure(Kind::kHeader, "SetThumbnail", "open", data, X_ERROR_ACCESS_DENIED,
+                        cl::LastSystemError());
+      return X_ERROR_ACCESS_DENIED;
+    }
     fwrite(buffer.data(), 1, buffer.size(), file);
     fclose(file);
     return X_ERROR_SUCCESS;
@@ -606,6 +712,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
 
   if (IsContentOpen(data)) {
     // TODO(Gliniak): Get real error code for this case.
+    LogContentFailure(Kind::kDelete, "DeleteContent", "content-open", data, X_ERROR_ACCESS_DENIED,
+                      0u);
     return X_ERROR_ACCESS_DENIED;
   }
 
@@ -613,6 +721,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   std::error_code ec;
   auto dir_removed = std::filesystem::remove_all(package_path, ec);
   if (ec) {
+    LogContentFailure(Kind::kDelete, "DeleteContent", "remove-package", data, X_ERROR_ACCESS_DENIED,
+                      ec);
     return X_ERROR_ACCESS_DENIED;
   }
 
@@ -665,6 +775,8 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
   std::error_code ec;
   auto dir_removed = std::filesystem::remove_all(package_path, ec);
   if (ec) {
+    LogContentFailure(Kind::kDelete, "UnmountAndDeleteContent", "remove-package", data,
+                      X_ERROR_ACCESS_DENIED, ec);
     return X_ERROR_ACCESS_DENIED;
   }
 

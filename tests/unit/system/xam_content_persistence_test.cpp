@@ -309,3 +309,51 @@ TEST_CASE("XAM dummy HDD capacity reports full storage fail closed", "[system][x
   CHECK(HasDummyHddCapacity(1024, 1024));
   CHECK_FALSE(HasDummyHddCapacity(1025, 1024));
 }
+
+TEST_CASE("XAM content transaction indicator spans Begin to Commit", "[system][xam][content]") {
+  TempContentRoot temp;
+  const auto expected = MakeSavedGameData();
+  ContentManager manager(nullptr, temp.path());
+  const uint32_t base = rex::system::xam::ContentTransactionsActive();
+  REQUIRE(manager.WriteContentHeaderFile(expected.xuid, expected) == X_ERROR_SUCCESS);
+  WritePayload(temp.path(), "old");
+  REQUIRE(manager.BeginContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+  CHECK(rex::system::xam::ContentTransactionsActive() == base + 1);
+  CHECK(rex_xam_content_transactions_active() == base + 1);
+  // A refused second Begin does not count twice.
+  CHECK(manager.BeginContentTransaction(expected.xuid, expected) == X_ERROR_BUSY);
+  CHECK(rex::system::xam::ContentTransactionsActive() == base + 1);
+  // Enumeration of an active transaction leaves it counted.
+  manager.ListContent(1, expected.xuid, XContentType::kSavedGame, expected.title_id);
+  CHECK(rex::system::xam::ContentTransactionsActive() == base + 1);
+  WritePayload(temp.path(), "new");
+  REQUIRE(manager.CommitContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+  CHECK(rex::system::xam::ContentTransactionsActive() == base);
+  // A second commit of the same content does not underflow the count.
+  REQUIRE(manager.CommitContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+  CHECK(rex::system::xam::ContentTransactionsActive() == base);
+}
+
+TEST_CASE("XAM content transaction indicator clears on Rollback and teardown",
+          "[system][xam][content]") {
+  TempContentRoot temp;
+  const auto expected = MakeSavedGameData();
+  const uint32_t base = rex::system::xam::ContentTransactionsActive();
+  {
+    ContentManager manager(nullptr, temp.path());
+    REQUIRE(manager.WriteContentHeaderFile(expected.xuid, expected) == X_ERROR_SUCCESS);
+    WritePayload(temp.path(), "kept");
+    REQUIRE(manager.BeginContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+    CHECK(rex::system::xam::ContentTransactionsActive() == base + 1);
+    WritePayload(temp.path(), "discarded");
+    REQUIRE(manager.RollbackContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+    CHECK(rex::system::xam::ContentTransactionsActive() == base);
+    CHECK(ReadPayload(temp.path()) == "kept");
+
+    REQUIRE(manager.BeginContentTransaction(expected.xuid, expected) == X_ERROR_SUCCESS);
+    CHECK(rex::system::xam::ContentTransactionsActive() == base + 1);
+    // Destroyed with the transaction open (a terminated title).
+  }
+  CHECK(rex::system::xam::ContentTransactionsActive() == base);
+  CHECK(fs::exists(HeaderPath(temp.path()).string() + ".rexpending"));
+}

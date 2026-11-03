@@ -11,6 +11,8 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include <rex/content_log.h>
+#include <rex/filesystem/device.h>
 
 #include <chrono>
 
@@ -62,6 +64,14 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
   if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
     return X_STATUS_SUCCESS;
   } else {
+    const uint32_t system_error = rex::content_log::LastSystemError();
+    if (rex::content_log::IsContentDevicePath(entry_->device()->mount_path())) {
+      rex::content_log::Warn(rex::content_log::Kind::kFileWrite,
+                             "content file write failed: path='{}' offset={} length={} win32={} "
+                             "({})",
+                             entry_->path(), byte_offset, buffer.size(), system_error,
+                             rex::content_log::SystemErrorText(system_error));
+    }
     return X_STATUS_END_OF_FILE;
   }
 }
@@ -74,6 +84,13 @@ X_STATUS HostPathFile::SetLength(size_t length) {
   if (file_handle_->SetLength(length)) {
     return X_STATUS_SUCCESS;
   } else {
+    const uint32_t system_error = rex::content_log::LastSystemError();
+    if (rex::content_log::IsContentDevicePath(entry_->device()->mount_path())) {
+      rex::content_log::Warn(rex::content_log::Kind::kFileSetInfo,
+                             "content file set-length failed: path='{}' length={} win32={} ({})",
+                             entry_->path(), length, system_error,
+                             rex::content_log::SystemErrorText(system_error));
+    }
     return X_STATUS_END_OF_FILE;
   }
 }

@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/content_log.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -348,6 +349,14 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
   if (io_status_block) {
     io_status_block->status = result;
     io_status_block->information = out_length;
+  }
+
+  if (XFAILED(result) && file->entry() &&
+      rex::content_log::IsContentDevicePath(file->entry()->absolute_path())) {
+    rex::content_log::Warn(rex::content_log::Kind::kFileSetInfo,
+                           "NtSetInformationFile failed on content file: path='{}' class={} "
+                           "status={:#x}",
+                           file->entry()->path(), uint32_t(info_class), uint32_t(result));
   }
 
   return result;

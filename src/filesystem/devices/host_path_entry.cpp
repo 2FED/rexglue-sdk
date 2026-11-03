@@ -11,6 +11,7 @@
 
 #include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/devices/host_path_file.h>
+#include <rex/content_log.h>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
@@ -59,6 +60,16 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
   auto file_handle = rex::filesystem::FileHandle::OpenExisting(
       host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
   if (!file_handle) {
+    // KI-065: a sharing violation from another process (e.g. a host copy of
+    // the save tree) surfaces here; keep the OS error visible.
+    const uint32_t system_error = rex::content_log::LastSystemError();
+    if (rex::content_log::IsContentDevicePath(device_->mount_path())) {
+      rex::content_log::Warn(rex::content_log::Kind::kFileOpen,
+                             "content file open failed: path='{}' access={:#x} status={:#x} "
+                             "win32={} ({})",
+                             path(), desired_access, uint32_t(X_STATUS_NO_SUCH_FILE), system_error,
+                             rex::content_log::SystemErrorText(system_error));
+    }
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
   }
@@ -92,13 +103,26 @@ bool HostPathEntry::Truncate() {
 std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view name,
                                                           uint32_t attributes) {
   auto full_path = host_path_ / rex::to_path(name);
+  const bool content_device = rex::content_log::IsContentDevicePath(device_->mount_path());
   if (attributes & kFileAttributeDirectory) {
     if (!std::filesystem::create_directories(full_path)) {
+      if (content_device) {
+        rex::content_log::Warn(rex::content_log::Kind::kFileOpen,
+                               "content directory create failed: parent='{}' name='{}'", path(),
+                               name);
+      }
       return nullptr;
     }
   } else {
     auto file = rex::filesystem::OpenFile(full_path, "wb");
     if (!file) {
+      const uint32_t system_error = rex::content_log::LastSystemError();
+      if (content_device) {
+        rex::content_log::Warn(rex::content_log::Kind::kFileOpen,
+                               "content file create failed: parent='{}' name='{}' error={} ({})",
+                               path(), name, system_error,
+                               rex::content_log::SystemErrorText(system_error));
+      }
       return nullptr;
     }
     fclose(file);
@@ -113,14 +137,21 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
 bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
   auto full_path = host_path_ / rex::to_path(entry->name());
   std::error_code ec;  // avoid exception on remove/remove_all failure
+  bool deleted;
   if (entry->attributes() & kFileAttributeDirectory) {
     // Delete entire directory and contents.
     auto removed = std::filesystem::remove_all(full_path, ec);
-    return removed >= 1 && removed != static_cast<std::uintmax_t>(-1);
+    deleted = removed >= 1 && removed != static_cast<std::uintmax_t>(-1);
   } else {
     // Delete file.
-    return !std::filesystem::is_directory(full_path) && std::filesystem::remove(full_path, ec);
+    deleted = !std::filesystem::is_directory(full_path) && std::filesystem::remove(full_path, ec);
   }
+  if (!deleted && ec && rex::content_log::IsContentDevicePath(device_->mount_path())) {
+    rex::content_log::Warn(rex::content_log::Kind::kFileOpen,
+                           "content entry delete failed: path='{}' win32={} ({})", entry->path(),
+                           ec.value(), rex::content_log::SystemErrorText(uint32_t(ec.value())));
+  }
+  return deleted;
 }
 
 X_STATUS HostPathEntry::RenameEntryInternal(const std::vector<std::string_view>& path_parts) {

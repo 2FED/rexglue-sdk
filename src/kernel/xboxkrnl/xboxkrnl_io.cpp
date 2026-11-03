@@ -14,6 +14,7 @@
 
 #include <atomic>
 
+#include <rex/content_log.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -448,6 +449,13 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
   if (XFAILED(result) && io_status_block) {
     io_status_block->status = result;
     io_status_block->information = 0;
+  }
+
+  if (XFAILED(result) && file && file->entry() &&
+      rex::content_log::IsContentDevicePath(file->entry()->absolute_path())) {
+    rex::content_log::Warn(rex::content_log::Kind::kFileWrite,
+                           "NtWriteFile failed on content file: path='{}' length={} status={:#x}",
+                           file->entry()->path(), uint32_t(buffer_length), uint32_t(result));
   }
 
   if (ev && signal_event) {

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/content_log.h>
 #include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -76,13 +77,23 @@ bool HasDummyHddCapacity(uint64_t requested_bytes, uint64_t free_bytes) {
   return free_bytes != 0 && requested_bytes <= free_bytes;
 }
 
+// KI-065: storage-device query failures (a guest that sees one may report the
+// storage device as removed).
+static void LogDeviceFailure(std::string_view api, uint32_t device_id, X_RESULT result) {
+  rex::content_log::Warn(rex::content_log::Kind::kDevice,
+                         "{} failed: device_id={:#x} result={:#x} hresult={:#x}", api, device_id,
+                         result, uint32_t(X_HRESULT_FROM_WIN32(result)));
+}
+
 u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32 name_capacity) {
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
+    LogDeviceFailure("XamContentGetDeviceName", device_id, X_ERROR_DEVICE_NOT_CONNECTED);
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   auto name = std::u16string(device_info->name);
   if (name_capacity < name.size() + 1) {
+    LogDeviceFailure("XamContentGetDeviceName", device_id, X_ERROR_INSUFFICIENT_BUFFER);
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
   rex::string::copy_and_swap_truncating(name_buffer, name, name_capacity);
@@ -92,6 +103,7 @@ u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
+    LogDeviceFailure("XamContentGetDeviceState", device_id, X_ERROR_DEVICE_NOT_CONNECTED);
     if (overlapped_ptr) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
           overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED, 0);
@@ -124,6 +136,7 @@ static_assert_size(X_CONTENT_DEVICE_DATA, 0x50);
 u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
+    LogDeviceFailure("XamContentGetDeviceData", device_id, X_ERROR_DEVICE_NOT_CONNECTED);
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   device_data.Zero();
@@ -148,6 +161,7 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
   auto e = make_object<XStaticEnumerator<X_CONTENT_DEVICE_DATA>>(REX_KERNEL_STATE(), max_count);
   auto result = e->Initialize(0xFE, 0xFE, 0x2000A, 0x20009, 0);
   if (XFAILED(result)) {
+    LogDeviceFailure("XamContentCreateDeviceEnumerator", 0, result);
     return result;
   }
 
