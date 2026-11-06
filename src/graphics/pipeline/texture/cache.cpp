@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <utility>
@@ -213,6 +214,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_y >= 1);
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
 
+  fetch_memo_ = std::make_unique<FetchIdentityMemo<FetchMemoPayload>>();
+
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
     scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
@@ -297,6 +300,8 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
+    // M11-016: memo entries may point at the destroyed texture.
+    BumpFetchIdentityGeneration();
   }
   if (destroyed_any) {
     COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
@@ -329,6 +334,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
     auto global_lock = global_critical_region_.Acquire();
+    bool pages_changed = false;
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -337,8 +343,24 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      scaled_resolve_pages_[i] |= add_bits;
-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      // M11-016: atomic stores (writers are serialized by the global lock) so
+      // that IsRangeScaledResolved may read without the lock.
+      std::atomic_ref<uint32_t> pages(scaled_resolve_pages_[i]);
+      const uint32_t old_pages = pages.load(std::memory_order_relaxed);
+      if ((old_pages | add_bits) != old_pages) {
+        pages.store(old_pages | add_bits, std::memory_order_relaxed);
+        pages_changed = true;
+      }
+      std::atomic_ref<uint64_t> l2(scaled_resolve_pages_l2_[i >> 6]);
+      const uint64_t l2_bit = UINT64_C(1) << (i & 63);
+      const uint64_t old_l2 = l2.load(std::memory_order_relaxed);
+      if (!(old_l2 & l2_bit)) {
+        l2.store(old_l2 | l2_bit, std::memory_order_release);
+      }
+    }
+    if (pages_changed) {
+      // A texture over these pages now resolves to its scaled version.
+      BumpFetchIdentityGeneration();
     }
   }
 
@@ -495,7 +517,58 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
-    BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    ++fetch_identity_counters_.tex_slots;
+
+    // M11-016 raw-fetch memo. Only fetch constants of the texture type are
+    // memoized (the invalid type depends on a cvar and logs); an entry holds
+    // the decode result and the textures FindOrCreateTexture returned for it
+    // while the generation is unchanged.
+    const FetchMemoPayload* memo_hit = nullptr;
+    FetchDwords memo_dwords{};
+    uint64_t memo_generation = 0;
+    const bool memo_usable =
+        fetch_identity_enabled_ && fetch.type == xenos::FetchConstantType::kTexture;
+    if (memo_usable) {
+      memo_dwords =
+          LoadFetchDwords(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * index]);
+      memo_generation = fetch_identity_generation_.Current();
+      memo_hit = fetch_memo_->Find(memo_dwords, memo_generation);
+      if (memo_hit) {
+        ++fetch_identity_counters_.tex_memo_hit;
+      } else {
+        ++fetch_identity_counters_.tex_memo_miss;
+      }
+    }
+    if (memo_hit && fetch_identity_verify_) {
+      // d3d12_fetch_identity_verify: run the slow path too and fall back to it
+      // on any difference.
+      TextureKey slow_key;
+      uint8_t slow_signs;
+      BindingInfoFromFetchConstant(fetch, slow_key, &slow_signs);
+      bool same = slow_key == memo_hit->key && slow_signs == memo_hit->swizzled_signs;
+      if (same && slow_key.is_valid) {
+        same = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(slow_key)) ==
+               memo_hit->host_swizzle;
+        if (same && memo_hit->texture) {
+          same = FindOrCreateTexture(slow_key) == memo_hit->texture;
+        }
+        if (same && memo_hit->texture_signed) {
+          TextureKey signed_key = slow_key;
+          signed_key.signed_separate = 1;
+          same = FindOrCreateTexture(signed_key) == memo_hit->texture_signed;
+        }
+      }
+      if (!same) {
+        ++fetch_identity_counters_.tex_memo_mismatch;
+        memo_hit = nullptr;
+      }
+    }
+    if (memo_hit) {
+      binding.key = memo_hit->key;
+      binding.swizzled_signs = memo_hit->swizzled_signs;
+    } else {
+      BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
+    }
     texture_bindings_in_sync_ |= index_bit;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
@@ -505,12 +578,25 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       continue;
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
-    binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    binding.host_swizzle =
+        memo_hit ? memo_hit->host_swizzle
+                 : GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
     // signed and unsigned - otherwise only the unsigned one is loaded).
     bool key_changed = binding.key != old_key;
+    if (key_changed) {
+      ++fetch_identity_counters_.tex_key_changed;
+    }
+    // On a memo hit the memoized textures are what FindOrCreateTexture would
+    // return now (same key, same generation).
+    auto find_texture = [&](const TextureKey& texture_key, bool is_signed) -> Texture* {
+      if (memo_hit) {
+        return is_signed ? memo_hit->texture_signed : memo_hit->texture;
+      }
+      return FindOrCreateTexture(texture_key);
+    };
     bool any_sign_was_not_signed = texture_util::IsAnySignNotSigned(old_swizzled_signs);
     bool any_sign_was_signed = texture_util::IsAnySignSigned(old_swizzled_signs);
     bool any_sign_is_not_signed = texture_util::IsAnySignNotSigned(binding.swizzled_signs);
@@ -521,7 +607,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       bindings_changed |= index_bit;
     }
     bool load_unsigned_data = false, load_signed_data = false;
-    if (IsSignedVersionSeparateForFormat(binding.key)) {
+    const bool separate_signed = IsSignedVersionSeparateForFormat(binding.key);
+    if (separate_signed) {
       // Can reuse previously loaded unsigned/signed versions if the key is the
       // same and the texture was previously bound as unsigned/signed
       // respectively (checking the previous values of signedness rather than
@@ -530,7 +617,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // load).
       if (any_sign_is_not_signed) {
         if (key_changed || !any_sign_was_not_signed) {
-          binding.texture = FindOrCreateTexture(binding.key);
+          binding.texture = find_texture(binding.key, false);
           load_unsigned_data = true;
         }
       } else {
@@ -540,7 +627,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         if (key_changed || !any_sign_was_signed) {
           TextureKey signed_key = binding.key;
           signed_key.signed_separate = 1;
-          binding.texture_signed = FindOrCreateTexture(signed_key);
+          binding.texture_signed = find_texture(signed_key, true);
           load_signed_data = true;
         }
       } else {
@@ -550,7 +637,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       // Same resource for both unsigned and signed, but descriptor formats may
       // be different.
       if (key_changed) {
-        binding.texture = FindOrCreateTexture(binding.key);
+        binding.texture = find_texture(binding.key, false);
         load_unsigned_data = true;
       }
       binding.texture_signed = nullptr;
@@ -560,6 +647,26 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     if (load_signed_data) {
       queue_pending_texture_load(binding.texture_signed);
+    }
+    // Store a memo entry after a miss when every texture this sign
+    // configuration needs exists (failures are never memoized, so a failed
+    // creation is retried exactly as before). The binding's textures are
+    // either fresh FindOrCreateTexture results or kept from an unchanged key,
+    // which equal them while the generation is unchanged. Stamped with the
+    // generation read before the lookup: a bump in between (including the
+    // creation of one of these textures) makes the entry stale at once.
+    if (memo_usable && !memo_hit) {
+      const bool needs_unsigned = !separate_signed || any_sign_is_not_signed;
+      const bool needs_signed = separate_signed && any_sign_is_signed;
+      if ((!needs_unsigned || binding.texture) && (!needs_signed || binding.texture_signed)) {
+        FetchMemoPayload payload;
+        payload.key = binding.key;
+        payload.host_swizzle = binding.host_swizzle;
+        payload.swizzled_signs = binding.swizzled_signs;
+        payload.texture = needs_unsigned ? binding.texture : nullptr;
+        payload.texture_signed = needs_signed ? binding.texture_signed : nullptr;
+        fetch_memo_->Store(memo_dwords, memo_generation, payload);
+      }
     }
   }
 
@@ -844,6 +951,7 @@ void TextureCache::LiveryDiag2ReportInvalidation(LiveryDiag2TextureTracker& trac
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
+  BumpFetchIdentityGeneration();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
 
@@ -961,6 +1069,9 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
+  // M11-016: conservative; a memo entry is only stored for found textures,
+  // but a new texture may change what a later lookup returns.
+  BumpFetchIdentityGeneration();
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
@@ -1123,9 +1234,18 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
+  // M11-016: with d3d12_fetch_identity_cache the bit vectors are read without
+  // the global lock. The CP thread is the only setter (MarkRangeAsResolved);
+  // a concurrent clear by a CPU write fault is as racy as before, because the
+  // lock was released before the result was used anyway, and the clear bumps
+  // the generation so no memo entry outlives it.
+  std::unique_lock<std::recursive_mutex> global_lock;
+  if (!fetch_identity_enabled_) {
+    global_lock = global_critical_region_.Acquire();
+  }
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
-    uint64_t l2_block = scaled_resolve_pages_l2_[i];
+    uint64_t l2_block =
+        std::atomic_ref<uint64_t>(scaled_resolve_pages_l2_[i]).load(std::memory_order_acquire);
     if (i == l2_block_first) {
       l2_block &= ~((UINT64_C(1) << (block_first & 63)) - 1);
     }
@@ -1143,7 +1263,9 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
       if (block_index == block_last && (page_last & 31) != 31) {
         check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      if (scaled_resolve_pages_[block_index] & check_bits) {
+      if (std::atomic_ref<uint32_t>(scaled_resolve_pages_[block_index])
+              .load(std::memory_order_relaxed) &
+          check_bits) {
         return true;
       }
     }
@@ -1175,8 +1297,10 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   uint32_t resolve_block_last = resolve_page_last >> 5;
   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
+  bool pages_changed = false;
   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
-    uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
+    std::atomic_ref<uint64_t> l2(scaled_resolve_pages_l2_[i]);
+    uint64_t resolve_l2_block = l2.load(std::memory_order_relaxed);
     if (REXCVAR_GET(pre_mask_resolve_l2_block)) {
       // Pre-mask to only process blocks within the write range.
       if (i == resolve_l2_block_first) {
@@ -1197,11 +1321,23 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
       }
-      scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
-      if (scaled_resolve_pages_[resolve_block_index] == 0) {
-        scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
+      std::atomic_ref<uint32_t> pages(scaled_resolve_pages_[resolve_block_index]);
+      const uint32_t old_pages = pages.load(std::memory_order_relaxed);
+      const uint32_t new_pages = old_pages & resolve_keep_bits;
+      if (new_pages != old_pages) {
+        pages.store(new_pages, std::memory_order_relaxed);
+        pages_changed = true;
+      }
+      if (new_pages == 0) {
+        l2.store(
+            l2.load(std::memory_order_relaxed) & ~(UINT64_C(1) << resolve_block_relative_index),
+            std::memory_order_release);
       }
     }
+  }
+  if (pages_changed) {
+    // M11-016: textures over these pages no longer resolve to scaled versions.
+    BumpFetchIdentityGeneration();
   }
 }
 

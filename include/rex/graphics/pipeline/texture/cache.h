@@ -21,6 +21,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/util/fetch_identity.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
@@ -119,6 +120,21 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
+
+  // M11-016 (d3d12_fetch_identity_cache): the owner (command processor)
+  // latches the cvars once per frame. With the cache off, RequestTextures and
+  // IsRangeScaledResolved behave exactly as before M11-016 (the generation is
+  // still bumped, so switching on later never sees a stale memo entry).
+  void SetFetchIdentityOptions(bool enabled, bool verify) {
+    fetch_identity_enabled_ = enabled;
+    fetch_identity_verify_ = enabled && verify;
+  }
+  bool fetch_identity_enabled() const { return fetch_identity_enabled_; }
+  const FetchIdentityCounters& fetch_identity_counters() const { return fetch_identity_counters_; }
+  // Number of generation bumps since creation.
+  uint64_t fetch_identity_generation_bumps() const {
+    return fetch_identity_generation_.Current() - 1;
+  }
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -632,6 +648,26 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+
+  // M11-016 raw-fetch memo: 6 raw fetch dwords -> decoded binding and the
+  // textures FindOrCreateTexture returned for it. Valid while
+  // fetch_identity_generation_ is unchanged. Bump sites: texture creation
+  // (FindOrCreateTexture), texture destruction (CompletedSubmissionUpdated
+  // eviction, DestroyAllTextures), a scaled-resolve page bit changing
+  // (MarkRangeAsResolved, ScaledResolveGlobalWatchCallback).
+  struct FetchMemoPayload {
+    TextureKey key;
+    uint32_t host_swizzle = 0;
+    uint8_t swizzled_signs = 0;
+    Texture* texture = nullptr;
+    Texture* texture_signed = nullptr;
+  };
+  void BumpFetchIdentityGeneration() { fetch_identity_generation_.Bump(); }
+  bool fetch_identity_enabled_ = false;
+  bool fetch_identity_verify_ = false;
+  FetchIdentityGeneration fetch_identity_generation_;
+  FetchIdentityCounters fetch_identity_counters_;
+  std::unique_ptr<FetchIdentityMemo<FetchMemoPayload>> fetch_memo_;
 };
 
 }  // namespace rex::graphics

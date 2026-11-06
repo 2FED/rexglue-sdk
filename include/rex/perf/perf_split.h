@@ -249,6 +249,19 @@ struct PerfSplitCounters {
   uint64_t copies_now = 0;
   uint64_t copies_deferred = 0;
   uint64_t copies_skipped = 0;
+  // M11-016 fetch-constant identity cache (cumulative values copied from the
+  // command processor and the texture cache at collection; counted whether
+  // or not the split is on).
+  uint64_t fetch_dw_written = 0;
+  uint64_t fetch_dw_unchanged = 0;
+  uint64_t tex_slots = 0;
+  uint64_t tex_key_changed = 0;
+  uint64_t tex_memo_hit = 0;
+  uint64_t tex_memo_miss = 0;
+  uint64_t tex_memo_mismatch = 0;
+  uint64_t tex_gen_bumps = 0;
+  uint64_t smp_memo_hit = 0;
+  uint64_t smp_memo_miss = 0;
 };
 
 class PerfSplitAccumulator {
@@ -461,6 +474,9 @@ struct PerfSplitInputs {
 // X-macro field list of one window: (name, kind). kind Count = integer
 // count, Ms = milliseconds (printed name_ms), Kb = kibibytes (name_kb).
 // The order is the MCLA_PERF_SPLIT v=1 field order after the header fields.
+// Fields are only ever appended (M11-016 added fetch_dw_written ..
+// smp_memo_miss after gpu_submissions), so v=1 parsers keyed by name keep
+// working.
 #define REX_PERF_SPLIT_FIELDS(X) \
   X(frames, Count)               \
   X(draws, Count)                \
@@ -518,7 +534,17 @@ struct PerfSplitInputs {
   X(render_wait, Ms)             \
   X(render_poll, Ms)             \
   X(gpu_busy, Ms)                \
-  X(gpu_submissions, Count)
+  X(gpu_submissions, Count)      \
+  X(fetch_dw_written, Count)     \
+  X(fetch_dw_unchanged, Count)   \
+  X(tex_slots, Count)            \
+  X(tex_key_changed, Count)      \
+  X(tex_memo_hit, Count)         \
+  X(tex_memo_miss, Count)        \
+  X(tex_memo_mismatch, Count)    \
+  X(tex_gen_bumps, Count)        \
+  X(smp_memo_hit, Count)         \
+  X(smp_memo_miss, Count)
 
 struct PerfSplitWindow {
   uint64_t seq = 0;
@@ -665,6 +691,17 @@ inline PerfSplitWindow ComputePerfSplitWindow(const PerfSplitInputs& previous,
 
   w.gpu_busy_ms = UsToMs(Delta(current.gpu_busy_us, previous.gpu_busy_us));
   w.gpu_submissions = Delta(current.gpu_submissions, previous.gpu_submissions);
+
+  w.fetch_dw_written = Delta(c.fetch_dw_written, p.fetch_dw_written);
+  w.fetch_dw_unchanged = Delta(c.fetch_dw_unchanged, p.fetch_dw_unchanged);
+  w.tex_slots = Delta(c.tex_slots, p.tex_slots);
+  w.tex_key_changed = Delta(c.tex_key_changed, p.tex_key_changed);
+  w.tex_memo_hit = Delta(c.tex_memo_hit, p.tex_memo_hit);
+  w.tex_memo_miss = Delta(c.tex_memo_miss, p.tex_memo_miss);
+  w.tex_memo_mismatch = Delta(c.tex_memo_mismatch, p.tex_memo_mismatch);
+  w.tex_gen_bumps = Delta(c.tex_gen_bumps, p.tex_gen_bumps);
+  w.smp_memo_hit = Delta(c.smp_memo_hit, p.smp_memo_hit);
+  w.smp_memo_miss = Delta(c.smp_memo_miss, p.smp_memo_miss);
   return w;
 }
 

@@ -40,6 +40,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/cp_freeze_watchdog.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/fetch_identity.h>
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/util/livery_diag2.h>
 #include <rex/graphics/util/readback_slots.h>
@@ -753,6 +754,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // (called at every frame close).
   void PerfSplitFrameClose(bool minute_boundary);
   rex::perf::PerfSplitInputs PerfSplitCollectInputs();
+
+  // M11-016 (d3d12_fetch_identity_cache, latched at setup and at every frame
+  // start): compare-before-invalidate of fetch-constant writes, the texture
+  // cache's raw-fetch memo and lock-free scaled-resolve check, and the sampler
+  // memo. False restores the pre-M11-016 behaviour.
+  bool fetch_identity_cache_ = false;
+  FetchIdentityCounters fetch_identity_counters_;
+  void LatchFetchIdentityOptions();
+  void InvalidateFetchDwords(uint32_t first_fetch_dword, uint32_t last_fetch_dword);
   void PerfSplitEmit(const std::string& reason);
   void PerfSplitShutdown();
 
@@ -1064,6 +1074,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::vector<D3D12TextureCache::TextureSRVKey> current_texture_srv_keys_pixel_;
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_vertex_;
   std::vector<D3D12TextureCache::SamplerParameters> current_samplers_pixel_;
+  // M11-016 sampler memo: last inputs and result per sampler binding position.
+  std::vector<SamplerMemoSlot> sampler_memo_vertex_;
+  std::vector<SamplerMemoSlot> sampler_memo_pixel_;
+  D3D12TextureCache::SamplerParameters GetSamplerParametersMemo(
+      const D3D12Shader::SamplerBinding& binding, SamplerMemoSlot& slot);
   std::vector<uint32_t> current_sampler_bindless_indices_vertex_;
   std::vector<uint32_t> current_sampler_bindless_indices_pixel_;
 

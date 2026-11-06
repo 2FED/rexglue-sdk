@@ -87,6 +87,20 @@ REXCVAR_DEFINE_BOOL(d3d12_livery_diag2, false, "GPU/D3D12",
                     "guest memory contents). KI-047 diagnostic v2")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_fetch_identity_cache, true, "GPU/D3D12",
+                    "M11-016: skip invalidation for fetch-constant writes that do not change "
+                    "the stored value, memoize texture bindings by the raw fetch constant "
+                    "(valid until the texture cache changes), check scaled-resolve pages "
+                    "without the global lock and memoize sampler parameters. False restores "
+                    "the previous behaviour. Applied at the next frame")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(d3d12_fetch_identity_verify, false, "GPU/D3D12",
+                    "M11-016 diagnostic: with d3d12_fetch_identity_cache, also run the full "
+                    "texture binding decode and lookup on every memo hit, use it on any "
+                    "difference and count it (tex_memo_mismatch in MCLA_PERF_SPLIT)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_sync_composite, false, "GPU/D3D12",
                     "KI-047 fix candidate: with readback_resolve fast or some, copy a read-back "
                     "resolve synchronously and fenced (as full does) when its destination "
@@ -1340,6 +1354,7 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
   texture_cache_->SetLiveryDiag2Tracker(&livery_diag2_textures_);
+  LatchFetchIdentityOptions();
 
   pipeline_cache_ = std::make_unique<PipelineCache>(
       *this, *register_file_, *render_target_cache_.get(), bindless_resources_used_);
@@ -1951,6 +1966,11 @@ void D3D12CommandProcessor::ShutdownContext() {
 }
 
 void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  // M11-016: whether a fetch-constant write leaves the stored value unchanged
+  // (read before the base class stores it).
+  const bool unchanged = index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+                         index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 &&
+                         register_file_->values[index] == value;
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -1974,12 +1994,32 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     cbuffer_binding_bool_loop_.up_to_date = false;
   } else if (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
              index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    cbuffer_binding_fetch_.up_to_date = false;
-    if (texture_cache_ != nullptr) {
-      texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
-                                                  6);
+    if (fetch_identity_cache_) {
+      ++fetch_identity_counters_.fetch_dw_written;
+      if (unchanged) {
+        ++fetch_identity_counters_.fetch_dw_unchanged;
+        return;
+      }
     }
-    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
+    const uint32_t fetch_dword = index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
+    InvalidateFetchDwords(fetch_dword, fetch_dword);
+  }
+}
+
+void D3D12CommandProcessor::InvalidateFetchDwords(uint32_t first_fetch_dword,
+                                                  uint32_t last_fetch_dword) {
+  cbuffer_binding_fetch_.up_to_date = false;
+  if (texture_cache_) {
+    texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+  }
+  InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+}
+
+void D3D12CommandProcessor::LatchFetchIdentityOptions() {
+  fetch_identity_cache_ = REXCVAR_GET(d3d12_fetch_identity_cache);
+  if (texture_cache_) {
+    texture_cache_->SetFetchIdentityOptions(fetch_identity_cache_,
+                                            REXCVAR_GET(d3d12_fetch_identity_verify));
   }
 }
 
@@ -2051,14 +2091,21 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
 
   if (start_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
       end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) {
-    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
-    cbuffer_binding_fetch_.up_to_date = false;
     uint32_t first_fetch_dword = start_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
-    if (texture_cache_) {
-      texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    if (fetch_identity_cache_) {
+      // M11-016: store and invalidate only the dwords whose value changes.
+      const FetchDwordStoreResult stored =
+          StoreFetchDwordsCompare(register_file_->values + start_index, base, num_registers);
+      fetch_identity_counters_.fetch_dw_written += num_registers;
+      fetch_identity_counters_.fetch_dw_unchanged += stored.unchanged;
+      if (stored.changed) {
+        InvalidateFetchDwords(first_fetch_dword + stored.first_changed,
+                              first_fetch_dword + stored.last_changed);
+      }
+      return;
     }
-    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    InvalidateFetchDwords(first_fetch_dword, end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0);
     return;
   }
 
@@ -3168,6 +3215,23 @@ rex::perf::PerfSplitInputs D3D12CommandProcessor::PerfSplitCollectInputs() {
                               .count());
   in.tsc = rex::perf::ReadTsc();
   in.counters = perf_split_.counters;
+  {
+    // M11-016 counters (always counted; the split reports their deltas).
+    FetchIdentityCounters fetch = fetch_identity_counters_;
+    if (texture_cache_) {
+      fetch += texture_cache_->fetch_identity_counters();
+      in.counters.tex_gen_bumps = texture_cache_->fetch_identity_generation_bumps();
+    }
+    in.counters.fetch_dw_written = fetch.fetch_dw_written;
+    in.counters.fetch_dw_unchanged = fetch.fetch_dw_unchanged;
+    in.counters.tex_slots = fetch.tex_slots;
+    in.counters.tex_key_changed = fetch.tex_key_changed;
+    in.counters.tex_memo_hit = fetch.tex_memo_hit;
+    in.counters.tex_memo_miss = fetch.tex_memo_miss;
+    in.counters.tex_memo_mismatch = fetch.tex_memo_mismatch;
+    in.counters.smp_memo_hit = fetch.smp_memo_hit;
+    in.counters.smp_memo_miss = fetch.smp_memo_miss;
+  }
   PerfSplitThreadTimes(GetCurrentThread(), in.cp_user_100ns, in.cp_kernel_100ns);
   PerfSplitThreadTimes(static_cast<HANDLE>(deferred_command_list_.WorkerNativeHandle()),
                        in.replay_user_100ns, in.replay_kernel_100ns);
@@ -5078,6 +5142,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
     primitive_processor_->BeginFrame();
 
+    LatchFetchIdentityOptions();
     texture_cache_->BeginFrame();
   }
 
@@ -6194,6 +6259,32 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   cbuffer_binding_system_.up_to_date &= !dirty;
 }
 
+D3D12TextureCache::SamplerParameters D3D12CommandProcessor::GetSamplerParametersMemo(
+    const D3D12Shader::SamplerBinding& binding, SamplerMemoSlot& slot) {
+  if (!fetch_identity_cache_) {
+    return texture_cache_->GetSamplerParameters(binding);
+  }
+  // M11-016: the parameters are a pure function of the 6 fetch dwords, the
+  // binding's filter overrides and anisotropic_override.
+  const FetchDwords dwords = LoadFetchDwords(
+      &register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * binding.fetch_constant]);
+  const uint32_t binding_word = PackSamplerBindingWord(
+      binding.fetch_constant, uint32_t(binding.mag_filter), uint32_t(binding.min_filter),
+      uint32_t(binding.mip_filter), uint32_t(binding.aniso_filter));
+  const int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  if (slot.Matches(dwords, binding_word, anisotropic_override)) {
+    ++fetch_identity_counters_.smp_memo_hit;
+    D3D12TextureCache::SamplerParameters parameters;
+    parameters.value = slot.result;
+    return parameters;
+  }
+  ++fetch_identity_counters_.smp_memo_miss;
+  const D3D12TextureCache::SamplerParameters parameters =
+      texture_cache_->GetSamplerParameters(binding);
+  slot.Store(dwords, binding_word, anisotropic_override, parameters.value);
+  return parameters;
+}
+
 bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
                                            const D3D12Shader* pixel_shader,
                                            ID3D12RootSignature* root_signature,
@@ -6400,9 +6491,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     }
     current_samplers_vertex_.resize(
         std::max(current_samplers_vertex_.size(), sampler_count_vertex));
+    sampler_memo_vertex_.resize(current_samplers_vertex_.size());
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
       D3D12TextureCache::SamplerParameters parameters =
-          texture_cache_->GetSamplerParameters(samplers_vertex[i]);
+          GetSamplerParametersMemo(samplers_vertex[i], sampler_memo_vertex_[i]);
       if (current_samplers_vertex_[i] != parameters) {
         cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
         bindful_samplers_written_vertex_ = false;
@@ -6432,9 +6524,10 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
       }
       current_samplers_pixel_.resize(
           std::max(current_samplers_pixel_.size(), size_t(sampler_count_pixel)));
+      sampler_memo_pixel_.resize(current_samplers_pixel_.size());
       for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
         D3D12TextureCache::SamplerParameters parameters =
-            texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
+            GetSamplerParametersMemo((*samplers_pixel)[i], sampler_memo_pixel_[i]);
         if (current_samplers_pixel_[i] != parameters) {
           current_samplers_pixel_[i] = parameters;
           cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
