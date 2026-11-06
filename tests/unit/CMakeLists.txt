@@ -19,6 +19,7 @@ add_executable(unit_tests
     kernel/xboxkrnl_reached_compat_test.cpp
     kernel/xam_user_profile_test.cpp
     system/xam_content_persistence_test.cpp
+    system/xam_content_unmount_test.cpp
     core/content_log_test.cpp
     kernel/xmp_fallback_test.cpp
     core/cvar_test.cpp

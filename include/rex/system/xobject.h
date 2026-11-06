@@ -176,6 +176,8 @@ class XObject {
   void Retain();
   void Release();
   X_STATUS Delete();
+  // Pointer references currently held (diagnostics only; racy by nature).
+  int32_t pointer_ref_count() const { return pointer_ref_count_.load(); }
 
   virtual bool Save(stream::ByteStream* stream) {
     (void)stream;

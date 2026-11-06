@@ -104,3 +104,43 @@ TEST_CASE("Content transaction indicator counts begun transactions and busy scop
     CHECK(cl::TransactionsActive() == 0);
   }
 }
+
+TEST_CASE("Content trace de-duplicates polled calls by change and quiet gap", "[content-log]") {
+  cl::ResetForTesting();
+  uint64_t repeats = 99;
+  CHECK(cl::AllowChangedAt("GetDeviceState:1", 0, 1000, 5000, &repeats));
+  CHECK(repeats == 0);
+  // Polled every frame with the same answer: swallowed.
+  CHECK_FALSE(cl::AllowChangedAt("GetDeviceState:1", 0, 1016, 5000, &repeats));
+  CHECK_FALSE(cl::AllowChangedAt("GetDeviceState:1", 0, 1033, 5000, &repeats));
+  // A changed answer is logged with the swallowed count.
+  CHECK(cl::AllowChangedAt("GetDeviceState:1", 1, 1050, 5000, &repeats));
+  CHECK(repeats == 2);
+  // Continuous polling never reaches the gap...
+  for (uint64_t t = 1066; t < 20000; t += 16) {
+    CHECK_FALSE(cl::AllowChangedAt("GetDeviceState:1", 1, t, 5000, &repeats));
+  }
+  // ...a call after a quiet gap is logged again.
+  CHECK(cl::AllowChangedAt("GetDeviceState:1", 1, 30000, 5000, &repeats));
+  CHECK(repeats > 1000);
+  // Keys are independent; a backwards clock counts as a gap.
+  CHECK(cl::AllowChangedAt("GetDeviceData:1", 7, 30000, 5000, &repeats));
+  CHECK(cl::AllowChangedAt("GetDeviceData:1", 7, 100, 5000, &repeats));
+  cl::ResetForTesting();
+  CHECK(cl::AllowChangedAt("GetDeviceState:1", 1, 30001, 5000, &repeats));
+}
+
+TEST_CASE("Content trace kinds have names and the trace switch works", "[content-log]") {
+  CHECK(std::string(cl::KindName(cl::Kind::kUnmount)) == "unmount");
+  CHECK(std::string(cl::KindName(cl::Kind::kStaleIo)) == "stale-io");
+  CHECK(std::string(cl::KindName(cl::Kind::kMoveAside)) == "move-aside");
+  CHECK(std::string(cl::KindName(cl::Kind::kSaveOk)) == "save-ok");
+  CHECK(std::string(cl::KindName(cl::Kind::kTraceDevice)) == "trace-device");
+  CHECK(std::string(cl::KindName(cl::Kind::kTraceFile)) == "trace-file");
+  cl::SetTraceEnabledForTesting(false);
+  CHECK_FALSE(cl::TraceEnabled());
+  cl::SetTraceEnabledForTesting(true);
+  CHECK(cl::TraceEnabled());
+  // Wine detection is stable within a process.
+  CHECK(cl::RunningUnderWine() == cl::RunningUnderWine());
+}

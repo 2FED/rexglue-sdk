@@ -42,6 +42,23 @@ bool IsContentCreateProbe(uint32_t flags, X_RESULT result) {
          ((disposition == 3 || disposition == 5) && result == X_ERROR_PATH_NOT_FOUND);
 }
 
+const char* DispositionName(uint32_t flags) {
+  switch (flags & 0xF) {
+    case 1:
+      return "CREATE_NEW";
+    case 2:
+      return "CREATE_ALWAYS";
+    case 3:
+      return "OPEN_EXISTING";
+    case 4:
+      return "OPEN_ALWAYS";
+    case 5:
+      return "TRUNCATE_EXISTING";
+    default:
+      return "unknown";
+  }
+}
+
 void LogContentResult(cl::Kind kind, std::string_view api, std::string_view root_name,
                       const XCONTENT_AGGREGATE_DATA* data, X_RESULT result) {
   if (data) {
@@ -143,6 +160,11 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
 
   *handle_out = e->handle();
+  cl::Trace(cl::Kind::kTraceEnum,
+            "XamContentCreateEnumerator: device_id={:#x} type={:08X} flags={:#x} per_call={} "
+            "items={} handle={:#x} result=0x0",
+            uint32_t(device_id), uint32_t(content_type), uint32_t(content_flags),
+            uint32_t(items_per_enumerate), uint32_t(e->item_count()), uint32_t(e->handle()));
   return X_ERROR_SUCCESS;
 }
 
@@ -184,6 +206,14 @@ u32 xeXamContentCreate(const char* api, u32 user_index, mapped_string root_name,
     X_RESULT result = X_ERROR_INVALID_PARAMETER;
     kDispositionState disposition = kDispositionState::Unknown;
     bool recreate_existing = false;
+    // M11-001: steps that succeeded, for the trace and the save summary.
+    std::string stages_done;
+    auto note_stage = [&stages_done](const char* name) {
+      if (!stages_done.empty()) {
+        stages_done += ',';
+      }
+      stages_done += name;
+    };
     // The step that decided `result`, for the KI-065 failure line.
     const char* stage = "disposition";
     switch (flags & 0xF) {
@@ -259,6 +289,8 @@ u32 xeXamContentCreate(const char* api, u32 user_index, mapped_string root_name,
         stage = "delete-existing";
         if (result != X_ERROR_SUCCESS && result != X_ERROR_FILE_NOT_FOUND) {
           disposition = kDispositionState::Unknown;
+        } else {
+          note_stage("delete-existing");
         }
       }
     }
@@ -266,9 +298,12 @@ u32 xeXamContentCreate(const char* api, u32 user_index, mapped_string root_name,
       result = content_manager->CreateContent(root_name, xuid, content_data);
       stage = "create-package";
       if (result == X_ERROR_SUCCESS) {
+        note_stage("create-package");
         result = content_manager->WriteContentHeaderFile(xuid, content_data);
         stage = "write-header";
-        if (result != X_ERROR_SUCCESS) {
+        if (result == X_ERROR_SUCCESS) {
+          note_stage("write-header");
+        } else {
           content_manager->UnmountContent(xuid, content_data);
           content_manager->DeleteContent(xuid, content_data);
           disposition = kDispositionState::Unknown;
@@ -277,6 +312,12 @@ u32 xeXamContentCreate(const char* api, u32 user_index, mapped_string root_name,
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
       stage = "open-package";
+      if (result == X_ERROR_SUCCESS) {
+        note_stage("open-package");
+      }
+    }
+    if (transaction_started && result == X_ERROR_SUCCESS && !stages_done.empty()) {
+      content_manager->NoteTransactionStage(xuid, content_data, stages_done);
     }
     if (transaction_started &&
         (disposition == kDispositionState::Unknown || result != X_ERROR_SUCCESS)) {
@@ -305,6 +346,18 @@ u32 xeXamContentCreate(const char* api, u32 user_index, mapped_string root_name,
     if (disposition_ptr) {
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
+
+    static constexpr const char* kResultDisposition[] = {"none", "created", "opened"};
+    cl::Trace(cl::Kind::kTraceCreate,
+              "{}: requested={} flags={:#x} root='{}' content='{}' type={:08X} recreate={} "
+              "result_disposition={} stages={} last_stage={} result={:#x} hresult={:#x} "
+              "transaction={} content_size={}",
+              api, DispositionName(flags), uint32_t(flags), root_name, content_data.file_name(),
+              uint32_t(XContentType(content_data.content_type)), recreate_existing ? 1 : 0,
+              kResultDisposition[static_cast<uint32_t>(disposition) % 3],
+              stages_done.empty() ? "none" : stages_done, stage, result,
+              uint32_t(X_HRESULT_FROM_WIN32(result)), transaction_started ? 1 : 0,
+              uint64_t(content_size));
 
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
@@ -356,6 +409,8 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   if (result != X_ERROR_SUCCESS) {
     LogContentResult(cl::Kind::kFlush, "XamContentFlush", root_name.value(), nullptr, result);
   }
+  cl::Trace(cl::Kind::kTraceClose, "XamContentFlush: root='{}' result={:#x} overlapped={}",
+            root_name.value(), result, overlapped_ptr ? 1 : 0);
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -366,11 +421,15 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
-  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  bool committed = false;
+  auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value(), &committed);
   if (result != X_ERROR_SUCCESS) {
     // Commit failures inside CloseContent log their own step first.
     LogContentResult(cl::Kind::kClose, "XamContentClose", root_name.value(), nullptr, result);
   }
+  cl::Trace(cl::Kind::kTraceClose,
+            "XamContentClose: root='{}' result={:#x} committed={} overlapped={}", root_name.value(),
+            result, committed ? 1 : 0, overlapped_ptr ? 1 : 0);
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -480,6 +539,8 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
   if (result != X_ERROR_SUCCESS) {
     LogContentResult(cl::Kind::kDelete, "XamContentDelete", "", &content_data, result);
   }
+  cl::Trace(cl::Kind::kTraceCreate, "XamContentDelete: content='{}' type={:08X} result={:#x}",
+            content_data.file_name(), uint32_t(XContentType(content_data.content_type)), result);
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

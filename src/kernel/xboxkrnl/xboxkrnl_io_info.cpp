@@ -175,6 +175,16 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       info->end_of_file = file->entry()->size();
       info->attributes = file->entry()->attributes();
       out_length = sizeof(*info);
+      if (file->entry()->device() &&
+          rex::content_log::IsContentDevicePath(file->entry()->device()->mount_path())) {
+        rex::content_log::Trace(rex::content_log::Kind::kTimestamp,
+                                "query times: path='{}' class={} creation={:#x} write={:#x} "
+                                "size={}",
+                                file->entry()->path(), uint32_t(info_class),
+                                uint64_t(file->entry()->create_timestamp()),
+                                uint64_t(file->entry()->write_timestamp()),
+                                uint64_t(file->entry()->size()));
+      }
       break;
     }
     case XFileAlignmentInformation: {

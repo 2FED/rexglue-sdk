@@ -14,12 +14,27 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
+#include <rex/cvar.h>
 #include <rex/platform.h>
 
 #if REX_PLATFORM_WIN32
 #include <windows.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(
+    xam_content_trace, true, "XAM",
+    "Log one INFO line per content/save call on the success path (XamContentCreate*, "
+    "Close/Flush, device queries, device selector, enumerators, XN_SYS_* broadcasts, "
+    "content-device file opens/closes); rate-limited, no host paths (M11-001)");
+
+REXCVAR_DEFINE_BOOL(xam_content_stable_creation_time, true, "XAM",
+                    "Report a constant creation time for each content (save) file within a "
+                    "process, as NTFS does, even when the host (Wine on ext4) reports a value that "
+                    "changes with writes; MCLA treats a changed creation time as a removed storage "
+                    "device (M11-001, KI-068)");
 
 namespace rex::content_log {
 
@@ -100,6 +115,30 @@ const char* KindName(Kind kind) {
       return "file-setinfo";
     case Kind::kDevice:
       return "device";
+    case Kind::kUnmount:
+      return "unmount";
+    case Kind::kStaleIo:
+      return "stale-io";
+    case Kind::kMoveAside:
+      return "move-aside";
+    case Kind::kSaveOk:
+      return "save-ok";
+    case Kind::kTraceCreate:
+      return "trace-create";
+    case Kind::kTraceClose:
+      return "trace-close";
+    case Kind::kTraceDevice:
+      return "trace-device";
+    case Kind::kTraceNotify:
+      return "trace-notify";
+    case Kind::kTraceUi:
+      return "trace-ui";
+    case Kind::kTraceEnum:
+      return "trace-enum";
+    case Kind::kTraceFile:
+      return "trace-file";
+    case Kind::kTimestamp:
+      return "timestamp";
     default:
       return "unknown";
   }
@@ -127,12 +166,129 @@ bool Allow(Kind kind, uint64_t* suppressed) {
   return AllowAt(kind, NowMs(), suppressed);
 }
 
+namespace {
+
+struct ChangeEntry {
+  uint64_t value = 0;
+  uint64_t last_call_ms = 0;
+  uint64_t swallowed = 0;
+};
+
+struct ChangeState {
+  std::mutex mutex;
+  std::unordered_map<std::string, ChangeEntry> entries;
+};
+
+ChangeState& GetChangeState() {
+  static ChangeState state;
+  return state;
+}
+
+std::atomic<int> g_trace_override{-1};
+
+}  // namespace
+
 void ResetForTesting() {
-  auto& state = GetBudgets();
-  std::lock_guard<std::mutex> lock(state.mutex);
-  for (auto& budget : state.budgets) {
-    budget = LineBudget();
+  {
+    auto& state = GetBudgets();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto& budget : state.budgets) {
+      budget = LineBudget();
+    }
   }
+  auto& changes = GetChangeState();
+  std::lock_guard<std::mutex> lock(changes.mutex);
+  changes.entries.clear();
+}
+
+bool TraceEnabled() {
+  const int override_value = g_trace_override.load(std::memory_order_relaxed);
+  if (override_value >= 0) {
+    return override_value != 0;
+  }
+  return REXCVAR_GET(xam_content_trace);
+}
+
+void SetTraceEnabledForTesting(bool enabled) {
+  g_trace_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool AllowChangedAt(std::string_view key, uint64_t value, uint64_t now_ms, uint64_t gap_ms,
+                    uint64_t* repeats) {
+  auto& state = GetChangeState();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto [it, inserted] = state.entries.try_emplace(std::string(key));
+  ChangeEntry& entry = it->second;
+  const bool gap =
+      !inserted && (now_ms < entry.last_call_ms || now_ms - entry.last_call_ms >= gap_ms);
+  const bool allow = inserted || entry.value != value || gap;
+  entry.last_call_ms = now_ms;
+  if (!allow) {
+    ++entry.swallowed;
+    return false;
+  }
+  entry.value = value;
+  if (repeats) {
+    *repeats = entry.swallowed;
+  }
+  entry.swallowed = 0;
+  return true;
+}
+
+bool AllowChanged(std::string_view key, uint64_t value, uint64_t* repeats) {
+  return AllowChangedAt(key, value, NowMs(), kDefaultTraceGapMs, repeats);
+}
+
+namespace {
+
+struct StableTimes {
+  std::mutex mutex;
+  std::unordered_map<std::string, uint64_t> times;
+};
+
+StableTimes& GetStableTimes() {
+  static StableTimes state;
+  return state;
+}
+
+}  // namespace
+
+bool StableCreationTimeEnabled() {
+  return REXCVAR_GET(xam_content_stable_creation_time);
+}
+
+uint64_t StableCreationTime(const std::string& key, uint64_t observed, bool* remembered) {
+  auto& state = GetStableTimes();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto [it, inserted] = state.times.try_emplace(key, observed);
+  if (remembered) {
+    *remembered = !inserted;
+  }
+  return it->second;
+}
+
+void SetStableCreationTime(const std::string& key, uint64_t value) {
+  auto& state = GetStableTimes();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.times[key] = value;
+}
+
+void ResetStableCreationTimesForTesting() {
+  auto& state = GetStableTimes();
+  std::lock_guard<std::mutex> lock(state.mutex);
+  state.times.clear();
+}
+
+bool RunningUnderWine() {
+#if REX_PLATFORM_WIN32
+  static const bool under_wine = [] {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+  }();
+  return under_wine;
+#else
+  return false;
+#endif
 }
 
 uint32_t LastSystemError() {

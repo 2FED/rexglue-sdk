@@ -75,6 +75,20 @@ enum class Kind : uint32_t {
   kFileWrite,    // NtWriteFile / host WriteFile on a content device
   kFileSetInfo,  // NtSetInformationFile / host SetLength on a content device
   kDevice,       // storage device queries and enumerators
+  // M11-001 (KI-068) additions. INFO lines that are always on:
+  kUnmount,    // host handles force-closed on content unmount
+  kStaleIo,    // later guest I/O on a file object closed by an unmount (WARN)
+  kMoveAside,  // Wine move-aside fallback and the *.rexdead-* sweep
+  kSaveOk,     // one summary line per committed saved-game transaction
+  // Success-path trace lines, gated by the xam_content_trace cvar:
+  kTraceCreate,  // XamContentCreate* / XamContentDelete*
+  kTraceClose,   // XamContentClose / XamContentFlush
+  kTraceDevice,  // XamContentGetDeviceState / Data / Name, device enumerator
+  kTraceNotify,  // XN_SYS_* notifications the SDK broadcasts
+  kTraceUi,      // device selector and other system UI calls
+  kTraceEnum,    // content enumerator create / XamEnumerate on it
+  kTraceFile,    // NtCreateFile success and file-object teardown on content devices
+  kTimestamp,    // content entry timestamps (create/list) and guest time queries
   kCount,
 };
 
@@ -110,6 +124,64 @@ void Warn(Kind kind, fmt::format_string<Args...> format, Args&&... args) {
     REXSYS_WARN("[content] {}", text);
   }
 }
+
+template <typename... Args>
+void Info(Kind kind, fmt::format_string<Args...> format, Args&&... args) {
+  uint64_t suppressed = 0;
+  if (!Allow(kind, &suppressed)) {
+    return;
+  }
+  const std::string text = fmt::format(format, std::forward<Args>(args)...);
+  if (suppressed) {
+    REXSYS_INFO("[content] {} (+{} earlier {} lines suppressed)", text, suppressed, KindName(kind));
+  } else {
+    REXSYS_INFO("[content] {}", text);
+  }
+}
+
+// M11-001: success-path trace of the content/save path (cvar xam_content_trace,
+// default true). Lines carry no host path.
+bool TraceEnabled();
+void SetTraceEnabledForTesting(bool enabled);
+
+template <typename... Args>
+void Trace(Kind kind, fmt::format_string<Args...> format, Args&&... args) {
+  if (!TraceEnabled()) {
+    return;
+  }
+  Info(kind, "trace: {}", fmt::format(format, std::forward<Args>(args)...));
+}
+
+// Gap-based de-duplication for calls a title may poll every frame. Returns
+// true when the call should be logged: the first call for `key`, a changed
+// `value`, or a call after at least `gap_ms` without a call for `key`.
+// `*repeats` receives the number of swallowed calls since the last logged one.
+constexpr uint64_t kDefaultTraceGapMs = 5000;
+bool AllowChangedAt(std::string_view key, uint64_t value, uint64_t now_ms, uint64_t gap_ms,
+                    uint64_t* repeats);
+bool AllowChanged(std::string_view key, uint64_t value, uint64_t* repeats);
+
+// True when running under Wine/Proton (ntdll exports wine_get_version).
+bool RunningUnderWine();
+
+// --- Stable creation times (M11-001, KI-068) ------------------------------
+//
+// MCLA records a save file's creation time (NtQueryInformationFile class 34)
+// after each save and compares it before the next one; a mismatch is reported
+// as "storage device removed". NTFS keeps a file's creation time (and tunnels
+// it across a delete + recreate of the same name); Wine on ext4 reports a
+// value that changes when the file is written. The SDK therefore remembers,
+// per host file, the creation time it first reported in this process and
+// reports that value again whenever the entry is rebuilt (remount, listing).
+// Cvar xam_content_stable_creation_time (default true).
+bool StableCreationTimeEnabled();
+// Returns the creation time to report for `key` (a normalized host path):
+// the remembered value, or `observed`, which is then remembered. `*remembered`
+// is set when an earlier value was returned.
+uint64_t StableCreationTime(const std::string& key, uint64_t observed, bool* remembered);
+// Records an explicit creation time (guest NtSetInformationFile).
+void SetStableCreationTime(const std::string& key, uint64_t value);
+void ResetStableCreationTimesForTesting();
 
 // --- Transaction indicator ------------------------------------------------
 

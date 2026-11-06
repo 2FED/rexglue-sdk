@@ -29,13 +29,46 @@ HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_vi
 
 HostPathEntry::~HostPathEntry() = default;
 
+namespace {
+
+// Key of the stable creation-time table: the host path, case-folded (Windows
+// and Wine resolve names case-insensitively). Never logged.
+std::string StableTimeKey(const std::filesystem::path& host_path) {
+  std::string key = rex::path_to_utf8(host_path.lexically_normal());
+  for (char& c : key) {
+    if (c >= 'A' && c <= 'Z') {
+      c = char(c - 'A' + 'a');
+    } else if (c == '/') {
+      c = '\\';
+    }
+  }
+  return key;
+}
+
+}  // namespace
+
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
                                      const std::filesystem::path& full_path,
-                                     rex::filesystem::FileInfo file_info) {
+                                     rex::filesystem::FileInfo file_info, const char* source) {
   auto path = rex::string::utf8_join_guest_paths(parent->path(), rex::path_to_utf8(file_info.name));
   auto entry = new HostPathEntry(device, parent, path, full_path);
 
-  entry->create_timestamp_ = file_info.create_timestamp;
+  uint64_t create_timestamp = file_info.create_timestamp;
+  if (rex::content_log::IsContentDevicePath(device->mount_path())) {
+    // M11-001 (KI-068): keep the creation time constant within the process.
+    bool remembered = false;
+    if (rex::content_log::StableCreationTimeEnabled()) {
+      create_timestamp = rex::content_log::StableCreationTime(
+          StableTimeKey(full_path), file_info.create_timestamp, &remembered);
+    }
+    rex::content_log::Trace(rex::content_log::Kind::kTimestamp,
+                            "entry timestamp: path='{}' source={} creation={:#x} write={:#x} "
+                            "host_creation={:#x} stable={}",
+                            path, source ? source : "list", create_timestamp,
+                            file_info.write_timestamp, file_info.create_timestamp,
+                            remembered ? "remembered" : "first");
+  }
+  entry->create_timestamp_ = create_timestamp;
   entry->access_timestamp_ = file_info.access_timestamp;
   entry->write_timestamp_ = file_info.write_timestamp;
   if (file_info.type == rex::filesystem::FileInfo::Type::kDirectory) {
@@ -131,7 +164,8 @@ std::unique_ptr<Entry> HostPathEntry::CreateEntryInternal(const std::string_view
   if (!rex::filesystem::GetInfo(full_path, &file_info)) {
     return nullptr;
   }
-  return std::unique_ptr<Entry>(HostPathEntry::Create(device_, this, full_path, file_info));
+  return std::unique_ptr<Entry>(
+      HostPathEntry::Create(device_, this, full_path, file_info, "create"));
 }
 
 bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
@@ -196,6 +230,11 @@ bool HostPathEntry::SetCreateTimestamp(uint64_t timestamp) {
     return false;
   }
   create_timestamp_ = timestamp;
+  if (rex::content_log::IsContentDevicePath(device_->mount_path()) &&
+      rex::content_log::StableCreationTimeEnabled()) {
+    // A guest-set creation time is what NTFS would keep reporting.
+    rex::content_log::SetStableCreationTime(StableTimeKey(host_path_), timestamp);
+  }
   return true;
 }
 

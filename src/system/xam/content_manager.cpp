@@ -10,13 +10,17 @@
  */
 
 #include <array>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <queue>
+#include <random>
 #include <string>
 
 #include <fmt/format.h>
 
 #include <rex/content_log.h>
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
@@ -26,6 +30,16 @@
 #include <rex/system/xam/content_manager.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xobject.h>
+
+REXCVAR_DEFINE_BOOL(xam_content_close_host_handles_on_unmount, true, "XAM",
+                    "On content unmount (XamContentClose, the overwrite path), close the host "
+                    "handle of every guest file object on that package even if guest references "
+                    "remain; later I/O on such an object returns STATUS_FILE_CLOSED (M11-001)");
+REXCVAR_DEFINE_BOOL(xam_content_move_aside_on_delete_failure, rex::content_log::RunningUnderWine(),
+                    "XAM",
+                    "When removing a content package fails with Win32 145 or 5, rename the "
+                    "remaining files to *.rexdead-* beside the package and retry; default true "
+                    "under Wine/Proton only (M11-001)");
 
 namespace rex {
 namespace system {
@@ -39,6 +53,8 @@ static constexpr std::string_view kTransactionBackupSuffix = ".rexbackup";
 static constexpr std::string_view kTransactionMarkerSuffix = ".rexpending";
 
 static int content_device_id_ = 0;
+
+static constexpr std::string_view kDeadFileMarker = ".rexdead-";
 
 namespace cl = rex::content_log;
 using cl::Kind;
@@ -57,6 +73,189 @@ static void LogContentFailure(Kind kind, std::string_view op, std::string_view s
                               const XCONTENT_AGGREGATE_DATA& data, X_RESULT result,
                               const std::error_code& error) {
   LogContentFailure(kind, op, stage, data, result, uint32_t(error.value()));
+}
+
+namespace {
+
+std::mutex g_test_hook_mutex;
+std::function<std::error_code(const std::filesystem::path&, int)> g_remove_tree_fault;
+std::string g_session_tag_override;
+
+std::error_code RemoveFaultFor(const std::filesystem::path& path, int attempt) {
+  std::lock_guard<std::mutex> lock(g_test_hook_mutex);
+  if (g_remove_tree_fault) {
+    return g_remove_tree_fault(path, attempt);
+  }
+  return {};
+}
+
+// Win32 145 (ERROR_DIR_NOT_EMPTY) and 5 (ERROR_ACCESS_DENIED): what Wine
+// reports while a file of the tree is delete-pending behind an open handle.
+// The raw Win32 value is compared on purpose: the portable conditions are too
+// wide (MSVC maps sharing violation 32 to errc::permission_denied as well).
+bool IsMoveAsideError(const std::error_code& error) {
+  if (error.category() != std::system_category()) {
+    return false;
+  }
+  const int value = error.value();
+  return value == 145 || value == 5;
+}
+
+}  // namespace
+
+void ContentManager::SetRemoveTreeFaultForTesting(
+    std::function<std::error_code(const std::filesystem::path&, int attempt)> hook) {
+  std::lock_guard<std::mutex> lock(g_test_hook_mutex);
+  g_remove_tree_fault = std::move(hook);
+}
+
+void ContentManager::SetSessionTagForTesting(std::string tag) {
+  std::lock_guard<std::mutex> lock(g_test_hook_mutex);
+  g_session_tag_override = std::move(tag);
+}
+
+std::string ContentManager::SessionTag() {
+  {
+    std::lock_guard<std::mutex> lock(g_test_hook_mutex);
+    if (!g_session_tag_override.empty()) {
+      return g_session_tag_override;
+    }
+  }
+  static const std::string tag = [] {
+    std::random_device random;
+    const uint64_t value = (uint64_t(random()) << 32) ^ uint64_t(random()) ^
+                           uint64_t(std::chrono::system_clock::now().time_since_epoch().count());
+    return fmt::format("{:016x}", value);
+  }();
+  return tag;
+}
+
+std::error_code ContentManager::RemovePackageTree(const std::filesystem::path& package_path,
+                                                  const XCONTENT_AGGREGATE_DATA& data,
+                                                  std::string_view op, uintmax_t* removed) {
+  namespace fs = std::filesystem;
+  uintmax_t count = 0;
+  std::error_code error = RemoveFaultFor(package_path, 0);
+  if (!error) {
+    count = fs::remove_all(package_path, error);
+  }
+  if (!error) {
+    if (removed) {
+      *removed = count;
+    }
+    return {};
+  }
+  if (!IsMoveAsideError(error) || !REXCVAR_GET(xam_content_move_aside_on_delete_failure)) {
+    return error;
+  }
+
+  // Wine keeps a delete-pending file in its directory until its last handle
+  // closes. Move every remaining file out of the package tree (into the
+  // package's parent, where enumeration looks at directories only) and retry.
+  cl::Info(Kind::kMoveAside,
+           "move-aside: {} remove failed with win32={} ({}); moving remaining files aside: "
+           "content='{}' type={:08X}",
+           op, error.value(), cl::SystemErrorText(uint32_t(error.value())), data.file_name(),
+           uint32_t(XContentType(data.content_type)));
+  const fs::path parent = package_path.parent_path();
+  const std::string session = SessionTag();
+  std::vector<fs::path> files;
+  std::error_code walk_error;
+  for (fs::recursive_directory_iterator it(package_path, fs::directory_options::none, walk_error),
+       end;
+       !walk_error && it != end; it.increment(walk_error)) {
+    std::error_code type_error;
+    const auto status = it->symlink_status(type_error);
+    if (!type_error && !fs::is_directory(status)) {
+      files.push_back(it->path());
+    }
+  }
+  if (walk_error) {
+    cl::Warn(Kind::kMoveAside, "move-aside: listing the package failed: content='{}' win32={} ({})",
+             data.file_name(), walk_error.value(),
+             cl::SystemErrorText(uint32_t(walk_error.value())));
+  }
+  static std::atomic<uint32_t> sequence{0};
+  size_t moved = 0;
+  for (const auto& file : files) {
+    const fs::path target =
+        parent / rex::to_path(fmt::format("{}{}{}-{}", rex::path_to_utf8(file.filename()),
+                                          kDeadFileMarker, session, ++sequence));
+    std::error_code rename_error;
+    fs::rename(file, target, rename_error);
+    if (rename_error) {
+      cl::Warn(Kind::kMoveAside, "move-aside: rename failed: content='{}' file='{}' win32={} ({})",
+               data.file_name(), rex::path_to_utf8(file.filename()), rename_error.value(),
+               cl::SystemErrorText(uint32_t(rename_error.value())));
+    } else {
+      ++moved;
+    }
+  }
+  error = RemoveFaultFor(package_path, 1);
+  if (!error) {
+    count = fs::remove_all(package_path, error);
+  }
+  if (error) {
+    cl::Warn(Kind::kMoveAside,
+             "move-aside: {} retry failed: content='{}' moved={} of {} win32={} ({})", op,
+             data.file_name(), moved, files.size(), error.value(),
+             cl::SystemErrorText(uint32_t(error.value())));
+    return error;
+  }
+  cl::Info(Kind::kMoveAside, "move-aside: {} retry succeeded: content='{}' moved={} of {}", op,
+           data.file_name(), moved, files.size());
+  if (removed) {
+    // The moved files count as removed from the package.
+    *removed = count + moved;
+  }
+  return {};
+}
+
+size_t ContentManager::SweepDeadFiles(const std::filesystem::path& package_root) {
+  namespace fs = std::filesystem;
+  const std::string current = std::string(kDeadFileMarker) + SessionTag() + "-";
+  size_t deleted = 0;
+  size_t kept = 0;
+  std::error_code error;
+  for (fs::directory_iterator it(package_root, error), end; !error && it != end;
+       it.increment(error)) {
+    const std::string name = rex::path_to_utf8(it->path().filename());
+    if (name.find(kDeadFileMarker) == std::string::npos ||
+        name.find(current) != std::string::npos) {
+      continue;
+    }
+    std::error_code type_error;
+    const auto status = it->symlink_status(type_error);
+    if (type_error || fs::is_directory(status)) {
+      continue;
+    }
+    std::error_code remove_error;
+    if (fs::remove(it->path(), remove_error) && !remove_error) {
+      ++deleted;
+    } else {
+      ++kept;
+    }
+  }
+  if (deleted || kept) {
+    cl::Info(Kind::kMoveAside, "move-aside: swept {} earlier-session file(s), {} still in use",
+             deleted, kept);
+  }
+  return deleted;
+}
+
+void ContentManager::NoteTransactionStage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                                          std::string_view stage) {
+  auto global_lock = global_critical_region_.Acquire();
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  auto marker_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  marker_path += kTransactionMarkerSuffix;
+  auto it = transaction_traces_.find(marker_path);
+  if (it == transaction_traces_.end()) {
+    return;
+  }
+  it->second.stages += ',';
+  it->second.stages += stage;
 }
 
 ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view root_name,
@@ -191,7 +390,8 @@ X_RESULT ContentManager::RecoverContentTransaction(uint64_t xuid,
     return X_ERROR_SUCCESS;
   }
 
-  std::filesystem::remove_all(package_path, error);
+  SweepDeadFiles(package_path.parent_path());
+  error = RemovePackageTree(package_path, data, "Recover", nullptr);
   if (error) {
     LogContentFailure(Kind::kTransaction, "Recover", "remove-package", data, X_ERROR_ACCESS_DENIED,
                       error);
@@ -308,7 +508,8 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
   std::filesystem::remove_all(package_backup_path, error);
   error.clear();
   std::filesystem::remove(header_backup_path, error);
-  if (std::filesystem::exists(package_path)) {
+  const bool had_package = std::filesystem::exists(package_path);
+  if (had_package) {
     error.clear();
     std::filesystem::copy(package_path, package_backup_path,
                           std::filesystem::copy_options::recursive, error);
@@ -349,6 +550,8 @@ X_RESULT ContentManager::BeginContentTransaction(uint64_t xuid,
   if (active_content_transactions_.insert(marker_path).second) {
     cl::NoteTransactionBegun();
   }
+  transaction_traces_[marker_path] =
+      TransactionTrace{std::chrono::steady_clock::now(), had_package ? "begin,backup" : "begin"};
   return X_ERROR_SUCCESS;
 }
 
@@ -367,6 +570,16 @@ X_RESULT ContentManager::CommitContentTransaction(uint64_t xuid,
   marker_path += kTransactionMarkerSuffix;
   // Removing the marker commits the replacement. Do this before deleting the
   // backups so an interruption can never leave a marker without recovery data.
+  const auto commit_start = std::chrono::steady_clock::now();
+  std::string stages = "commit";
+  int64_t transaction_ms = -1;
+  if (auto trace = transaction_traces_.find(marker_path); trace != transaction_traces_.end()) {
+    stages = trace->second.stages + ",commit";
+    transaction_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(commit_start - trace->second.begin)
+            .count();
+    transaction_traces_.erase(trace);
+  }
   std::error_code error;
   std::filesystem::remove(marker_path, error);
   if (error) {
@@ -391,6 +604,12 @@ X_RESULT ContentManager::CommitContentTransaction(uint64_t xuid,
                       X_ERROR_ACCESS_DENIED, error);
     return X_ERROR_ACCESS_DENIED;
   }
+  const int64_t commit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - commit_start)
+                                .count();
+  cl::Info(Kind::kSaveOk, "save ok: content='{}' type={:08X} stages={} ms={} commit_ms={}",
+           data.file_name(), uint32_t(XContentType(data.content_type)), stages, transaction_ms,
+           commit_ms);
   return X_ERROR_SUCCESS;
 }
 
@@ -406,6 +625,7 @@ X_RESULT ContentManager::RollbackContentTransaction(uint64_t xuid,
     if (active_content_transactions_.erase(marker_path)) {
       cl::NoteTransactionsEnded();
     }
+    transaction_traces_.erase(marker_path);
   }
   const X_RESULT result = RecoverContentTransaction(xuid, data);
   if (result != X_ERROR_SUCCESS) {
@@ -428,6 +648,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
   // Search path:
   // content_root/xuid/title_id/type_name/*
   auto package_root = ResolvePackageRoot(xuid, content_type, title_id);
+  SweepDeadFiles(package_root);
   auto file_infos = rex::filesystem::ListFiles(package_root);
   for (const auto& file_info : file_infos) {
     if (file_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
@@ -639,6 +860,13 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
 }
 
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
+  return CloseContent(root_name, nullptr);
+}
+
+X_RESULT ContentManager::CloseContent(const std::string_view root_name, bool* committed) {
+  if (committed) {
+    *committed = false;
+  }
   ContentPackage* package = nullptr;
   XCONTENT_AGGREGATE_DATA content_data{};
   {
@@ -657,7 +885,11 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     if (xuid == 0 || xuid == uint64_t(-1)) {
       xuid = kernel_state_->user_profile()->xuid();
     }
-    return CommitContentTransaction(xuid, content_data);
+    const X_RESULT result = CommitContentTransaction(xuid, content_data);
+    if (committed) {
+      *committed = result == X_ERROR_SUCCESS;
+    }
+    return result;
   }
   return X_ERROR_SUCCESS;
 }
@@ -718,8 +950,8 @@ X_RESULT ContentManager::DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_D
   }
 
   auto package_path = ResolvePackagePath(xuid, data);
-  std::error_code ec;
-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
+  uintmax_t dir_removed = 0;
+  std::error_code ec = RemovePackageTree(package_path, data, "DeleteContent", &dir_removed);
   if (ec) {
     LogContentFailure(Kind::kDelete, "DeleteContent", "remove-package", data, X_ERROR_ACCESS_DENIED,
                       ec);
@@ -772,8 +1004,9 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
   auto header_path =
       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
 
-  std::error_code ec;
-  auto dir_removed = std::filesystem::remove_all(package_path, ec);
+  uintmax_t dir_removed = 0;
+  std::error_code ec =
+      RemovePackageTree(package_path, data, "UnmountAndDeleteContent", &dir_removed);
   if (ec) {
     LogContentFailure(Kind::kDelete, "UnmountAndDeleteContent", "remove-package", data,
                       X_ERROR_ACCESS_DENIED, ec);
@@ -855,8 +1088,18 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
 
   std::string resolved_path = "";
   kernel_state_->file_system()->FindSymbolicLink(std::string(root_name) + ':', resolved_path);
+  if (resolved_path.empty()) {
+    // An empty prefix would match every open file of the title.
+    cl::Warn(Kind::kClose, "close: root '{}' has no device link; no file objects released",
+             root_name);
+    return;
+  }
 
   for (const object_ref<XFile>& file : all_files_handles) {
+    if (file->host_closed()) {
+      // Already force-closed by an earlier unmount; its entry may be gone.
+      continue;
+    }
     std::string file_path = file->entry()->absolute_path();
     bool is_file_inside_content = rex::string::utf8_starts_with(file_path, resolved_path);
 
@@ -864,6 +1107,46 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
       file->ReleaseHandle();
     }
   }
+
+  // KI-068: a file object still referenced after its handle was released
+  // keeps its host handle open (under Wine that blocks the package removal of
+  // the next overwrite). The device is about to be unregistered, so close the
+  // host handles now.
+  size_t still_referenced = 0;
+  const size_t closed = ForceCloseHostFiles(all_files_handles, resolved_path, &still_referenced);
+  if (closed) {
+    cl::Info(Kind::kUnmount,
+             "close: {} host handle(s) force-closed on unmount: root='{}' still_referenced={}",
+             closed, root_name, still_referenced);
+  }
+}
+
+size_t ContentManager::ForceCloseHostFiles(const std::vector<object_ref<XFile>>& files,
+                                           std::string_view device_prefix,
+                                           size_t* still_referenced) {
+  size_t closed = 0;
+  size_t referenced = 0;
+  if (!device_prefix.empty() && REXCVAR_GET(xam_content_close_host_handles_on_unmount)) {
+    for (const object_ref<XFile>& file : files) {
+      if (!file || file->host_closed() || !file->entry()) {
+        continue;
+      }
+      if (!rex::string::utf8_starts_with(file->entry()->absolute_path(), device_prefix)) {
+        continue;
+      }
+      // One reference is the caller's list.
+      if (file->pointer_ref_count() > 1) {
+        ++referenced;
+      }
+      if (file->ForceCloseHost()) {
+        ++closed;
+      }
+    }
+  }
+  if (still_referenced) {
+    *still_referenced = referenced;
+  }
+  return closed;
 }
 
 static X_RESULT ExtractEntry(rex::filesystem::Entry* entry,

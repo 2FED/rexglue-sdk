@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <string>
 #include <filesystem>
 #include <mutex>
@@ -110,6 +111,12 @@ class XFile : public XObject {
 
   bool is_synchronous() const { return is_synchronous_; }
 
+  // M11-001 (KI-068): closes the host handle behind this file object now,
+  // even if guest references remain (content unmount). Later I/O returns
+  // X_STATUS_FILE_CLOSED. Returns true when a host handle was closed.
+  bool ForceCloseHost();
+  bool host_closed() const { return host_closed_.load(std::memory_order_acquire); }
+
   void SetFindPattern(const std::string_view pattern) {
     find_engine_.SetRule(pattern);
     find_index_ = 0;
@@ -145,6 +152,11 @@ class XFile : public XObject {
   size_t find_index_ = 0;
 
   bool is_synchronous_ = false;
+
+  std::atomic<bool> host_closed_{false};
+  // Device-relative path of a file on a content device, for the trace line
+  // written when the file object is destroyed (empty otherwise).
+  std::string content_trace_path_;
 };
 
 }  // namespace rex::system

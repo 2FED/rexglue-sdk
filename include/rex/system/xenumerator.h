@@ -65,10 +65,12 @@ class XEnumerator : public XObject {
 
   size_t item_size() const { return item_size_; }
   size_t items_per_enumerate() const { return items_per_enumerate_; }
+  uint32_t open_message() const { return open_message_; }
 
  private:
   size_t items_per_enumerate_;
   size_t item_size_;
+  uint32_t open_message_ = 0;
 };
 
 class XStaticUntypedEnumerator : public XEnumerator {

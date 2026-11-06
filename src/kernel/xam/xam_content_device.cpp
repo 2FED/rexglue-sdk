@@ -85,6 +85,23 @@ static void LogDeviceFailure(std::string_view api, uint32_t device_id, X_RESULT 
                          result, uint32_t(X_HRESULT_FROM_WIN32(result)));
 }
 
+// M11-001: success-path trace of the device queries. A title may poll these
+// every frame, so a line is written for the first call, for a changed answer,
+// and for a call after a quiet gap (rex::content_log::AllowChanged).
+template <typename... Args>
+static void TraceDeviceQuery(std::string_view key, uint64_t value,
+                             fmt::format_string<Args...> format, Args&&... args) {
+  if (!rex::content_log::TraceEnabled()) {
+    return;
+  }
+  uint64_t repeats = 0;
+  if (!rex::content_log::AllowChanged(key, value, &repeats)) {
+    return;
+  }
+  rex::content_log::Trace(rex::content_log::Kind::kTraceDevice, "{} repeats_since_last={}",
+                          fmt::format(format, std::forward<Args>(args)...), repeats);
+}
+
 u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32 name_capacity) {
   auto device_info = GetDummyDeviceInfo(device_id);
   if (device_info == nullptr) {
@@ -97,11 +114,19 @@ u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
   rex::string::copy_and_swap_truncating(name_buffer, name, name_capacity);
+  TraceDeviceQuery(fmt::format("GetDeviceName:{}", uint32_t(device_id)), 0,
+                   "XamContentGetDeviceName: device_id={:#x} capacity={} result=0x0",
+                   uint32_t(device_id), uint32_t(name_capacity));
   return X_ERROR_SUCCESS;
 }
 
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   auto device_info = GetDummyDeviceInfo(device_id);
+  TraceDeviceQuery(fmt::format("GetDeviceState:{}", uint32_t(device_id)), device_info ? 0 : 1,
+                   "XamContentGetDeviceState: device_id={:#x} state={} result={:#x} overlapped={}",
+                   uint32_t(device_id), device_info ? "connected" : "not-connected",
+                   uint32_t(device_info ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED),
+                   overlapped_ptr ? 1 : 0);
   if (device_info == nullptr) {
     LogDeviceFailure("XamContentGetDeviceState", device_id, X_ERROR_DEVICE_NOT_CONNECTED);
     if (overlapped_ptr) {
@@ -147,6 +172,12 @@ u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA
                                                                          : device_info->free_bytes;
   rex::string::copy_and_swap_truncating(device_data->name_chars, device_info->name,
                                         rex::countof(device_data->name_chars));
+  const uint64_t free_bytes = device_data->free_bytes;
+  TraceDeviceQuery(fmt::format("GetDeviceData:{}", uint32_t(device_id)), free_bytes,
+                   "XamContentGetDeviceData: device_id={:#x} type={} total_bytes={} "
+                   "free_bytes={} result=0x0",
+                   uint32_t(device_id), uint32_t(device_info->device_type),
+                   uint64_t(device_info->total_bytes), free_bytes);
   return X_ERROR_SUCCESS;
 }
 
@@ -182,6 +213,9 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
   }
 
   *handle_out = e->handle();
+  TraceDeviceQuery("CreateDeviceEnumerator", e->item_count(),
+                   "XamContentCreateDeviceEnumerator: type={:08X} max={} devices={} result=0x0",
+                   uint32_t(content_type), uint32_t(max_count), uint32_t(e->item_count()));
   return X_ERROR_SUCCESS;
 }
 

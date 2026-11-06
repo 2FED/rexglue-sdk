@@ -26,9 +26,12 @@ class HostPathEntry : public Entry {
                 const std::filesystem::path& host_path);
   ~HostPathEntry() override;
 
+  // `source` names where the host information came from ("create" for a
+  // file the guest just created, "list" for a directory listing) for the
+  // M11-001 timestamp trace.
   static HostPathEntry* Create(Device* device, Entry* parent,
                                const std::filesystem::path& full_path,
-                               rex::filesystem::FileInfo file_info);
+                               rex::filesystem::FileInfo file_info, const char* source = "list");
 
   const std::filesystem::path& host_path() const { return host_path_; }
 

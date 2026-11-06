@@ -177,6 +177,16 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
+    // M11-001: successful opens on content (save) devices.
+    if (file && file->entry() && file->entry()->device() &&
+        rex::content_log::IsContentDevicePath(file->entry()->device()->mount_path())) {
+      rex::content_log::Trace(rex::content_log::Kind::kTraceFile,
+                              "NtCreateFile: path='{}' disposition={} access={:#x} share={:#x} "
+                              "options={:#x} action={} handle={:#x} result={:#x}",
+                              file->entry()->path(), uint32_t(creation_disposition),
+                              uint32_t(desired_access), uint32_t(share_access),
+                              uint32_t(create_options), uint32_t(file_action), handle, result);
+    }
   }
   return result;
 }
@@ -558,6 +568,13 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
     file_info->allocation_size = entry->allocation_size();
     file_info->end_of_file = entry->size();
     file_info->attributes = entry->attributes();
+    if (entry->device() && rex::content_log::IsContentDevicePath(entry->device()->mount_path())) {
+      rex::content_log::Trace(rex::content_log::Kind::kTimestamp,
+                              "query times: path='{}' class=full-attributes creation={:#x} "
+                              "write={:#x} size={}",
+                              entry->path(), uint64_t(entry->create_timestamp()),
+                              uint64_t(entry->write_timestamp()), uint64_t(entry->size()));
+    }
 
     REXKRNL_IMPORT_RESULT("NtQueryFullAttributesFile", "0x0 size={}", (uint64_t)entry->size());
     return X_STATUS_SUCCESS;

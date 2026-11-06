@@ -11,6 +11,7 @@
 
 #include <mutex>
 
+#include <rex/content_log.h>
 #include <rex/logging.h>
 #include <rex/kernel/xam/offline_progression.h>
 #include <rex/runtime.h>
@@ -296,6 +297,13 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
         REX_KERNEL_MEMORY()->TranslateVirtual(button_ptr));
     buttons.push_back(rex::string::to_utf8(button));
   }
+  // M11-001: a system message box can be what a title shows for a storage
+  // problem; the text is guest data (no host path).
+  rex::content_log::Trace(rex::content_log::Kind::kTraceUi,
+                          "XamShowMessageBoxUI: title='{}' text='{}' buttons={} active={} "
+                          "flags={:#x} overlapped={}",
+                          title.substr(0, 96), text_str.substr(0, 240), uint32_t(button_count),
+                          uint32_t(active_button), uint32_t(flags), overlapped ? 1 : 0);
 
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
@@ -511,20 +519,37 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
                 overlapped.guest_address());
+  const uint32_t trace_content_type = content_type;
+  const uint32_t trace_content_flags = content_flags;
+  const uint32_t trace_overlapped = overlapped ? 1 : 0;
   return xeXamDispatchHeadless(
-      [device_id_ptr, total_requested]() -> X_RESULT {
+      [device_id_ptr, total_requested, trace_content_type, trace_content_flags,
+       trace_overlapped]() -> X_RESULT {
         if (!system::xam::HasDummyHddCapacity(total_requested,
                                               system::xam::GetDummyHddFreeBytes())) {
+          rex::content_log::Trace(rex::content_log::Kind::kTraceUi,
+                                  "XamShowDeviceSelectorUI: type={:08X} flags={:#x} requested={} "
+                                  "-> result={:#x} (disk full) overlapped={}",
+                                  trace_content_type, trace_content_flags,
+                                  uint64_t(total_requested), uint32_t(X_ERROR_DISK_FULL),
+                                  trace_overlapped);
           return X_ERROR_DISK_FULL;
         }
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
         *device_id_ptr = 0x00000001;
+        rex::content_log::Trace(rex::content_log::Kind::kTraceUi,
+                                "XamShowDeviceSelectorUI: type={:08X} flags={:#x} requested={} "
+                                "-> device_id=0x1 result=0x0 overlapped={}",
+                                trace_content_type, trace_content_flags, uint64_t(total_requested),
+                                trace_overlapped);
         return X_ERROR_SUCCESS;
       },
       overlapped.guest_address());
 }
 
 void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
+  rex::content_log::Trace(rex::content_log::Kind::kTraceUi,
+                          "XamShowDirtyDiscErrorUI: user_index={}", uint32_t(user_index));
   REXKRNL_ERROR("XamShowDirtyDiscErrorUI called! user_index={}", uint32_t(user_index));
   REXKRNL_ERROR("This indicates a disc/file read error - check that all game files exist");
 

@@ -57,6 +57,14 @@ class File {
     return X_STATUS_NOT_IMPLEMENTED;
   }
 
+  // M11-001 (KI-068): drops the host OS handle behind this file now, while
+  // guest references to the file object may remain (content unmount). Later
+  // I/O returns X_STATUS_FILE_CLOSED. Returns true when a host handle was
+  // open and has been closed by this call; files without a host handle
+  // return false.
+  virtual bool CloseHost() { return false; }
+  virtual bool host_closed() const { return false; }
+
   // rex::filesystem::FileAccess
   uint32_t file_access() const { return file_access_; }
   const Entry* entry() const { return entry_; }

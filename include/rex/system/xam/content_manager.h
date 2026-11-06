@@ -12,7 +12,10 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <system_error>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,6 +32,9 @@
 namespace rex {
 namespace system {
 class KernelState;
+class XFile;
+template <typename T>
+class object_ref;
 }  // namespace system
 }  // namespace rex
 
@@ -167,6 +173,8 @@ class ContentManager {
   X_RESULT OpenContent(const std::string_view root_name, uint64_t xuid,
                        const XCONTENT_AGGREGATE_DATA& data, uint32_t& content_license);
   X_RESULT CloseContent(const std::string_view root_name);
+  // `*committed` is set when a saved-game transaction was committed.
+  X_RESULT CloseContent(const std::string_view root_name, bool* committed);
   X_RESULT GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t>* buffer);
   X_RESULT SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
@@ -192,6 +200,40 @@ class ContentManager {
   std::filesystem::path ResolveGlobalUserProfilePath();
   bool IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const;
   void CloseOpenedFilesFromContent(const std::string_view root_name);
+
+  // M11-001 (KI-068). Closes the host handles of every file object in
+  // `files` whose entry lies under `device_prefix` (the content device mount
+  // path, with its trailing separator), whatever guest references remain,
+  // when the cvar xam_content_close_host_handles_on_unmount is set (default
+  // true). Returns the number of host handles closed; `*still_referenced`
+  // receives how many matching file objects were still referenced beyond
+  // the caller's list.
+  static size_t ForceCloseHostFiles(const std::vector<object_ref<XFile>>& files,
+                                    std::string_view device_prefix, size_t* still_referenced);
+
+  // M11-001 (KI-068) save summary: stages recorded between Begin and Commit.
+  void NoteTransactionStage(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
+                            std::string_view stage);
+
+  // Removes a package directory tree. When the removal fails with Win32 145
+  // (directory not empty) or 5 (access denied) and the cvar
+  // xam_content_move_aside_on_delete_failure is set (default: true under
+  // Wine), every remaining file is renamed to "<name>.rexdead-<session>-<n>"
+  // in the package's parent directory and the removal is retried once.
+  std::error_code RemovePackageTree(const std::filesystem::path& package_path,
+                                    const XCONTENT_AGGREGATE_DATA& data, std::string_view op,
+                                    uintmax_t* removed);
+  // Deletes "*.rexdead-*" files of earlier sessions in `package_root`
+  // (non-recursive). Returns the number deleted.
+  size_t SweepDeadFiles(const std::filesystem::path& package_root);
+
+  // Tests only. The fault hook runs before each removal attempt (attempt 0,
+  // then 1 after the move-aside); a returned error is used instead of
+  // removing. The session tag names the *.rexdead-* files of this process.
+  static void SetRemoveTreeFaultForTesting(
+      std::function<std::error_code(const std::filesystem::path&, int attempt)> hook);
+  static void SetSessionTagForTesting(std::string tag);
+  static std::string SessionTag();
 
   // Returns the host filesystem path for an open content package, or empty.
   std::filesystem::path GetOpenPackagePath(const std::string_view root_name) const;
@@ -225,6 +267,12 @@ class ContentManager {
   std::unordered_map<string::string_key_case, ContentPackage*, string::string_key_case::Hash>
       open_packages_;
   std::unordered_set<std::filesystem::path> active_content_transactions_;
+
+  struct TransactionTrace {
+    std::chrono::steady_clock::time_point begin;
+    std::string stages;
+  };
+  std::unordered_map<std::filesystem::path, TransactionTrace> transaction_traces_;
 };
 
 }  // namespace xam

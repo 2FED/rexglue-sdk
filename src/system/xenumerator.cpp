@@ -30,6 +30,7 @@ X_STATUS XEnumerator::Initialize(uint32_t user_index, uint32_t app_id, uint32_t 
   auto guest_object = reinterpret_cast<X_KENUMERATOR*>(native_object);
   guest_object->app_id = app_id;
   guest_object->open_message = open_message;
+  open_message_ = open_message;
   guest_object->close_message = close_message;
   guest_object->user_index = user_index;
   guest_object->items_per_enumerate = static_cast<uint32_t>(items_per_enumerate_);

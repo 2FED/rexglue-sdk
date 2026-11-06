@@ -17,6 +17,7 @@
 #include <fmt/format.h>
 #include <rex/assert.h>
 #include <rex/image_info.h>
+#include <rex/content_log.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ppc/function.h>
@@ -1129,6 +1130,18 @@ void KernelState::BroadcastNotification(XNotificationID id, uint32_t data) {
     REXSYS_DEBUG("BroadcastNotification(id={:#x}, data={}) to {} listeners",
                  static_cast<uint32_t>(id), data, notify_listeners_.size());
     snapshot = notify_listeners_;
+  }
+  // M11-001: system-area notifications (XN_SYS_*). The SDK never posts
+  // XN_SYS_STORAGEDEVICESCHANGED (0xB); a line with id=0xb would be new.
+  const uint32_t raw_id = static_cast<uint32_t>(id);
+  if ((raw_id >> 25) == 0) {
+    const char* name = raw_id == 0x9   ? "XN_SYS_UI"
+                       : raw_id == 0xA ? "XN_SYS_SIGNINCHANGED"
+                       : raw_id == 0xB ? "XN_SYS_STORAGEDEVICESCHANGED"
+                                       : "XN_SYS_other";
+    rex::content_log::Trace(rex::content_log::Kind::kTraceNotify,
+                            "notify: id={:#x} ({}) data={} listeners={}", raw_id, name, data,
+                            snapshot.size());
   }
   for (const auto& notify_listener : snapshot) {
     notify_listener->EnqueueNotification(id, data);

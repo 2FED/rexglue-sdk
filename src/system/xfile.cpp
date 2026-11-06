@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/content_log.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -27,6 +28,10 @@ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchr
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  if (file_ && file_->entry() && file_->entry()->device() &&
+      rex::content_log::IsContentDevicePath(file_->entry()->device()->mount_path())) {
+    content_trace_path_ = file_->entry()->path();
+  }
 }
 
 XFile::XFile() : XObject(kObjectType) {
@@ -37,8 +42,34 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
-  file_->Destroy();
+  if (!content_trace_path_.empty()) {
+    rex::content_log::Trace(rex::content_log::Kind::kTraceFile,
+                            "file object destroyed: path='{}' host_handle={}", content_trace_path_,
+                            host_closed() ? "force-closed-earlier" : "closed-now");
+  }
+  if (file_) {
+    file_->Destroy();
+  }
 }
+
+bool XFile::ForceCloseHost() {
+  // Deliberately not under file_lock_: Read holds file_lock_ while it takes
+  // the global critical region, and unmount runs inside that region. The
+  // host file serializes the close against in-flight I/O itself.
+  host_closed_.store(true, std::memory_order_release);
+  return file_ && file_->CloseHost();
+}
+
+namespace {
+X_STATUS StaleFileStatus(const char* op, const std::string& content_path) {
+  if (!content_path.empty()) {
+    rex::content_log::Warn(rex::content_log::Kind::kStaleIo,
+                           "{} on a file closed by content unmount: path='{}' status={:#x}", op,
+                           content_path, uint32_t(X_STATUS_FILE_CLOSED));
+  }
+  return X_STATUS_FILE_CLOSED;
+}
+}  // namespace
 
 uint64_t XFile::position() const {
   std::lock_guard<std::mutex> lock(file_lock_);
@@ -54,6 +85,10 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
                                const std::string_view file_name, bool restart) {
   std::lock_guard<std::mutex> lock(file_lock_);
   assert_not_null(out_info);
+  if (host_closed()) {
+    // The entry tree of an unmounted content device is gone.
+    return StaleFileStatus("query-directory", content_trace_path_);
+  }
 
   rex::filesystem::Entry* entry = nullptr;
 
@@ -292,6 +327,9 @@ X_STATUS XFile::SetLength(size_t length) {
 
 X_STATUS XFile::Rename(const std::filesystem::path& file_path) {
   std::lock_guard<std::mutex> lock(file_lock_);
+  if (host_closed()) {
+    return StaleFileStatus("rename", content_trace_path_);
+  }
   return entry()->Rename(file_path);
 }
 

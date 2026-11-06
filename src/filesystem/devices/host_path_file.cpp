@@ -15,6 +15,7 @@
 #include <rex/filesystem/device.h>
 
 #include <chrono>
+#include <mutex>
 
 #include <rex/perf/frame_audit.h>
 
@@ -30,12 +31,42 @@ void HostPathFile::Destroy() {
   delete this;
 }
 
+bool HostPathFile::CloseHost() {
+  std::unique_lock<std::shared_mutex> lock(host_mutex_);
+  if (host_closed_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  // Capture what the stale-I/O WARN needs while the entry is still alive.
+  if (entry_ && entry_->device()) {
+    closed_path_ = entry_->path();
+    closed_on_content_device_ =
+        rex::content_log::IsContentDevicePath(entry_->device()->mount_path());
+  }
+  const bool had_handle = file_handle_ != nullptr;
+  file_handle_.reset();
+  host_closed_.store(true, std::memory_order_release);
+  return had_handle;
+}
+
+X_STATUS HostPathFile::ClosedStatus(const char* op) const {
+  if (closed_on_content_device_) {
+    rex::content_log::Warn(rex::content_log::Kind::kStaleIo,
+                           "{} on a file closed by content unmount: path='{}' status={:#x}", op,
+                           closed_path_, uint32_t(X_STATUS_FILE_CLOSED));
+  }
+  return X_STATUS_FILE_CLOSED;
+}
+
 X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                 size_t* out_bytes_read) {
   if (!(file_access_ & (FileAccess::kGenericRead | FileAccess::kFileReadData))) {
     return X_STATUS_ACCESS_DENIED;
   }
 
+  std::shared_lock<std::shared_mutex> lock(host_mutex_);
+  if (!file_handle_) {
+    return ClosedStatus("read");
+  }
   bool read_succeeded;
   if (rex::perf::IsFrameAuditEnabled()) {
     const auto read_start = std::chrono::steady_clock::now();
@@ -61,6 +92,10 @@ X_STATUS HostPathFile::WriteSync(std::span<const uint8_t> buffer, size_t byte_of
     return X_STATUS_ACCESS_DENIED;
   }
 
+  std::shared_lock<std::shared_mutex> lock(host_mutex_);
+  if (!file_handle_) {
+    return ClosedStatus("write");
+  }
   if (file_handle_->Write(byte_offset, buffer.data(), buffer.size(), out_bytes_written)) {
     return X_STATUS_SUCCESS;
   } else {
@@ -81,6 +116,10 @@ X_STATUS HostPathFile::SetLength(size_t length) {
     return X_STATUS_ACCESS_DENIED;
   }
 
+  std::shared_lock<std::shared_mutex> lock(host_mutex_);
+  if (!file_handle_) {
+    return ClosedStatus("set-length");
+  }
   if (file_handle_->SetLength(length)) {
     return X_STATUS_SUCCESS;
   } else {

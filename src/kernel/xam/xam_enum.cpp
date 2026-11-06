@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/content_log.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -48,6 +49,14 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
       result = X_ERROR_INVALID_PARAMETER;
     } else {
       result = e->WriteItems(buffer_ptr.guest_address(), buffer_ptr.as<uint8_t*>(), &item_count);
+    }
+    // M11-001: content (0x20005) and storage-device (0x2000A) enumerators.
+    const uint32_t open_message = e->open_message();
+    if (open_message == 0x20005 || open_message == 0x2000A) {
+      rex::content_log::Trace(rex::content_log::Kind::kTraceEnum,
+                              "XamEnumerate: kind={} handle={:#x} items={} result={:#x}",
+                              open_message == 0x20005 ? "content" : "device", uint32_t(e->handle()),
+                              item_count, result);
     }
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = item_count;
