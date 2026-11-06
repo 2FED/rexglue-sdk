@@ -27,6 +27,7 @@ add_executable(unit_tests
     core/filesystem_test.cpp
     core/frame_audit_test.cpp
     core/perf_split_test.cpp
+    core/log_async_test.cpp
     core/graphics_performance_diagnostic_test.cpp
     graphics/primitive_processor_cache_test.cpp
     graphics/descriptor_binding_snapshot_test.cpp
@@ -38,6 +39,7 @@ add_executable(unit_tests
     graphics/wait_reg_mem_stats_test.cpp
     graphics/replay_wake_test.cpp
     graphics/readback_slots_test.cpp
+    graphics/cp_freeze_watchdog_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

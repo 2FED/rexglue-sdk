@@ -374,6 +374,7 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       const auto idle_begin = std::chrono::steady_clock::now();
+      cp_wait_state_.store(1, std::memory_order_relaxed);
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
@@ -390,6 +391,7 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      cp_wait_state_.store(0, std::memory_order_relaxed);
       performance_command_ring_idle_us_.fetch_add(
           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - idle_begin)
@@ -1284,6 +1286,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       return result;
     }
     PrepareForWait();
+    cp_wait_state_.store(2, std::memory_order_relaxed);
     if (!REXCVAR_GET(vsync)) {
       // User wants it fast and dangerous.
       result.kind = WrmBlockKind::kYieldLong;
@@ -1311,6 +1314,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
                                        .count());
     }
     rex::thread::SyncMemory();
+    cp_wait_state_.store(0, std::memory_order_relaxed);
     ReturnFromWait();
     return result;
   };

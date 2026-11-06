@@ -15,10 +15,13 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,6 +38,7 @@
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/cp_freeze_watchdog.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/util/livery_diag2.h>
@@ -751,6 +755,28 @@ class D3D12CommandProcessor : public CommandProcessor {
   rex::perf::PerfSplitInputs PerfSplitCollectInputs();
   void PerfSplitEmit(const std::string& reason);
   void PerfSplitShutdown();
+
+  // KI-069 CP freeze watchdog (d3d12_cp_freeze_watchdog_ms). The CP thread
+  // publishes the frame counter and the IssueCopy state; the watchdog thread
+  // reads them and the perf-split scope stack.
+  void FreezeWatchdogStart();
+  void FreezeWatchdogStop();
+  void FreezeWatchdogMain();
+  void FreezeWatchdogReport(uint64_t episode, uint64_t stall_ms, uint64_t frames);
+  std::atomic<uint64_t> freeze_frames_{0};
+  std::atomic<uint64_t> freeze_last_frame_ns_{0};
+  std::atomic<uint32_t> freeze_cp_tid_{0};
+  std::atomic<uint64_t> freeze_cp_stack_low_{0};
+  std::atomic<uint64_t> freeze_cp_stack_high_{0};
+  std::atomic<bool> freeze_copy_active_{false};
+  std::atomic<uint64_t> freeze_copy_seq_{0};
+  std::atomic<uint64_t> freeze_copy_begin_ns_{0};
+  std::atomic<uint32_t> freeze_copy_address_{0};
+  std::atomic<uint32_t> freeze_copy_length_{0};
+  std::mutex freeze_watchdog_mutex_;
+  std::condition_variable freeze_watchdog_cv_;
+  bool freeze_watchdog_stop_ = false;
+  std::thread freeze_watchdog_thread_;
   // Counts the CPU-copy outcome of one read-back resolve on scope exit.
   struct PerfReadbackOutcome {
     rex::perf::PerfSplitAccumulator* accumulator = nullptr;

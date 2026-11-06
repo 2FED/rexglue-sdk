@@ -42,6 +42,9 @@ std::string g_flight_reason;
 std::mutex g_snapshot_mutex;
 PerfSplitSnapshot g_snapshot;
 
+CpScopeStack g_cp_scope;
+thread_local bool t_cp_scope_thread = false;
+
 bool CurrentIsRenderThread() {
   const uint32_t tid = g_render_tid.load(std::memory_order_relaxed);
   return tid && tid == rex::thread::current_thread_system_id();
@@ -159,6 +162,32 @@ void PublishPerfSplitSnapshot(const PerfSplitWindow& window) {
 PerfSplitSnapshot GetPerfSplitSnapshot() {
   std::lock_guard<std::mutex> lock(g_snapshot_mutex);
   return g_snapshot;
+}
+
+void MarkCpScopeThread() {
+  t_cp_scope_thread = true;
+}
+
+uint64_t CpScopeNowNs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+void NoteCpScopeEnter(PerfRegion region) {
+  if (t_cp_scope_thread) {
+    g_cp_scope.Push(region, CpScopeNowNs());
+  }
+}
+
+void NoteCpScopeExit() {
+  if (t_cp_scope_thread) {
+    g_cp_scope.Pop();
+  }
+}
+
+CpScopeSnapshot GetCpScopeSnapshot() {
+  return g_cp_scope.Read();
 }
 
 bool HasInvariantTsc() {

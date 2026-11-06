@@ -26,6 +26,10 @@ REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);
 REXCVAR_DECLARE(int32_t, log_max_file_size_mb);
 REXCVAR_DECLARE(int32_t, log_max_files);
+REXCVAR_DECLARE(bool, log_async);
+REXCVAR_DECLARE(int32_t, log_async_flush_ms);
+REXCVAR_DECLARE(int32_t, log_async_queue_lines);
+REXCVAR_DECLARE(int32_t, log_async_queue_mb);
 
 namespace rex {
 
@@ -79,6 +83,29 @@ void ShutdownLogging();
  * concurrent logger cannot hit freed state.
  */
 void FlushLogging();
+
+/**
+ * KI-069: bounded flush for crash handling and watchdogs. Waits at most
+ * timeout_ms for the writer thread to write and flush the queued lines (no
+ * registry lock); on timeout writes what it can on the calling thread if no
+ * other thread holds the write lock. Returns true when everything queued
+ * before the call was written and flushed.
+ */
+bool FlushLoggingFor(uint32_t timeout_ms);
+
+/** Lock-free view of the log dispatcher (KI-069 diagnostics). */
+struct LogRuntimeState {
+  bool active = false;        /**< InitLogging created the dispatcher */
+  bool async = false;         /**< log_async */
+  size_t queue_lines = 0;     /**< lines waiting for the writer */
+  uint64_t dropped_total = 0; /**< lines lost to queue overflow since start */
+  uint64_t slow_total = 0;    /**< sink writes/flushes over 100 ms since start */
+  uint64_t op_busy_ms = 0;    /**< age of the sink write/flush in progress (0 = none) */
+  uint32_t op_thread = 0;     /**< producer thread id of that write (0 for a flush) */
+  bool op_flush = false;      /**< the operation in progress is a flush */
+  uint32_t writer_thread = 0; /**< writer thread id */
+};
+LogRuntimeState GetLogRuntimeState();
 
 /**
  * Register a new log category at runtime.

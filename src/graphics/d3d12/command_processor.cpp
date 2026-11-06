@@ -136,6 +136,15 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_gpu_timing, true, "GPU/D3D12",
                     "summed into gpu_readback_ms of the MCLA_READBACK v=1 lines")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(d3d12_cp_freeze_watchdog_ms, 1000, "GPU/D3D12",
+                     "KI-069: log one MCLA_CP_FREEZE line per episode when the command "
+                     "processor completes no frame for longer than this many ms (0 = off)")
+    .range(0, 60000);
+
+REXCVAR_DEFINE_BOOL(d3d12_cp_freeze_stack, true, "GPU/D3D12",
+                    "KI-069: with the freeze watchdog, also log a one-off host stack scan of "
+                    "the command processor thread per episode (suspends it for one copy)");
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -978,6 +987,18 @@ bool D3D12CommandProcessor::SetupContext() {
   InvalidateAllVertexBufferResidency();
   UpdateDebugMarkersEnabled();
 
+  // KI-069: this is the CP thread; publish its scope stack and identity for
+  // the freeze watchdog.
+  rex::perf::MarkCpScopeThread();
+  {
+    ULONG_PTR stack_low = 0, stack_high = 0;
+    GetCurrentThreadStackLimits(&stack_low, &stack_high);
+    freeze_cp_stack_low_.store(uint64_t(stack_low), std::memory_order_relaxed);
+    freeze_cp_stack_high_.store(uint64_t(stack_high), std::memory_order_relaxed);
+    freeze_cp_tid_.store(uint32_t(GetCurrentThreadId()), std::memory_order_relaxed);
+  }
+  FreezeWatchdogStart();
+
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
@@ -1779,6 +1800,7 @@ void D3D12CommandProcessor::EmitRenderAuditSummary(const char* phase) {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  FreezeWatchdogStop();
   PerfSplitShutdown();
   AwaitAllQueueOperationsCompletion();
   for (uint32_t slot = 0; slot < kQueueFrames; ++slot) {
@@ -3239,6 +3261,189 @@ void D3D12CommandProcessor::PerfSplitFrameClose(bool minute_boundary) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// KI-069 CP freeze watchdog
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool FreezeIsCodeAddress(uint64_t address) {
+  if (address < 0x10000) {
+    return false;
+  }
+  MEMORY_BASIC_INFORMATION info = {};
+  if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info))) {
+    return false;
+  }
+  constexpr DWORD kExecute =
+      PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+  return info.State == MEM_COMMIT && info.Type == MEM_IMAGE && (info.Protect & kExecute);
+}
+
+std::string FreezeSymbolize(uint64_t address) {
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(address), &module) ||
+      !module) {
+    return fmt::format("{:X}", address);
+  }
+  char path[MAX_PATH] = {};
+  const DWORD length = GetModuleFileNameA(module, path, MAX_PATH);
+  std::string_view name(path, length);
+  const size_t slash = name.find_last_of("\\/");
+  if (slash != std::string_view::npos) {
+    name.remove_prefix(slash + 1);
+  }
+  return fmt::format("{}+{:X}", name, address - uint64_t(reinterpret_cast<uintptr_t>(module)));
+}
+
+// One-off stack scan of another thread: suspend it, copy its context and the
+// top of its stack into a buffer allocated beforehand, resume it, then (with
+// the thread running again) keep the stack words that point into executable
+// image pages. Nothing that can take a lock runs while it is suspended. A
+// scan, not an unwind: stale return addresses can appear.
+std::string FreezeStackScan(uint32_t tid, uint64_t stack_low, uint64_t stack_high) {
+  if (!tid || tid == GetCurrentThreadId() || !stack_high) {
+    return "status=unavailable";
+  }
+  HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+  if (!thread) {
+    return fmt::format("status=open_failed error={}", GetLastError());
+  }
+  constexpr size_t kWords = 4096;  // 32 KB
+  std::vector<uint64_t> words(kWords);
+  CONTEXT context = {};
+  context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+  size_t count = 0;
+  bool ok = false;
+  if (SuspendThread(thread) != DWORD(-1)) {
+    if (GetThreadContext(thread, &context)) {
+      const uint64_t rsp = context.Rsp;
+      if (rsp >= stack_low && rsp < stack_high) {
+        count = size_t(std::min<uint64_t>((stack_high - rsp) / 8, kWords));
+        std::memcpy(words.data(), reinterpret_cast<const void*>(rsp), count * 8);
+        ok = true;
+      }
+    }
+    ResumeThread(thread);
+  }
+  CloseHandle(thread);
+  if (!ok) {
+    return "status=context_failed";
+  }
+  std::string out =
+      fmt::format("status=ok rip={} words={} scan=", FreezeSymbolize(context.Rip), count);
+  uint32_t found = 0;
+  for (size_t i = 0; i < count && found < 24; ++i) {
+    if (FreezeIsCodeAddress(words[i])) {
+      if (found) {
+        out += ',';
+      }
+      out += FreezeSymbolize(words[i]);
+      ++found;
+    }
+  }
+  if (!found) {
+    out += '-';
+  }
+  return out;
+}
+
+}  // namespace
+
+void D3D12CommandProcessor::FreezeWatchdogStart() {
+  if (freeze_watchdog_thread_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard lock(freeze_watchdog_mutex_);
+    freeze_watchdog_stop_ = false;
+  }
+  freeze_watchdog_thread_ = std::thread([this] { FreezeWatchdogMain(); });
+}
+
+void D3D12CommandProcessor::FreezeWatchdogStop() {
+  if (!freeze_watchdog_thread_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard lock(freeze_watchdog_mutex_);
+    freeze_watchdog_stop_ = true;
+  }
+  freeze_watchdog_cv_.notify_all();
+  freeze_watchdog_thread_.join();
+}
+
+void D3D12CommandProcessor::FreezeWatchdogMain() {
+  rex::thread::set_current_thread_name("GPU CP Watchdog");
+  CpFreezeEpisodes episodes;
+  std::unique_lock lock(freeze_watchdog_mutex_);
+  while (!freeze_watchdog_stop_) {
+    const uint32_t threshold_ms = uint32_t(std::max(0, REXCVAR_GET(d3d12_cp_freeze_watchdog_ms)));
+    const uint32_t poll_ms = threshold_ms ? std::clamp<uint32_t>(threshold_ms / 4, 50, 250) : 250;
+    freeze_watchdog_cv_.wait_for(lock, std::chrono::milliseconds(poll_ms),
+                                 [&] { return freeze_watchdog_stop_; });
+    if (freeze_watchdog_stop_) {
+      break;
+    }
+    lock.unlock();
+    const uint64_t frames = freeze_frames_.load(std::memory_order_acquire);
+    const uint64_t last_frame_ns = freeze_last_frame_ns_.load(std::memory_order_relaxed);
+    switch (episodes.Observe(rex::perf::CpScopeNowNs(), frames, last_frame_ns, threshold_ms)) {
+      case CpFreezeEpisodes::Action::kBegin:
+        FreezeWatchdogReport(episodes.episodes(), episodes.stall_ms(), frames);
+        break;
+      case CpFreezeEpisodes::Action::kEnd:
+        REXGPU_WARN("{}", FormatCpFreezeEnd(episodes.episodes(), episodes.episode_ms(), frames));
+        break;
+      case CpFreezeEpisodes::Action::kNone:
+        break;
+    }
+    lock.lock();
+  }
+}
+
+void D3D12CommandProcessor::FreezeWatchdogReport(uint64_t episode, uint64_t stall_ms,
+                                                 uint64_t frames) {
+  const uint64_t now_ns = rex::perf::CpScopeNowNs();
+  CpFreezeReport report;
+  report.episode = episode;
+  report.stall_ms = stall_ms;
+  report.frames = frames;
+  report.cp_tid = freeze_cp_tid_.load(std::memory_order_relaxed);
+  report.cp_state = cp_wait_state_.load(std::memory_order_relaxed);
+  report.perf_split = rex::perf::PerfSplitActive();
+  const rex::perf::CpScopeSnapshot scope = rex::perf::GetCpScopeSnapshot();
+  report.scope = rex::perf::FormatCpScopePath(scope);
+  report.scope_depth = scope.depth;
+  report.scope_ms = rex::perf::CpScopeInnermostMs(scope, now_ns);
+  report.copy_active = freeze_copy_active_.load(std::memory_order_acquire);
+  report.copy_seq = freeze_copy_seq_.load(std::memory_order_relaxed);
+  if (report.copy_active) {
+    const uint64_t begin = freeze_copy_begin_ns_.load(std::memory_order_relaxed);
+    report.copy_ms = now_ns > begin ? (now_ns - begin) / 1000000ull : 0;
+  }
+  report.copy_address = freeze_copy_address_.load(std::memory_order_relaxed);
+  report.copy_length = freeze_copy_length_.load(std::memory_order_relaxed);
+  const rex::LogRuntimeState log_state = rex::GetLogRuntimeState();
+  report.log_active = log_state.active;
+  report.log_async = log_state.async;
+  report.log_queue = log_state.queue_lines;
+  report.log_dropped = log_state.dropped_total;
+  report.log_op_ms = log_state.op_busy_ms;
+  report.log_op_thread = log_state.op_thread;
+  report.log_op_flush = log_state.op_flush;
+  report.log_writer = log_state.writer_thread;
+  REXGPU_WARN("{}", FormatCpFreezeBegin(report));
+  if (REXCVAR_GET(d3d12_cp_freeze_stack)) {
+    const std::string stack =
+        FreezeStackScan(report.cp_tid, freeze_cp_stack_low_.load(std::memory_order_relaxed),
+                        freeze_cp_stack_high_.load(std::memory_order_relaxed));
+    REXGPU_WARN("MCLA_CP_FREEZE v=1 kind=stack episode={} {}", episode, stack);
+  }
+}
+
 void D3D12CommandProcessor::PerfSplitShutdown() {
   if (perf_split_mode_) {
     PerfSplitEmit("exit");
@@ -4084,6 +4289,17 @@ bool D3D12CommandProcessor::IssueCopy() {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   rex::perf::ScopedPerfRegion perf_copy(perf_split_active_, rex::perf::PerfRegion::kCopy);
+  // KI-069 freeze watchdog: IssueCopy state (cleared on every exit).
+  freeze_copy_seq_.store(freeze_copy_seq_.load(std::memory_order_relaxed) + 1,
+                         std::memory_order_relaxed);
+  freeze_copy_begin_ns_.store(rex::perf::CpScopeNowNs(), std::memory_order_relaxed);
+  freeze_copy_address_.store(0, std::memory_order_relaxed);
+  freeze_copy_length_.store(0, std::memory_order_relaxed);
+  freeze_copy_active_.store(true, std::memory_order_release);
+  struct FreezeCopyClear {
+    std::atomic<bool>& active;
+    ~FreezeCopyClear() { active.store(false, std::memory_order_release); }
+  } freeze_copy_clear{freeze_copy_active_};
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -4106,6 +4322,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       return false;
     }
   }
+  freeze_copy_address_.store(written_address, std::memory_order_relaxed);
+  freeze_copy_length_.store(written_length, std::memory_order_relaxed);
 
   if (!written_length) {
     return true;
@@ -4994,6 +5212,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       ObserveAlwaysPipelineWait();
     }
     ++readback_counters_.frames;
+    // KI-069 freeze watchdog: one completed frame.
+    freeze_last_frame_ns_.store(rex::perf::CpScopeNowNs(), std::memory_order_relaxed);
+    freeze_frames_.store(freeze_frames_.load(std::memory_order_relaxed) + 1,
+                         std::memory_order_release);
     bool pacing_minute_reported = false;
     {
       // Host frame pacing, reported once a minute (command processor thread).

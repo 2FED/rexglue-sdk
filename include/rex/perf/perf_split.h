@@ -32,6 +32,7 @@
 //   untimed packets and the unsampled share of the scaling error).
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -119,6 +120,98 @@ enum class PerfRegion : uint8_t {
   kEmit,              // building and logging this line
   kCount,
 };
+
+inline constexpr const char* kPerfRegionNames[size_t(PerfRegion::kCount)] = {
+    "fence_wait", "pipeline_wait",      "upload",        "copy",
+    "resolve",    "readback_gpu",       "readback_wait", "readback_memcpy",
+    "submit",     "stream_finish_wait", "execute",       "present",
+    "emit"};
+
+// KI-069 CP freeze watchdog: the stack of timed regions the command processor
+// thread is in, published for another thread to read. Single writer (the CP
+// thread); a reader may see a stack that changes while it reads, which only
+// costs accuracy of one diagnostic line. Deeper levels than kCpScopeDepth are
+// counted but not recorded.
+inline constexpr size_t kCpScopeDepth = 8;
+
+struct CpScopeSnapshot {
+  uint32_t depth = 0;
+  PerfRegion regions[kCpScopeDepth] = {};
+  uint64_t enter_ns[kCpScopeDepth] = {};
+};
+
+class CpScopeStack {
+ public:
+  void Push(PerfRegion region, uint64_t now_ns) {
+    const uint32_t depth = depth_.load(std::memory_order_relaxed);
+    if (depth < kCpScopeDepth) {
+      regions_[depth].store(uint8_t(region), std::memory_order_relaxed);
+      enter_ns_[depth].store(now_ns, std::memory_order_relaxed);
+    }
+    depth_.store(depth + 1, std::memory_order_release);
+  }
+  void Pop() {
+    const uint32_t depth = depth_.load(std::memory_order_relaxed);
+    if (depth) {
+      depth_.store(depth - 1, std::memory_order_release);
+    }
+  }
+  CpScopeSnapshot Read() const {
+    CpScopeSnapshot snapshot;
+    snapshot.depth = depth_.load(std::memory_order_acquire);
+    const uint32_t recorded = std::min<uint32_t>(snapshot.depth, uint32_t(kCpScopeDepth));
+    for (uint32_t i = 0; i < recorded; ++i) {
+      const uint8_t region = regions_[i].load(std::memory_order_relaxed);
+      snapshot.regions[i] =
+          region < uint8_t(PerfRegion::kCount) ? PerfRegion(region) : PerfRegion::kCount;
+      snapshot.enter_ns[i] = enter_ns_[i].load(std::memory_order_relaxed);
+    }
+    return snapshot;
+  }
+
+ private:
+  std::atomic<uint32_t> depth_{0};
+  std::atomic<uint8_t> regions_[kCpScopeDepth] = {};
+  std::atomic<uint64_t> enter_ns_[kCpScopeDepth] = {};
+};
+
+// "copy>readback_wait" (outermost first; "-" when empty) and the time spent in
+// the innermost recorded region.
+inline std::string FormatCpScopePath(const CpScopeSnapshot& snapshot) {
+  if (!snapshot.depth) {
+    return "-";
+  }
+  std::string path;
+  const uint32_t recorded = std::min<uint32_t>(snapshot.depth, uint32_t(kCpScopeDepth));
+  for (uint32_t i = 0; i < recorded; ++i) {
+    if (i) {
+      path += '>';
+    }
+    const PerfRegion region = snapshot.regions[i];
+    path += region < PerfRegion::kCount ? kPerfRegionNames[size_t(region)] : "?";
+  }
+  if (snapshot.depth > recorded) {
+    path += fmt::format(">+{}", snapshot.depth - recorded);
+  }
+  return path;
+}
+
+inline uint64_t CpScopeInnermostMs(const CpScopeSnapshot& snapshot, uint64_t now_ns) {
+  if (!snapshot.depth) {
+    return 0;
+  }
+  const uint32_t top = std::min<uint32_t>(snapshot.depth, uint32_t(kCpScopeDepth)) - 1;
+  const uint64_t enter = snapshot.enter_ns[top];
+  return now_ns > enter ? (now_ns - enter) / 1000000ull : 0;
+}
+
+// Runtime (perf_split.cpp): only the thread that called MarkCpScopeThread
+// publishes; calls from other threads are ignored.
+void MarkCpScopeThread();
+void NoteCpScopeEnter(PerfRegion region);
+void NoteCpScopeExit();
+CpScopeSnapshot GetCpScopeSnapshot();
+uint64_t CpScopeNowNs();
 
 // Outcome of one read-back resolve's CPU copy (same rule as the livery
 // diagnostics' ClassifyReadbackCopy).
@@ -227,6 +320,7 @@ class ScopedPerfRegion {
   ScopedPerfRegion(PerfSplitAccumulator* accumulator, PerfRegion region)
       : accumulator_(accumulator), region_(region) {
     if (accumulator_) {
+      NoteCpScopeEnter(region_);
       frame_ = accumulator_->Enter(ReadTsc());
     }
   }
@@ -235,6 +329,7 @@ class ScopedPerfRegion {
     if (accumulator_) {
       accumulator_->Exit(region_, frame_, ReadTsc());
       accumulator_ = nullptr;
+      NoteCpScopeExit();
     }
   }
   ScopedPerfRegion(const ScopedPerfRegion&) = delete;

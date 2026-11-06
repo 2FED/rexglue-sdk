@@ -419,6 +419,9 @@ class CommandProcessor {
   // the window counters are command processor thread only.
   std::unique_ptr<rex::thread::Event> wrm_wake_event_;
   std::atomic<uint32_t> wrm_cp_thread_id_{0};
+  // KI-069 freeze watchdog: CpWaitState of the CP thread (0 busy, 1 ring idle,
+  // 2 WAIT_REG_MEM); written by the CP thread only.
+  std::atomic<uint8_t> cp_wait_state_{0};
   std::atomic<uint64_t> wrm_signals_{0};
   uint64_t wrm_signals_reported_ = 0;
   WrmCounters wrm_window_;
