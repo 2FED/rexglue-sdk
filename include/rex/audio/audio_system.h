@@ -56,6 +56,10 @@ class AudioSystem : public system::IAudioSystem {
   void Resume();
   bool PollDefaultDeviceChanges();
 
+  // Channel count of the host playback device the backend would open, 0 when unknown.
+  // May be called before any client registers (XAudioGetSpeakerConfig).
+  virtual int QueryHostOutputChannels() { return 0; }
+
  protected:
   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
 

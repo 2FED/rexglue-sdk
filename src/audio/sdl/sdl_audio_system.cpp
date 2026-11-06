@@ -26,6 +26,10 @@ SDLAudioSystem::SDLAudioSystem(runtime::FunctionDispatcher* function_dispatcher)
 
 SDLAudioSystem::~SDLAudioSystem() {}
 
+int SDLAudioSystem::QueryHostOutputChannels() {
+  return SDLAudioDriver::QueryPlaybackDeviceChannels();
+}
+
 void SDLAudioSystem::Initialize() {
   AudioSystem::Initialize();
 }

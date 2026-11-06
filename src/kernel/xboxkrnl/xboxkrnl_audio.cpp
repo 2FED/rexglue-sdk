@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/audio/audio_system.h>
+#include <rex/audio/speaker_config.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -24,8 +25,42 @@
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
+namespace {
+
+// Resolved once: audio_speaker_config requires a restart, and the title may poll the config.
+uint32_t ResolveGuestSpeakerConfig() {
+  audio::SpeakerConfigMode mode = audio::SpeakerConfigMode::kAuto;
+  const std::string configured = REXCVAR_GET(audio_speaker_config);
+  if (!audio::ParseSpeakerConfigMode(configured, &mode)) {
+    REXAPU_WARN("[audio] speaker config: unknown audio_speaker_config '{}', using auto",
+                configured);
+    mode = audio::SpeakerConfigMode::kAuto;
+  }
+  // Probe the host playback device directly so the answer does not depend on whether the title
+  // registers its render client (which opens the SDL stream) before or after this call.
+  int device_channels = 0;
+  auto* emulator = REX_KERNEL_STATE()->emulator();
+  if (auto* audio_system =
+          emulator ? static_cast<audio::AudioSystem*>(emulator->audio_system()) : nullptr) {
+    device_channels = audio_system->QueryHostOutputChannels();
+  }
+  const audio::SpeakerConfigAnswer answer = audio::ResolveSpeakerConfig(mode, device_channels);
+  REXAPU_INFO("[audio] speaker config: cvar={} device_channels={} answer=0x{:08X}",
+              audio::SpeakerConfigModeName(mode), device_channels, answer.value);
+  if (answer.device_unknown) {
+    REXAPU_WARN(
+        "[audio] speaker config: host device channel count unknown; auto keeps surround "
+        "(0x{:08X})",
+        answer.value);
+  }
+  return answer.value;
+}
+
+}  // namespace
+
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
-  *config_ptr = 0x00010001;
+  static const uint32_t speaker_config = ResolveGuestSpeakerConfig();
+  *config_ptr = speaker_config;
   return X_ERROR_SUCCESS;
 }
 

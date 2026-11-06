@@ -27,6 +27,7 @@ class SDLAudioSystem : public AudioSystem {
   X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
                         AudioDriver** out_driver) override;
   void DestroyDriver(AudioDriver* driver) override;
+  int QueryHostOutputChannels() override;
 
  protected:
   void Initialize() override;

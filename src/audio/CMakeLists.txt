@@ -5,7 +5,9 @@ add_library(rexaudio OBJECT
     
     audio_driver.cpp
     audio_route_audit.cpp
+    channel_rms_probe.cpp
     audio_system.cpp
+    speaker_config.cpp
     xma_context.cpp
     xma_decoder.cpp
     xma_register_file.cpp

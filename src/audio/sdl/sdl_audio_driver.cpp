@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
 #include <rex/audio/audio_route_audit.h>
+#include <rex/audio/channel_rms_probe.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/sdl/audio_config.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
@@ -38,6 +39,10 @@ REXCVAR_DEFINE_DOUBLE(audio_volume, 1.0, "Audio", "Host output volume (0.0 = sil
     .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(audio_downmix_itu, true, "Audio",
+                    "Stereo downmix of the 5.1 guest output uses ITU Lo/Ro weights (false = legacy "
+                    "Xenia weights, for A/B)");
+
 namespace rex::audio::sdl {
 
 SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
@@ -48,7 +53,7 @@ SDLAudioDriver::~SDLAudioDriver() {
   assert_true(frames_unused_.empty());
 }
 
-bool SDLAudioDriver::Initialize() {
+void SDLAudioDriver::ApplySdlAudioHints() {
   // Prevent SDL from interfering with timer resolution (causes FPS drops)
   SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
 
@@ -57,6 +62,62 @@ bool SDLAudioDriver::Initialize() {
 
   // Set app name for audio device identification
   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+}
+
+bool SDLAudioDriver::ResolvePlaybackDevice(SDL_AudioDeviceID* out_device) {
+  *out_device = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+  const std::string_view configured_device = REXCVAR_GET(audio_device);
+  if (configured_device == "default") {
+    return true;
+  }
+  int playback_device_count = 0;
+  SDL_AudioDeviceID* playback_devices = SDL_GetAudioPlaybackDevices(&playback_device_count);
+  if (!playback_devices) {
+    REXAPU_ERROR("SDL_GetAudioPlaybackDevices() failed: {}", SDL_GetError());
+    return false;
+  }
+  std::vector<PlaybackDeviceConfigEntry> device_entries;
+  device_entries.reserve(static_cast<size_t>(playback_device_count));
+  for (int i = 0; i < playback_device_count; ++i) {
+    const char* device_name = SDL_GetAudioDeviceName(playback_devices[i]);
+    if (device_name) {
+      device_entries.push_back({playback_devices[i], device_name});
+    }
+  }
+  *out_device =
+      static_cast<SDL_AudioDeviceID>(FindPlaybackDeviceByName(configured_device, device_entries));
+  SDL_free(playback_devices);
+  if (!*out_device) {
+    REXAPU_ERROR("Configured audio playback device is unavailable");
+    return false;
+  }
+  return true;
+}
+
+int SDLAudioDriver::QueryPlaybackDeviceChannels() {
+  ApplySdlAudioHints();
+  if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+    REXAPU_WARN("SDL_InitSubSystem(SDL_INIT_AUDIO) failed for the speaker config query: {}",
+                SDL_GetError());
+    return 0;
+  }
+  int channels = 0;
+  SDL_AudioDeviceID device = 0;
+  if (ResolvePlaybackDevice(&device)) {
+    SDL_AudioSpec spec = {};
+    if (SDL_GetAudioDeviceFormat(device, &spec, NULL)) {
+      channels = spec.channels;
+    } else {
+      REXAPU_WARN("SDL_GetAudioDeviceFormat() failed for the speaker config query: {}",
+                  SDL_GetError());
+    }
+  }
+  SDL_QuitSubSystem(SDL_INIT_AUDIO);
+  return channels;
+}
+
+bool SDLAudioDriver::Initialize() {
+  ApplySdlAudioHints();
 
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
@@ -65,29 +126,8 @@ bool SDLAudioDriver::Initialize() {
   sdl_initialized_ = true;
 
   SDL_AudioDeviceID requested_device = SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
-  const std::string_view configured_device = REXCVAR_GET(audio_device);
-  if (configured_device != "default") {
-    int playback_device_count = 0;
-    SDL_AudioDeviceID* playback_devices = SDL_GetAudioPlaybackDevices(&playback_device_count);
-    if (!playback_devices) {
-      REXAPU_ERROR("SDL_GetAudioPlaybackDevices() failed: {}", SDL_GetError());
-      return false;
-    }
-    std::vector<PlaybackDeviceConfigEntry> device_entries;
-    device_entries.reserve(static_cast<size_t>(playback_device_count));
-    for (int i = 0; i < playback_device_count; ++i) {
-      const char* device_name = SDL_GetAudioDeviceName(playback_devices[i]);
-      if (device_name) {
-        device_entries.push_back({playback_devices[i], device_name});
-      }
-    }
-    requested_device =
-        static_cast<SDL_AudioDeviceID>(FindPlaybackDeviceByName(configured_device, device_entries));
-    SDL_free(playback_devices);
-    if (!requested_device) {
-      REXAPU_ERROR("Configured audio playback device is unavailable");
-      return false;
-    }
+  if (!ResolvePlaybackDevice(&requested_device)) {
+    return false;
   }
   output_volume_ = static_cast<float>(REXCVAR_GET(audio_volume));
 
@@ -158,6 +198,7 @@ bool SDLAudioDriver::Initialize() {
 void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
   RecordAudioRouteSubmittedFrame(input_frame, frame_samples_);
+  RecordChannelRmsProbeFrame(input_frame, channel_samples_);
   float* output_frame;
   {
     std::unique_lock<std::mutex> guard(frames_mutex_);
@@ -321,7 +362,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       } else {
         switch (driver->sdl_device_channels_) {
           case 2:
-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_);
+            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_,
+                                                            REXCVAR_GET(audio_downmix_itu)
+                                                                ? conversion::kItuStereoDownmix
+                                                                : conversion::kLegacyStereoDownmix);
             break;
           case 6:
             conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_);

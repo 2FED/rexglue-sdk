@@ -29,6 +29,9 @@ class SDLAudioDriver : public AudioDriver {
   ~SDLAudioDriver() override;
 
   bool Initialize();
+  // Opens the SDL audio subsystem briefly and returns the channel count of the playback device
+  // Initialize would use (audio_device cvar), 0 on failure.
+  static int QueryPlaybackDeviceChannels();
   void SubmitFrame(uint32_t frame_ptr) override;
   bool Pause() override;
   bool Resume() override;
@@ -36,6 +39,8 @@ class SDLAudioDriver : public AudioDriver {
   void Shutdown();
 
  protected:
+  static void ApplySdlAudioHints();
+  static bool ResolvePlaybackDevice(SDL_AudioDeviceID* out_device);
   static bool SDLCALL SDLEventWatch(void* userdata, SDL_Event* event);
   static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                           int total_amount);
