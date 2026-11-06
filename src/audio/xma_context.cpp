@@ -10,12 +10,18 @@
 */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+
+#include <fmt/format.h>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/audio_route_audit.h>
 #include <rex/audio/xma/decoder.h>
+#include <rex/audio/xma/doubling_fixes.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
@@ -37,9 +43,115 @@ extern "C" {
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
 
+// KI-071 (doubled cut-scene dialogue). All default off; see
+// rex/audio/xma/doubling_fixes.h for the rules.
+REXCVAR_DEFINE_BOOL(xma_swap_carry_packet, false, "Audio",
+                    "KI-071 C1: after an XMA input-buffer swap continue at packet "
+                    "next_packet_index - packet_count of the new buffer instead of packet 0");
+REXCVAR_DEFINE_BOOL(xma_valid_only_when_written, false, "Audio",
+                    "KI-071 C2: clear the XMA output_buffer_valid flag only when the Work wrote "
+                    "at least one block");
+REXCVAR_DEFINE_BOOL(xma_work_lock_recheck, false, "Audio",
+                    "KI-071 C3: re-check the XMA context enable flag after taking the lock and "
+                    "do not write back the guest-owned output_buffer_read_offset");
+REXCVAR_DEFINE_BOOL(xma_swap_trace, false, "Audio",
+                    "KI-071: log XMA input-buffer swaps (paced) and a per-minute MCLA_XMA line");
+
 namespace rex::audio {
 
 using stream::BitStream;
+
+namespace {
+
+// KI-071 counters, reported once per minute (MCLA_XMA kind=minute).
+struct XmaDoublingCounters {
+  std::atomic<uint64_t> swaps{0};
+  std::atomic<uint64_t> carry_nonzero{0};
+  // Same two counts for 44.1 kHz contexts only (the measured doubling is
+  // 512/1024 samples of a 44.1 kHz stream).
+  std::atomic<uint64_t> swaps_44k{0};
+  std::atomic<uint64_t> carry_nonzero_44k{0};
+  std::atomic<uint64_t> carry_fallbacks{0};
+  std::atomic<uint64_t> stale_ring_replays{0};
+  std::atomic<uint64_t> lock_races{0};
+  std::atomic<uint64_t> read_offset_reverts{0};
+  std::atomic<uint64_t> trace_suppressed{0};
+};
+XmaDoublingCounters g_xma_counters;
+std::atomic<int64_t> g_xma_minute_start_ms{-1};
+std::mutex g_xma_trace_mutex;
+int64_t g_xma_trace_last_ms = -1;
+uint32_t g_xma_trace_milli_tokens = 0;
+
+// Swap trace pacing: up to kTraceBurst lines at once, kTracePerSecond refill.
+constexpr uint32_t kTraceBurst = 64;
+constexpr uint32_t kTracePerSecond = 8;
+
+int64_t XmaSteadyNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+bool AllowXmaTraceLine() {
+  const int64_t now = XmaSteadyNowMs();
+  std::lock_guard<std::mutex> guard(g_xma_trace_mutex);
+  constexpr uint32_t kBurstMilli = kTraceBurst * 1000;
+  if (g_xma_trace_last_ms < 0) {
+    g_xma_trace_milli_tokens = kBurstMilli;
+  } else if (now > g_xma_trace_last_ms) {
+    const uint64_t refill = uint64_t(now - g_xma_trace_last_ms) * kTracePerSecond;
+    g_xma_trace_milli_tokens =
+        uint32_t(std::min<uint64_t>(kBurstMilli, g_xma_trace_milli_tokens + refill));
+  }
+  g_xma_trace_last_ms = now;
+  if (g_xma_trace_milli_tokens >= 1000) {
+    g_xma_trace_milli_tokens -= 1000;
+    return true;
+  }
+  g_xma_counters.trace_suppressed.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
+void MaybeEmitXmaMinute() {
+  const int64_t now = XmaSteadyNowMs();
+  int64_t start = g_xma_minute_start_ms.load(std::memory_order_relaxed);
+  if (start < 0) {
+    g_xma_minute_start_ms.compare_exchange_strong(start, now, std::memory_order_relaxed);
+    return;
+  }
+  if (now - start < 60000 ||
+      !g_xma_minute_start_ms.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+    return;
+  }
+  auto take = [](std::atomic<uint64_t>& counter) {
+    return counter.exchange(0, std::memory_order_relaxed);
+  };
+  const uint64_t swaps = take(g_xma_counters.swaps);
+  const uint64_t carry_nonzero = take(g_xma_counters.carry_nonzero);
+  const uint64_t swaps_44k = take(g_xma_counters.swaps_44k);
+  const uint64_t carry_nonzero_44k = take(g_xma_counters.carry_nonzero_44k);
+  const uint64_t carry_fallbacks = take(g_xma_counters.carry_fallbacks);
+  const uint64_t stale_ring_replays = take(g_xma_counters.stale_ring_replays);
+  const uint64_t lock_races = take(g_xma_counters.lock_races);
+  const uint64_t read_offset_reverts = take(g_xma_counters.read_offset_reverts);
+  const uint64_t trace_suppressed = take(g_xma_counters.trace_suppressed);
+  const bool any = swaps || carry_nonzero || carry_fallbacks || stale_ring_replays || lock_races ||
+                   read_offset_reverts || trace_suppressed;
+  if (!any && !REXCVAR_GET(xma_swap_trace)) {
+    return;
+  }
+  REXAPU_INFO(
+      "MCLA_XMA v=1 kind=minute swaps={} carry_nonzero={} stale_ring_replays={} lock_races={} "
+      "swaps_44k={} carry_nonzero_44k={} carry_fallbacks={} read_offset_reverts={} "
+      "trace_suppressed={} carry_fix={} valid_fix={} lock_fix={}",
+      swaps, carry_nonzero, stale_ring_replays, lock_races, swaps_44k, carry_nonzero_44k,
+      carry_fallbacks, read_offset_reverts, trace_suppressed,
+      int(REXCVAR_GET(xma_swap_carry_packet)), int(REXCVAR_GET(xma_valid_only_when_written)),
+      int(REXCVAR_GET(xma_work_lock_recheck)));
+}
+
+}  // namespace
 
 const uint32_t XmaContext::kBitsPerPacketHeader;
 const uint32_t XmaContext::kOutputMaxSizeBytes;
@@ -97,9 +209,23 @@ bool XmaContext::Work() {
   if (!is_allocated() || !is_enabled()) {
     return false;
   }
+  MaybeEmitXmaMinute();
+  const uint32_t disables_before_lock = disable_count_.load(std::memory_order_acquire);
 
   std::lock_guard<std::mutex> lock(lock_);
+  // KI-071 C3: the enable check above ran without the lock. A guest lock
+  // (Disable + Block) or another Work may have run in between.
+  const bool enabled_after_lock = is_enabled();
+  if (!enabled_after_lock) {
+    if (disable_count_.load(std::memory_order_acquire) != disables_before_lock) {
+      g_xma_counters.lock_races.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!xma::ShouldRunWorkAfterLock(enabled_after_lock, REXCVAR_GET(xma_work_lock_recheck))) {
+      return false;
+    }
+  }
   set_is_enabled(false);
+  blocks_written_this_work_ = 0;
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -144,7 +270,16 @@ bool XmaContext::Work() {
 
   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
 
-  if (output_rb.empty()) {
+  // KI-071 C2: read == write is "full" only when this Work's writes closed the
+  // ring; upstream also cleared valid on a ring the guest had drained, which
+  // the guest reads as "whole ring readable" and replays.
+  const bool ring_read_equals_write = output_rb.empty();
+  if (xma::IsStaleRingReplay(initial_data.output_buffer_valid, ring_read_equals_write,
+                             blocks_written_this_work_)) {
+    g_xma_counters.stale_ring_replays.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (xma::ShouldClearOutputValid(ring_read_equals_write, blocks_written_this_work_,
+                                  REXCVAR_GET(xma_valid_only_when_written))) {
     data.output_buffer_valid = 0;
   }
 
@@ -201,10 +336,12 @@ void XmaContext::ResetDecoderState() {
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
+  pending_swap_carry_packet_ = 0;
 }
 
 void XmaContext::Disable() {
   std::lock_guard<std::mutex> lock(lock_);
+  disable_count_.fetch_add(1, std::memory_order_acq_rel);
   set_is_enabled(false);
 }
 
@@ -296,7 +433,16 @@ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_p
     return nullptr;
   }
 
-  return memory()->TranslatePhysical(next_buffer_address);
+  const uint8_t* next_buffer = memory()->TranslatePhysical(next_buffer_address);
+  if (REXCVAR_GET(xma_swap_carry_packet)) {
+    // KI-071 C1: a frame that spans the buffer boundary continues in this
+    // stream's packet of the next buffer, not in packet 0 (stream 0's).
+    const xma::SwapCarry carry =
+        xma::ComputeSwapCarry(next_packet_index, current_input_packet_count,
+                              data->GetInputBufferPacketCount(next_buffer_index));
+    return next_buffer + carry.start_packet * kBytesPerPacket;
+  }
+  return next_buffer;
 }
 
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
@@ -409,7 +555,13 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
   fresh.input_buffer_read_offset = data.input_buffer_read_offset;
   fresh.error_status = data.error_status;
   fresh.current_buffer = data.current_buffer;
-  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+  // KI-071 C3: the guest owns output_buffer_read_offset; Work never changes it.
+  if (fresh.output_buffer_read_offset != data.output_buffer_read_offset) {
+    g_xma_counters.read_offset_reverts.fetch_add(1, std::memory_order_relaxed);
+  }
+  fresh.output_buffer_read_offset =
+      xma::MergeOutputReadOffset(fresh.output_buffer_read_offset, data.output_buffer_read_offset,
+                                 REXCVAR_GET(xma_work_lock_recheck));
 
   fresh.Store(context_ptr);
 }
@@ -451,6 +603,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
 
   output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
                    subframes_to_write * kOutputBytesPerBlock);
+  if (subframes_to_write > 0) {
+    blocks_written_this_work_ += uint32_t(subframes_to_write);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding
@@ -532,6 +687,30 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     SwapInputBuffer(data);
     if (!data->IsCurrentInputBufferValid()) {
       return;
+    }
+  }
+
+  // KI-071 C1: the end-of-buffer swap found no valid next buffer and recorded
+  // the carry; continue at that packet once decoding resumes at the start.
+  if (pending_swap_carry_packet_) {
+    const uint32_t pending = pending_swap_carry_packet_;
+    pending_swap_carry_packet_ = 0;
+    if (REXCVAR_GET(xma_swap_carry_packet) &&
+        data->input_buffer_read_offset == kBitsPerPacketHeader) {
+      const uint32_t packet_count = data->GetCurrentInputBufferPacketCount();
+      const uint32_t frame_offset =
+          pending < packet_count
+              ? xma::GetPacketFrameOffset(GetCurrentInputBuffer(data) + pending * kBytesPerPacket)
+              : kMaxFrameSizeinBits + 1;
+      if (frame_offset <= kMaxFrameSizeinBits) {
+        data->input_buffer_read_offset = pending * kBitsPerPacket + frame_offset;
+      } else {
+        g_xma_counters.carry_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        if (AllowXmaTraceLine()) {
+          REXAPU_WARN("[xma] swap carry {} out of range (packets={}) on ctx={}; packet 0", pending,
+                      packet_count, id());
+        }
+      }
     }
   }
 
@@ -695,17 +874,96 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   if (next_input_offset == kBitsPerPacketHeader) {
     SwapInputBuffer(data);
+    // KI-071 C1: 0 (upstream) unless xma_swap_carry_packet carries the stream.
+    const uint32_t start_packet = OnInputBufferSwap(data, uint32_t(packet_index), next_packet_index,
+                                                    current_input_packet_count);
     if (data->IsAnyInputBufferValid()) {
       next_input_offset = xma::GetPacketFrameOffset(
-          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()));
+          memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
+          start_packet * kBytesPerPacket);
 
       if (next_input_offset > kMaxFrameSizeinBits) {
         SwapInputBuffer(data);
         return;
       }
+      next_input_offset += start_packet * kBitsPerPacket;
     }
   }
   data->input_buffer_read_offset = next_input_offset;
+}
+
+uint32_t XmaContext::OnInputBufferSwap(const XMA_CONTEXT_DATA* data, uint32_t last_packet_index,
+                                       uint32_t next_packet_index, uint32_t old_packet_count) {
+  const bool fix = REXCVAR_GET(xma_swap_carry_packet);
+  const bool new_valid = data->IsCurrentInputBufferValid();
+  const uint32_t new_packet_count = data->GetCurrentInputBufferPacketCount();
+  const xma::SwapCarry carry = xma::ComputeSwapCarry(next_packet_index, old_packet_count,
+                                                     new_valid ? new_packet_count : UINT32_MAX);
+  const int rate = GetSampleRate(data->sample_rate);
+  g_xma_counters.swaps.fetch_add(1, std::memory_order_relaxed);
+  if (rate == 44100) {
+    g_xma_counters.swaps_44k.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (carry.carry) {
+    g_xma_counters.carry_nonzero.fetch_add(1, std::memory_order_relaxed);
+    if (rate == 44100) {
+      g_xma_counters.carry_nonzero_44k.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (new_valid && carry.fallback) {
+    g_xma_counters.carry_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (fix && !new_valid) {
+    // The next buffer's packet count is not known yet; applied on resume.
+    pending_swap_carry_packet_ = carry.carry;
+  }
+  const uint32_t start_packet = (fix && new_valid) ? carry.start_packet : 0;
+
+  if (fix && new_valid && carry.fallback && AllowXmaTraceLine()) {
+    REXAPU_WARN("[xma] swap carry {} out of range (packets={}) on ctx={}; packet 0", carry.carry,
+                new_packet_count, id());
+  }
+  if (REXCVAR_GET(xma_swap_trace) && AllowXmaTraceLine()) {
+    const uint8_t old_buffer = data->current_buffer ^ 1;
+    const uint32_t old_ptr = data->GetInputBufferAddress(old_buffer);
+    REXAPU_INFO(
+        "[xma] swap: ctx={} stereo={} rate={} packets={} last_packet={} skip={} "
+        "next_packet_index={} carry={} new_valid={} new_packets={} start_packet={} fix={} "
+        "buffer={:08X} shared_buffer_ctxs={}",
+        id(), uint32_t(data->is_stereo), rate, old_packet_count, last_packet_index,
+        next_packet_index - last_packet_index - 1, next_packet_index, carry.carry, int(new_valid),
+        new_valid ? new_packet_count : 0, start_packet, int(fix), old_ptr,
+        FormatSharedBufferContexts(old_ptr));
+  }
+  return start_packet;
+}
+
+std::string XmaContext::FormatSharedBufferContexts(uint32_t ptr) {
+  const uint32_t own_offset = id_ * uint32_t(sizeof(XMA_CONTEXT_DATA));
+  if (!ptr || guest_ptr_ < own_offset) {
+    return "-";
+  }
+  // Contexts are one contiguous guest array (XmaDecoder::Setup); read-only scan.
+  const uint32_t base = guest_ptr_ - own_offset;
+  std::string result;
+  uint32_t listed = 0;
+  for (uint32_t i = 0; i < kTraceContextArrayCount; ++i) {
+    if (i == id_) {
+      continue;
+    }
+    const XMA_CONTEXT_DATA other(
+        memory()->TranslateVirtual(base + i * uint32_t(sizeof(XMA_CONTEXT_DATA))));
+    if (other.input_buffer_0_ptr != ptr && other.input_buffer_1_ptr != ptr) {
+      continue;
+    }
+    if (listed == 8) {
+      result += ",...";
+      break;
+    }
+    result += listed ? fmt::format(",{}", i) : fmt::format("{}", i);
+    ++listed;
+  }
+  return result.empty() ? "-" : result;
 }
 
 void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,

@@ -112,6 +112,8 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
       memory()->GetPhysicalAddress(context_data_first_ptr_);
 
   // Setup XMA contexts.
+  static_assert(XmaContext::kTraceContextArrayCount == kContextCount,
+                "the KI-071 XMA swap trace scans the whole context array");
   for (size_t i = 0; i < kContextCount; ++i) {
     uint32_t guest_ptr = context_data_first_ptr_ + i * sizeof(XMA_CONTEXT_DATA);
     XmaContext& context = contexts_[i];

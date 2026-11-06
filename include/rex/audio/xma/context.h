@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <string>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -190,6 +191,9 @@ class XmaContext {
   static const uint32_t kOutputBytesPerBlock = 256;
   static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
   static const uint32_t kMaxFrameSizeinBits = 0x4000 - kBitsPerPacketHeader;
+  // Size of the contiguous guest context array (XmaDecoder::kContextCount);
+  // used only by the KI-071 swap trace to list contexts sharing a buffer.
+  static const uint32_t kTraceContextArrayCount = 320;
 
   explicit XmaContext();
   ~XmaContext();
@@ -254,6 +258,14 @@ class XmaContext {
   void StoreContextMerged(const XMA_CONTEXT_DATA& data, const XMA_CONTEXT_DATA& initial_data,
                           uint8_t* context_ptr);
 
+  // KI-071 C1: called right after the end-of-buffer swap in Decode. Returns the
+  // packet of the (new) current buffer to continue at; 0 keeps upstream
+  // behaviour. Also counts and traces the swap.
+  uint32_t OnInputBufferSwap(const XMA_CONTEXT_DATA* data, uint32_t last_packet_index,
+                             uint32_t next_packet_index, uint32_t old_packet_count);
+  // KI-071 C1: other allocated contexts whose input buffer pointer equals ptr.
+  std::string FormatSharedBufferContexts(uint32_t ptr);
+
   static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
 
   memory::Memory* memory_ = nullptr;
@@ -264,6 +276,9 @@ class XmaContext {
   std::mutex lock_;
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
+  // KI-071 C3: incremented by Disable() (guest lock) to tell a guest lock race
+  // from a concurrent Work in Work's post-lock enable re-check.
+  std::atomic<uint32_t> disable_count_ = 0;
 
   // ffmpeg structures
   AVPacket* av_packet_ = nullptr;
@@ -285,6 +300,12 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+  // KI-071: output blocks written by the current Work (C2).
+  uint32_t blocks_written_this_work_ = 0;
+  // KI-071 C1: carry packet recorded at a swap that found the next input buffer
+  // not yet valid; applied when decoding resumes at the buffer start.
+  uint32_t pending_swap_carry_packet_ = 0;
 };
 
 }  // namespace rex::audio

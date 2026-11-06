@@ -4,6 +4,7 @@ add_executable(unit_tests
     audio/sdl_audio_config_test.cpp
     audio/audio_route_audit_test.cpp
     audio/audio_output_mix_test.cpp
+    audio/xma_doubling_fixes_test.cpp
     memory/access_diagnostics_test.cpp
     memory/watch_census_test.cpp
     memory/physical_mapping_test.cpp
