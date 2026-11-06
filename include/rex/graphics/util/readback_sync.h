@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+
+#include <fmt/format.h>
 
 #include <rex/graphics/util/livery_diag2.h>
 
@@ -77,6 +80,9 @@ struct ReadbackSyncResolve {
   bool key_live = false;
   uint64_t previous_frame = 0;
   uint64_t frame = 0;
+  // d3d12_readback_sync_steady_exempt: consecutive frames, this one
+  // included, in which the key was resolved (NextReadbackConsecutiveFrames).
+  uint32_t consecutive_frames = 0;
 };
 
 inline bool IsSquarePowerOfTwoInRange(uint32_t width, uint32_t height, uint32_t min_size,
@@ -136,8 +142,14 @@ struct ReadbackSyncRules {
   uint64_t other_key = 0;
   uint64_t other_last_used_frame = 0;
   uint32_t other_keys = 0;
+  // d3d12_readback_sync_steady_exempt: rule c matched, but the key is a
+  // steady per-frame resolve (IsReadbackSyncSteadyExempt), so rule c does
+  // not force it. The rule bits above stay set for the diagnostics.
+  bool steady_exempt = false;
 
   bool any() const { return shared_range || sporadic || composite_shape; }
+  // The rules that force the resolve (any() without an exempt rule c).
+  bool forces() const { return shared_range || sporadic || (composite_shape && !steady_exempt); }
   // Rule a or c: the composite-range diagnostic lines.
   bool composite() const { return shared_range || composite_shape; }
 };
@@ -172,7 +184,88 @@ ReadbackSyncRules EvaluateReadbackSyncRules(const ReadbackSyncResolve& r, Readba
 // back) and not for cache misses (they already wait and read their own slot).
 inline bool ShouldForceReadbackSync(bool enabled, bool delayed_mode, bool cache_miss,
                                     const ReadbackSyncRules& rules) {
-  return enabled && delayed_mode && !cache_miss && rules.any();
+  return enabled && delayed_mode && !cache_miss && rules.forces();
+}
+
+// d3d12_readback_sync_steady_exempt (M11-007a). Rule c also matches a steady
+// 256x256 k_8_8_8_8 resolve to 03702000 that the game issues in every frame
+// and the GPU samples in the same frame (no known CPU reader). It forced
+// about one full GPU drain per frame (6.3 ms PC, 7.1 ms Deck) although it
+// was never forced before l55 and never tied to a defect. The livery
+// composite keys match rules a or b and run at most 3 consecutive frames.
+// With the switch on, rule c does not force a key that was resolved in each
+// of the last kReadbackSyncSteadyMinFrames frames (this one included) and
+// that matches neither rule a nor rule b now; such a resolve keeps the
+// delayed behaviour of its mode. A gap of one frame resets the run, so a key
+// re-used by a one-shot composite is forced again on its first resolve.
+constexpr uint32_t kReadbackSyncSteadyMinFrames = 30;
+
+// Consecutive frames, `frame` included, in which a key was resolved, from
+// the key's previous state (a key without a live entry starts at 1; several
+// resolves in one frame keep the run).
+inline uint32_t NextReadbackConsecutiveFrames(bool key_live, uint64_t previous_frame,
+                                              uint32_t previous_run, uint64_t frame) {
+  if (!key_live || !previous_run) {
+    return 1;
+  }
+  if (previous_frame == frame) {
+    return previous_run;
+  }
+  if (previous_frame + 1 == frame) {
+    return previous_run == UINT32_MAX ? previous_run : previous_run + 1;
+  }
+  return 1;
+}
+
+// Rule c only (neither a nor b) and a run of at least the minimum.
+inline bool IsReadbackSyncSteadyExempt(const ReadbackSyncRules& rules, uint32_t run) {
+  return rules.composite_shape && !rules.shared_range && !rules.sporadic &&
+         run >= kReadbackSyncSteadyMinFrames;
+}
+
+// Why a key that was exempt is not exempt any more.
+inline const char* ReadbackSyncSteadyEndReason(bool enabled, const ReadbackSyncRules& rules,
+                                               uint32_t run) {
+  if (!enabled) {
+    return "disabled";
+  }
+  if (rules.shared_range) {
+    return "rule_a";
+  }
+  if (rules.sporadic) {
+    return "rule_b";
+  }
+  if (!rules.composite_shape) {
+    return "shape";
+  }
+  return run < kReadbackSyncSteadyMinFrames ? "gap" : "none";
+}
+
+// One kind=steady_key line (the MCLA_READBACK_SYNC v=1 prefix is added by the
+// caller): a key became exempt (event=exempt) or stopped being exempt
+// (event=end, run = the run of its last exempt resolve).
+struct ReadbackSyncSteadyKeyEvent {
+  bool exempt = false;
+  const char* reason = "none";
+  uint64_t frame = 0;
+  uint32_t draw = 0;
+  uint32_t address = 0;
+  uint32_t length = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t dest_format = 0;
+  uint32_t source_edram_base = 0;
+  uint32_t run = 0;
+  uint64_t suppressed = 0;
+};
+
+inline std::string FormatReadbackSyncSteadyKeyEvent(const ReadbackSyncSteadyKeyEvent& e) {
+  return fmt::format(
+      "kind=steady_key event={} reason={} frame={} draw={} base={:08X} len={} size={}x{} fmt={} "
+      "src_base={} run={} min_frames={} suppressed={}",
+      e.exempt ? "exempt" : "end", e.reason, e.frame, e.draw, e.address, e.length, e.width,
+      e.height, e.dest_format, e.source_edram_base, e.run, kReadbackSyncSteadyMinFrames,
+      e.suppressed);
 }
 
 inline const char* ReadbackSyncRuleNames(const ReadbackSyncRules& rules) {
@@ -332,6 +425,26 @@ struct ReadbackSyncCounters {
   uint64_t kicks = 0;
   uint64_t kick_us = 0;
 
+  // d3d12_readback_sync_steady_exempt: non-miss resolves that rule c
+  // matched alone and that were not forced because their key is steady,
+  // the distinct keys among them, and the longest consecutive-frame run of
+  // any non-miss rule c resolve in the minute (counted with the switch off
+  // too; reported only while it is on or has counted).
+  uint64_t steady_exempt = 0;
+  uint64_t steady_exempt_keys = 0;
+  uint32_t steady_max_run = 0;
+
+  void CountSteadyRun(uint32_t run) {
+    steady_max_run = run > steady_max_run ? run : steady_max_run;
+  }
+
+  // `first_in_minute`: the first exempt resolve of this key since the
+  // counters were last reset.
+  void CountSteadyExempt(bool first_in_minute) {
+    ++steady_exempt;
+    steady_exempt_keys += first_in_minute ? 1 : 0;
+  }
+
   void CountTargeted(const ReadbackTargetedWait& wait) {
     ++targeted_waits;
     uint64_t total_us = wait.submit_us + wait.fence_us;
@@ -343,5 +456,19 @@ struct ReadbackSyncCounters {
     targeted_backlog_draws += wait.backlog_draws;
   }
 };
+
+// Fields appended to the MCLA_READBACK_SYNC minute and mark lines: empty
+// while d3d12_readback_sync_steady_exempt is off and nothing was exempt (the
+// line is unchanged then).
+inline std::string ReadbackSyncSteadyReport(const ReadbackSyncCounters& c, bool enabled) {
+  if (!enabled && !c.steady_exempt) {
+    return std::string();
+  }
+  return fmt::format(
+      " steady={} steady_min_frames={} steady_exempt={} steady_exempt_keys={} "
+      "steady_max_run={}",
+      int(enabled), kReadbackSyncSteadyMinFrames, c.steady_exempt, c.steady_exempt_keys,
+      c.steady_max_run);
+}
 
 }  // namespace rex::graphics

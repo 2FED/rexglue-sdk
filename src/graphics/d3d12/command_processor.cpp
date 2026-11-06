@@ -136,6 +136,14 @@ REXCVAR_DEFINE_INT32(d3d12_readback_sync_kick_draws, 512, "GPU/D3D12",
     .range(0, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_exempt, false, "GPU/D3D12",
+                    "M11-007a: with d3d12_readback_sync_composite on, the composite-shape rule "
+                    "does not force a resolve whose key was resolved in each of the last 30 "
+                    "frames and that matches neither the shared-range nor the sporadic rule "
+                    "(a steady per-frame resolve keeps the delayed behaviour of its mode). "
+                    "Adds steady* fields and kind=steady_key lines to MCLA_READBACK_SYNC")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_elide_unread, false, "GPU/D3D12",
                     "M10-002 step 1: with readback_resolve some, do not record the GPU copy "
                     "(downscale or shared-memory copy, slot copy and their barriers) of a "
@@ -3005,7 +3013,7 @@ bool D3D12CommandProcessor::ReadbackSyncEnabled() {
   ReadbackSyncScope scope = NormalizeReadbackSyncScope(REXCVAR_GET(d3d12_readback_sync_scope));
   if (enabled != readback_sync_was_enabled_ || (enabled && scope != readback_sync_scope_)) {
     readback_sync_was_enabled_ = enabled;
-    readback_sync_minute_ = {};
+    ResetReadbackSyncMinute();
     REXGPU_INFO(
         "MCLA_READBACK_SYNC v=1 kind={} frame={} scope={} readback={} scale={}x{} "
         "sporadic_min_frames={} composite_sizes={}-{} composite_format={}",
@@ -3032,7 +3040,25 @@ std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
       c.forced, c.forced_rule_a, c.forced_rule_b, c.forced_rule_c, c.forced_wait_failed,
       double(c.wait_us) / 1000.0, double(c.max_wait_us) / 1000.0);
   line += ReadbackSyncTargetedReport();
+  line += ReadbackSyncSteadyReport(c, readback_sync_steady_was_enabled_);
   return line;
+}
+
+void D3D12CommandProcessor::ResetReadbackSyncMinute() {
+  readback_sync_minute_ = {};
+  // Keys counted in steady_exempt_keys are counted again in the next minute.
+  ++readback_sync_minute_epoch_;
+}
+
+bool D3D12CommandProcessor::ReadbackSyncSteadyExemptEnabled() {
+  bool steady = REXCVAR_GET(d3d12_readback_sync_steady_exempt);
+  if (steady != readback_sync_steady_was_enabled_) {
+    readback_sync_steady_was_enabled_ = steady;
+    REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind={} frame={} steady_min_frames={}",
+                steady ? "steady_start" : "steady_stop", frame_current_,
+                kReadbackSyncSteadyMinFrames);
+  }
+  return steady;
 }
 
 std::string D3D12CommandProcessor::ReadbackSyncTargetedReport() {
@@ -4423,6 +4449,21 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  // d3d12_readback_sync_steady_exempt: the key's consecutive-frame run,
+  // tracked for every resolve.
+  uint32_t steady_run;
+  uint32_t steady_previous_run = 0;
+  {
+    auto existing = readback_buffers_.find(resolve_key);
+    bool key_live = existing != readback_buffers_.end();
+    if (key_live) {
+      steady_previous_run = existing->second.consecutive_frames;
+    }
+    steady_run =
+        NextReadbackConsecutiveFrames(key_live, key_live ? existing->second.last_used_frame : 0,
+                                      steady_previous_run, frame_current_);
+  }
+  bool steady_enabled = false;
   if (use_delayed_sync && (sync_enabled || diag.diag2)) {
     const D3D12RenderTargetCache::LastResolveDiagInfo& info =
         render_target_cache_->last_resolve_diag_info();
@@ -4437,6 +4478,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     sync_resolve.address = written_address;
     sync_resolve.length = written_length;
     sync_resolve.frame = frame_current_;
+    sync_resolve.consecutive_frames = steady_run;
     auto existing = readback_buffers_.find(resolve_key);
     if (existing != readback_buffers_.end()) {
       sync_resolve.key_live = true;
@@ -4445,9 +4487,38 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     diag.sync_rules = EvaluateReadbackSyncRules(sync_resolve, readback_sync_scope_,
                                                 readback_buffers_, resolve_key);
     diag.sync_evaluated = true;
+    steady_enabled = sync_enabled && ReadbackSyncSteadyExemptEnabled();
+    diag.sync_rules.steady_exempt =
+        steady_enabled && IsReadbackSyncSteadyExempt(diag.sync_rules, steady_run);
   }
   ReadbackBuffer& rb = readback_buffers_[resolve_key];
   rb.last_used_frame = frame_current_;
+  rb.consecutive_frames = steady_run;
+  if (diag.sync_evaluated && rb.steady_exempt != diag.sync_rules.steady_exempt) {
+    // A kind=steady_key line when the key becomes exempt or stops being
+    // exempt (paced).
+    rb.steady_exempt = diag.sync_rules.steady_exempt;
+    if (readback_sync_steady_lines_.Allow(LiveryDiagNowMs())) {
+      const D3D12RenderTargetCache::LastResolveDiagInfo& info =
+          render_target_cache_->last_resolve_diag_info();
+      ReadbackSyncSteadyKeyEvent event;
+      event.exempt = rb.steady_exempt;
+      event.reason = rb.steady_exempt
+                         ? "run"
+                         : ReadbackSyncSteadyEndReason(steady_enabled, diag.sync_rules, steady_run);
+      event.frame = frame_current_;
+      event.draw = g_mcla_frame_draws;
+      event.address = written_address;
+      event.length = written_length;
+      event.width = info.width;
+      event.height = info.height;
+      event.dest_format = info.copy_dest_format;
+      event.source_edram_base = info.source_edram_base;
+      event.run = rb.steady_exempt ? steady_run : steady_previous_run;
+      event.suppressed = readback_sync_steady_lines_.TakeSuppressed();
+      REXGPU_INFO("MCLA_READBACK_SYNC v=1 {}", FormatReadbackSyncSteadyKeyEvent(event));
+    }
+  }
 
   // M10-002: decide before recording which slot this resolve reads and
   // whether the GPU copy into its own slot can ever be read
@@ -4712,6 +4783,14 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       ++sync_counters.misses;
     } else if (diag.sync_rules.any()) {
       sync_counters.CountMatched(diag.sync_rules);
+      if (diag.sync_rules.composite_shape) {
+        sync_counters.CountSteadyRun(rb.consecutive_frames);
+      }
+      if (diag.sync_rules.steady_exempt) {
+        // Rule c alone on a steady key: not forced (plan.forced is false).
+        sync_counters.CountSteadyExempt(rb.steady_exempt_epoch != readback_sync_minute_epoch_);
+        rb.steady_exempt_epoch = readback_sync_minute_epoch_;
+      }
       // Planned with the same inputs: ShouldForceReadbackSync and not a miss.
       if (plan.forced) {
         read_index = write_index;
@@ -5332,7 +5411,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
         if (readback_sync_was_enabled_ || livery_diag2_was_enabled_) {
           REXGPU_INFO("MCLA_READBACK_SYNC v=1 kind=minute {}", ReadbackSyncMinuteReport());
-          readback_sync_minute_ = {};
+          ResetReadbackSyncMinute();
         }
         // M10-CPU-B: WAIT_REG_MEM episodes of the minute (always on).
         REXGPU_INFO("{}", WaitRegMemReport("minute", "minute", frame_current_, true));
@@ -5406,6 +5485,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
     ReadbackSyncEnabled();
     ReadbackSyncTargetedEnabled();
+    ReadbackSyncSteadyExemptEnabled();
     if (performance_timestamp_frame_active_) {
       const uint64_t cpu_us =
           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(

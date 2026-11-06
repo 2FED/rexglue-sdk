@@ -318,6 +318,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // switch changes and returns it.
   bool ReadbackSyncTargetedEnabled();
   std::string ReadbackSyncTargetedReport();
+  // d3d12_readback_sync_steady_exempt (readback_sync.h): logs a line when the
+  // switch changes.
+  bool ReadbackSyncSteadyExemptEnabled();
+  // Resets the per-minute read-back sync counters.
+  void ResetReadbackSyncMinute();
   // Ends the open submission holding a forced resolve's GPU copy and waits
   // for exactly its fence value; `wait` gets the timings. Requires an open
   // submission.
@@ -495,6 +500,12 @@ class D3D12CommandProcessor : public CommandProcessor {
     // M10-002 (d3d12_readback_elide_unread): the last resolve that wrote the
     // slot elided its GPU copy (see readback_slots.h).
     bool slot_elided[2] = {false, false};
+    // d3d12_readback_sync_steady_exempt (readback_sync.h): consecutive frames
+    // in which the key was resolved, whether its last evaluated resolve was
+    // exempt, and the counter epoch of its last exempt resolve.
+    uint32_t consecutive_frames = 0;
+    bool steady_exempt = false;
+    uint64_t steady_exempt_epoch = 0;
   };
   // In "some" mode a resolve target is copied to guest memory on a cache miss
   // and additionally every this many resolves, so CPU readers such as Photo
@@ -845,6 +856,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool readback_sync_targeted_was_enabled_ = false;
   // Draws recorded into the open submission (reset when one is opened).
   uint64_t readback_sync_submission_draws_ = 0;
+  // d3d12_readback_sync_steady_exempt state: the switch, the epoch of the
+  // per-minute counters (incremented when they are reset; starts at 1 so a
+  // new ReadbackBuffer is never counted as already seen) and the line budget
+  // of the kind=steady_key lines.
+  bool readback_sync_steady_was_enabled_ = false;
+  uint64_t readback_sync_minute_epoch_ = 1;
+  PacedLineBudget readback_sync_steady_lines_{2, 16};
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

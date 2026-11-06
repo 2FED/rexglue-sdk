@@ -369,6 +369,201 @@ TEST_CASE("Read-back sync targeted counters", "[graphics][readback-sync][readbac
   CHECK(c.wait_us == 0);
 }
 
+TEST_CASE("Read-back sync steady run counts consecutive frames",
+          "[graphics][readback-sync][readback-steady]") {
+  // A key without a live entry, or with no run yet, starts at 1.
+  CHECK(NextReadbackConsecutiveFrames(false, 0, 0, 5) == 1);
+  CHECK(NextReadbackConsecutiveFrames(false, 4, 7, 5) == 1);
+  CHECK(NextReadbackConsecutiveFrames(true, 4, 0, 5) == 1);
+  // The next frame extends the run, the same frame keeps it.
+  CHECK(NextReadbackConsecutiveFrames(true, 4, 7, 5) == 8);
+  CHECK(NextReadbackConsecutiveFrames(true, 5, 8, 5) == 8);
+  // A gap of one frame (or a counter that went backwards) resets it.
+  CHECK(NextReadbackConsecutiveFrames(true, 3, 7, 5) == 1);
+  CHECK(NextReadbackConsecutiveFrames(true, 9, 7, 5) == 1);
+  // Saturates.
+  CHECK(NextReadbackConsecutiveFrames(true, 4, UINT32_MAX, 5) == UINT32_MAX);
+}
+
+TEST_CASE("Read-back sync steady exemption: rule c alone after 30 frames",
+          "[graphics][readback-sync][readback-steady]") {
+  CHECK(kReadbackSyncSteadyMinFrames == 30);
+  ReadbackSyncRules c_only;
+  c_only.composite_shape = true;
+  ReadbackSyncRules a_and_c = c_only;
+  a_and_c.shared_range = true;
+  ReadbackSyncRules b_and_c = c_only;
+  b_and_c.sporadic = true;
+  ReadbackSyncRules a_only;
+  a_only.shared_range = true;
+  ReadbackSyncRules none;
+  for (uint32_t run = 0; run <= 31; ++run) {
+    INFO("run " << run);
+    CHECK(IsReadbackSyncSteadyExempt(c_only, run) == (run >= 30));
+    CHECK_FALSE(IsReadbackSyncSteadyExempt(a_and_c, run));
+    CHECK_FALSE(IsReadbackSyncSteadyExempt(b_and_c, run));
+    CHECK_FALSE(IsReadbackSyncSteadyExempt(a_only, run));
+    CHECK_FALSE(IsReadbackSyncSteadyExempt(none, run));
+  }
+}
+
+TEST_CASE("Read-back sync steady exemption removes only the rule c force",
+          "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncRules rules;
+  rules.composite_shape = true;
+  CHECK(rules.forces());
+  CHECK(ShouldForceReadbackSync(true, true, false, rules));
+  rules.steady_exempt = true;
+  // Still matched (any() and the rule names keep rule c for the counters).
+  CHECK(rules.any());
+  CHECK(std::string(ReadbackSyncRuleNames(rules)) == "c");
+  CHECK_FALSE(rules.forces());
+  CHECK_FALSE(ShouldForceReadbackSync(true, true, false, rules));
+  // Rules a and b still force even with the flag set.
+  ReadbackSyncRules with_a = rules;
+  with_a.shared_range = true;
+  CHECK(ShouldForceReadbackSync(true, true, false, with_a));
+  ReadbackSyncRules with_b = rules;
+  with_b.sporadic = true;
+  CHECK(ShouldForceReadbackSync(true, true, false, with_b));
+}
+
+TEST_CASE("Read-back sync steady exemption on frame sequences",
+          "[graphics][readback-sync][readback-steady]") {
+  // The steady 256x256 key at 03702000: resolved every frame, rule c only.
+  ReadbackSyncResolve steady = Composite(256, 0x03702000, 0x40000);
+  LiveKeys live;
+  const uint64_t steady_key = Key(0x03702000, 0x40000);
+  bool was_live = false;
+  uint64_t previous_frame = 0;
+  uint32_t run = 0;
+  auto resolve = [&](ReadbackSyncResolve r, uint64_t key, uint64_t frame) {
+    r.frame = frame;
+    r.key_live = was_live;
+    r.previous_frame = previous_frame;
+    run = NextReadbackConsecutiveFrames(was_live, previous_frame, run, frame);
+    r.consecutive_frames = run;
+    ReadbackSyncRules rules =
+        EvaluateReadbackSyncRules(r, ReadbackSyncScope::kComposite, live, key);
+    rules.steady_exempt = IsReadbackSyncSteadyExempt(rules, r.consecutive_frames);
+    was_live = true;
+    previous_frame = frame;
+    live[key].last_used_frame = frame;
+    return rules;
+  };
+  for (uint64_t frame = 100; frame < 129; ++frame) {
+    ReadbackSyncRules rules = resolve(steady, steady_key, frame);
+    INFO("frame " << frame);
+    CHECK(rules.composite_shape);
+    CHECK_FALSE(rules.steady_exempt);
+  }
+  // Frame 129 is the 30th consecutive frame.
+  ReadbackSyncRules rules = resolve(steady, steady_key, 129);
+  CHECK(rules.steady_exempt);
+  CHECK_FALSE(ShouldForceReadbackSync(true, true, false, rules));
+  // A second resolve in the same frame stays exempt.
+  CHECK(resolve(steady, steady_key, 129).steady_exempt);
+  CHECK(resolve(steady, steady_key, 130).steady_exempt);
+  // A gap of one frame: the next resolve is forced again (a one-shot
+  // composite re-using the key after the run).
+  rules = resolve(steady, steady_key, 132);
+  CHECK(run == 1);
+  CHECK_FALSE(rules.steady_exempt);
+  CHECK(ShouldForceReadbackSync(true, true, false, rules));
+
+  // A livery burst of 3 consecutive frames (the longest seen) is never exempt.
+  was_live = false;
+  previous_frame = 0;
+  run = 0;
+  live.clear();
+  ReadbackSyncResolve livery = Composite(512, 0x050A0000, 0x100000);
+  for (uint64_t frame = 500; frame < 503; ++frame) {
+    rules = resolve(livery, Key(0x050A0000, 0x100000), frame);
+    CHECK_FALSE(rules.steady_exempt);
+    CHECK(rules.forces());
+  }
+  CHECK(run == 3);
+
+  // A steady key whose range is shared by another live key of a different
+  // length (rule a) is forced whatever its run.
+  was_live = true;
+  previous_frame = 999;
+  run = 100;
+  live.clear();
+  live[Key(0x03702000, 0x10000)].last_used_frame = 990;
+  rules = resolve(steady, steady_key, 1000);
+  CHECK(run == 101);
+  CHECK(rules.shared_range);
+  CHECK_FALSE(rules.steady_exempt);
+  CHECK(ShouldForceReadbackSync(true, true, false, rules));
+}
+
+TEST_CASE("Read-back sync steady end reasons", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncRules c_only;
+  c_only.composite_shape = true;
+  CHECK(std::string(ReadbackSyncSteadyEndReason(false, c_only, 50)) == "disabled");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 1)) == "gap");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 30)) == "none");
+  ReadbackSyncRules a = c_only;
+  a.shared_range = true;
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, a, 50)) == "rule_a");
+  ReadbackSyncRules b = c_only;
+  b.sporadic = true;
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, b, 50)) == "rule_b");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, ReadbackSyncRules(), 50)) == "shape");
+}
+
+TEST_CASE("Read-back sync steady counters and report",
+          "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncCounters c;
+  // Off and nothing exempt: the minute line is unchanged.
+  c.CountSteadyRun(12);
+  CHECK(ReadbackSyncSteadyReport(c, false).empty());
+  CHECK(ReadbackSyncSteadyReport(c, true) ==
+        " steady=1 steady_min_frames=30 steady_exempt=0 steady_exempt_keys=0 steady_max_run=12");
+  c.CountSteadyRun(3);
+  CHECK(c.steady_max_run == 12);
+  c.CountSteadyExempt(true);
+  c.CountSteadyExempt(false);
+  c.CountSteadyExempt(false);
+  c.CountSteadyRun(1500);
+  CHECK(ReadbackSyncSteadyReport(c, true) ==
+        " steady=1 steady_min_frames=30 steady_exempt=3 steady_exempt_keys=1 "
+        "steady_max_run=1500");
+  // Switched off within the minute after counting: still reported.
+  CHECK(ReadbackSyncSteadyReport(c, false) ==
+        " steady=0 steady_min_frames=30 steady_exempt=3 steady_exempt_keys=1 "
+        "steady_max_run=1500");
+  // The existing counters are untouched.
+  CHECK(c.matched == 0);
+  CHECK(c.forced == 0);
+}
+
+TEST_CASE("Read-back sync steady key line", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncSteadyKeyEvent e;
+  e.exempt = true;
+  e.reason = "run";
+  e.frame = 4321;
+  e.draw = 26;
+  e.address = 0x03702000;
+  e.length = 0x40000;
+  e.width = 256;
+  e.height = 256;
+  e.dest_format = 6;
+  e.source_edram_base = 0;
+  e.run = 30;
+  CHECK(FormatReadbackSyncSteadyKeyEvent(e) ==
+        "kind=steady_key event=exempt reason=run frame=4321 draw=26 base=03702000 len=262144 "
+        "size=256x256 fmt=6 src_base=0 run=30 min_frames=30 suppressed=0");
+  e.exempt = false;
+  e.reason = "gap";
+  e.run = 812;
+  e.suppressed = 2;
+  CHECK(FormatReadbackSyncSteadyKeyEvent(e) ==
+        "kind=steady_key event=end reason=gap frame=4321 draw=26 base=03702000 len=262144 "
+        "size=256x256 fmt=6 src_base=0 run=812 min_frames=30 suppressed=2");
+}
+
 TEST_CASE("Paced line budget: burst, then lines per second", "[graphics][livery-diag2]") {
   PacedLineBudget budget(2, 4);
   int allowed = 0;
