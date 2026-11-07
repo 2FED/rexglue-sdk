@@ -10,6 +10,7 @@
 
 using rex::audio::xma::ApplyFrameTrim;
 using rex::audio::xma::BufferSlice;
+using rex::audio::xma::DumpBurstTracker;
 using rex::audio::xma::DumpFileName;
 using rex::audio::xma::FrameTrimApplied;
 using rex::audio::xma::FrameTrimCarry;
@@ -307,8 +308,8 @@ TEST_CASE("XMA PCM dump: WAV header and sample order", "[audio][xma][ki071]") {
   CHECK(le[1] == 0x12);
   CHECK(le[2] == 0x80);
   CHECK(le[3] == 0xFF);
-  CHECK(DumpFileName(82, 44100, false, 3) == "ctx82-44100Hz-mono-3.wav");
-  CHECK(DumpFileName(1, 48000, true, 0) == "ctx1-48000Hz-stereo-0.wav");
+  CHECK(DumpFileName(82, 4, 44100, false, 3) == "ctx82-g4-44100Hz-mono-3.wav");
+  CHECK(DumpFileName(1, 0, 48000, true, 0) == "ctx1-g0-48000Hz-stereo-0.wav");
 }
 
 TEST_CASE("XMA first-decode burst window", "[audio][xma][ki071]") {
@@ -405,4 +406,49 @@ TEST_CASE("XMA sticky sibling groups: start burst plus contiguous buffers", "[au
   groups = g.Update(m, swapped);
   REQUIRE(groups.size() == 1);
   CHECK(groups[0].id == voice_id);
+}
+
+TEST_CASE("XMA burst-only dump decision", "[audio][xma][ki071]") {
+  DumpBurstTracker t;
+  std::vector<uint32_t> joined;
+  // Menu SFX: isolated starts are never dumped.
+  CHECK(t.OnStart(0, 5, 44100, 11, &joined) == 0);
+  CHECK(t.OnStart(200000, 6, 44100, 12, &joined) == 0);
+  CHECK(joined.empty());
+  // Cut-scene: 7 mono 44.1 kHz starts within a few ms plus a 48 kHz pair.
+  const int64_t t0 = 1000000;
+  CHECK(t.OnStart(t0, 82, 44100, 8513, &joined) == 0);
+  CHECK(t.OnStart(t0 + 100, 83, 44100, 8513, &joined) == 0);
+  CHECK(t.OnStart(t0 + 150, 1, 48000, 8513, &joined) == 0);
+  CHECK(t.OnStart(t0 + 200, 84, 44100, 8513, &joined) == 0);
+  CHECK(joined.empty());
+  // 4th 44.1 kHz start: burst; the held-back three join with it.
+  const uint32_t serial = t.OnStart(t0 + 300, 85, 44100, 8513, &joined);
+  CHECK(serial == 1);
+  CHECK(joined == std::vector<uint32_t>{82, 83, 84, 85});
+  joined.clear();
+  for (uint32_t ctx : {86u, 87u, 88u}) {
+    CHECK(t.OnStart(t0 + 400, ctx, 44100, 8513, &joined) == serial);
+  }
+  CHECK(joined == std::vector<uint32_t>{86, 87, 88});
+  joined.clear();
+  // A sibling of the same guest kick burst started after the window joins.
+  CHECK(t.OnStart(t0 + 500000, 89, 44100, 8513, &joined) == serial);
+  CHECK(joined == std::vector<uint32_t>{89});
+  joined.clear();
+  // Start kick 0 (trace off) never joins by kick id.
+  CHECK(t.OnStart(t0 + 600000, 90, 44100, 0, &joined) == 0);
+  // A later burst gets a new serial.
+  const int64_t t1 = 5000000;
+  for (uint32_t ctx : {20u, 21u, 22u}) {
+    CHECK(t.OnStart(t1, ctx, 44100, 9000, &joined) == 0);
+  }
+  CHECK(t.OnStart(t1 + 10, 23, 44100, 9000, &joined) == 2);
+  CHECK(joined.size() == 4);
+  // The same context restarting does not count as another start.
+  DumpBurstTracker u;
+  CHECK(u.OnStart(0, 7, 44100, 0, &joined) == 0);
+  CHECK(u.OnStart(10, 7, 44100, 0, &joined) == 0);
+  CHECK(u.OnStart(20, 8, 44100, 0, &joined) == 0);
+  CHECK(u.OnStart(30, 9, 44100, 0, &joined) == 0);
 }

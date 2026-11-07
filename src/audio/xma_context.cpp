@@ -85,9 +85,13 @@ REXCVAR_DEFINE_BOOL(xma_frame_trim_block_granular, false, "Audio",
 REXCVAR_DEFINE_STRING(xma_dump_contexts, "", "Audio",
                       "KI-071: directory for per-context decoded PCM dumps "
                       "(ctx<id>-<rate>Hz-<mono|stereo>-<n>.wav, as written to the output ring; "
-                      "44.1 kHz only unless xma_dump_all_rates; 60 s per stream, 64 files)");
+                      "44.1 kHz only unless xma_dump_all_rates; 90 s per stream, 128 files)");
 REXCVAR_DEFINE_BOOL(xma_dump_all_rates, false, "Audio",
                     "KI-071: with xma_dump_contexts, dump every sample rate, not only 44.1 kHz");
+REXCVAR_DEFINE_BOOL(xma_dump_burst_only, true, "Audio",
+                    "KI-071: with xma_dump_contexts, dump only contexts whose first decode falls "
+                    "within 50 ms of first decodes of 3+ other contexts of the same rate, and "
+                    "their siblings (same start kick burst), for the whole wave");
 
 namespace rex::audio {
 
@@ -219,6 +223,17 @@ xma::StartBurstWindow g_xma_start_window;
 // Dump files opened this session (cap kDumpMaxFiles).
 std::atomic<uint32_t> g_xma_dump_files{0};
 std::atomic<bool> g_xma_dump_limit_logged{false};
+// xma_dump_burst_only: burst serial per context id (0 = none), set by the
+// tracker from the starting context's thread, reset on Clear/Release.
+std::mutex g_xma_dump_burst_mutex;
+xma::DumpBurstTracker g_xma_dump_burst;
+std::array<std::atomic<uint32_t>, XmaContext::kTraceContextArrayCount> g_xma_dump_serial{};
+
+int64_t XmaSteadyNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 void MaybeEmitXmaMinute() {
   const int64_t now = XmaSteadyNowMs();
@@ -554,6 +569,10 @@ void XmaContext::ResetDecoderState() {
   sib_frame_index_ = 0;
   CloseDumpLocked("clear");
   dump_blocked_ = false;
+  dump_pending_.clear();
+  if (id_ < g_xma_dump_serial.size()) {
+    g_xma_dump_serial[id_].store(0, std::memory_order_relaxed);
+  }
   ResetSiblingCounters();
 }
 
@@ -623,6 +642,21 @@ void XmaContext::DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTE
       dump_blocked_ = true;
       return;
     }
+    const uint32_t serial =
+        id_ < g_xma_dump_serial.size() ? g_xma_dump_serial[id_].load(std::memory_order_relaxed) : 0;
+    if (REXCVAR_GET(xma_dump_burst_only) && !serial) {
+      // Hold the first blocks until the burst is known; give up after
+      // kDumpPendingUs (not a burst start).
+      if (XmaSteadyNowUs() - dump_start_us_ > xma::kDumpPendingUs ||
+          dump_pending_.size() + bytes > xma::kDumpPendingMaxBytes) {
+        dump_pending_.clear();
+        dump_pending_.shrink_to_fit();
+        dump_blocked_ = true;
+        return;
+      }
+      dump_pending_.insert(dump_pending_.end(), blocks, blocks + bytes);
+      return;
+    }
     const uint32_t n = g_xma_dump_files.fetch_add(1, std::memory_order_relaxed);
     if (n >= xma::kDumpMaxFiles) {
       dump_blocked_ = true;
@@ -636,17 +670,29 @@ void XmaContext::DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTE
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const bool stereo = bool(data->is_stereo);
-    dump_ = std::make_unique<XmaPcmDump>(dir / xma::DumpFileName(id(), rate, stereo, n), rate,
-                                         uint16_t(stereo ? 2 : 1));
+    dump_ = std::make_unique<XmaPcmDump>(dir / xma::DumpFileName(id(), serial, rate, stereo, n),
+                                         rate, uint16_t(stereo ? 2 : 1));
     if (!dump_->ok()) {
       REXAPU_WARN("[xma] dump: cannot open {} ({})", dump_->path().string(), ec.message());
       dump_.reset();
       dump_blocked_ = true;
       return;
     }
-    REXAPU_INFO("[xma] dump: open ctx={} rate={} stereo={} n={} start_kick={} file={}", id(), rate,
-                uint32_t(stereo), n, sib_start_kick_.load(std::memory_order_relaxed),
-                dump_->path().string());
+    REXAPU_INFO(
+        "[xma] dump: open ctx={} group={} rate={} stereo={} n={} start_kick={} held_bytes={} "
+        "file={}",
+        id(), serial, rate, uint32_t(stereo), n, sib_start_kick_.load(std::memory_order_relaxed),
+        dump_pending_.size(), dump_->path().string());
+    if (!dump_pending_.empty()) {
+      const bool more = dump_->Write(dump_pending_.data(), dump_pending_.size());
+      dump_pending_.clear();
+      dump_pending_.shrink_to_fit();
+      if (!more) {
+        CloseDumpLocked("cap");
+        dump_blocked_ = true;
+        return;
+      }
+    }
   }
   if (!dump_->Write(blocks, bytes)) {
     CloseDumpLocked("cap");
@@ -1418,6 +1464,22 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       sib_rate_.store(uint32_t(GetSampleRate(data->sample_rate)), std::memory_order_relaxed);
       sib_stereo_.store(bool(data->is_stereo), std::memory_order_relaxed);
       LogFirstDecode(data, entry_read_offset, codec_reinit, trim);
+      // KI-071: burst-only dump decision (the same 50 ms / 3+ others rule).
+      if (!REXCVAR_GET(xma_dump_contexts).empty()) {
+        dump_start_us_ = XmaSteadyNowUs();
+        std::vector<uint32_t> joined;
+        {
+          std::lock_guard<std::mutex> guard(g_xma_dump_burst_mutex);
+          const uint32_t serial = g_xma_dump_burst.OnStart(
+              dump_start_us_, id(), uint32_t(GetSampleRate(data->sample_rate)),
+              sib_start_kick_.load(std::memory_order_relaxed), &joined);
+          for (uint32_t ctx : joined) {
+            if (ctx < g_xma_dump_serial.size()) {
+              g_xma_dump_serial[ctx].store(serial, std::memory_order_relaxed);
+            }
+          }
+        }
+      }
       if (field) {
         Bump(g_xma_sib.start_skips);
       }

@@ -372,6 +372,9 @@ class XmaContext {
   // xma_dump_contexts (lock_).
   std::unique_ptr<XmaPcmDump> dump_;
   bool dump_blocked_ = false;  // this stream is not (or no longer) dumped
+  // xma_dump_burst_only: first blocks held until the burst decision (lock_).
+  std::vector<uint8_t> dump_pending_;
+  int64_t dump_start_us_ = 0;  // first decode since Clear
 };
 
 }  // namespace rex::audio

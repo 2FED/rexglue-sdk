@@ -40,6 +40,8 @@ REXCVAR_DECLARE(bool, xma_frame_trim_block_granular);
 REXCVAR_DECLARE(std::string, xma_dump_contexts);
 // Dump every sample rate, not only 44.1 kHz.
 REXCVAR_DECLARE(bool, xma_dump_all_rates);
+// Dump only contexts that start in a multi-context burst (DumpBurstTracker).
+REXCVAR_DECLARE(bool, xma_dump_burst_only);
 
 namespace rex::audio::xma {
 
@@ -352,12 +354,110 @@ inline void SwapPcm16(const uint8_t* in, uint8_t* out, size_t bytes) {
   }
 }
 
-inline std::string DumpFileName(uint32_t ctx, uint32_t rate, bool stereo, uint32_t n) {
-  return fmt::format("ctx{}-{}Hz-{}-{}.wav", ctx, rate, stereo ? "stereo" : "mono", n);
+// group = start-burst serial (DumpBurstTracker), 0 outside a burst.
+inline std::string DumpFileName(uint32_t ctx, uint32_t group, uint32_t rate, bool stereo,
+                                uint32_t n) {
+  return fmt::format("ctx{}-g{}-{}Hz-{}-{}.wav", ctx, group, rate, stereo ? "stereo" : "mono", n);
 }
 
-inline constexpr uint32_t kDumpMaxSeconds = 60;
-inline constexpr uint32_t kDumpMaxFiles = 64;
+inline constexpr uint32_t kDumpMaxSeconds = 90;
+inline constexpr uint32_t kDumpMaxFiles = 128;
+// Burst-only dumps buffer a context's first blocks until its burst is known
+// (the 4th start of a burst can come up to 50 ms after the 1st).
+inline constexpr int64_t kDumpPendingUs = 100000;
+inline constexpr size_t kDumpPendingMaxBytes = 256 * 1024;
+
+// xma_dump_burst_only: a context is dumped when its first decode falls within
+// 50 ms of first decodes of 3 or more other contexts of the same rate (the
+// rule of the burst first-decode budget, StartBurstWindow). All contexts of
+// the window then join one burst serial (also the earlier ones, whose blocks
+// were held back), later starts in the same window join it too, and a later
+// start that shares a burst member's non-zero start kick id (same guest kick
+// burst) joins as a sibling. The serial names the sibling set in the dump
+// file name.
+class DumpBurstTracker {
+ public:
+  static constexpr int64_t kWindowUs = 50000;
+  static constexpr size_t kMinOthers = 3;
+  static constexpr size_t kMaxEntries = 128;
+  static constexpr size_t kMaxKicks = 64;
+
+  // Returns the burst serial of this start (0 = not in a burst yet). Every
+  // context that joins a burst with this call, including earlier ones of the
+  // window and this one, is appended to `joined`.
+  uint32_t OnStart(int64_t now_us, uint32_t ctx, uint32_t rate, uint32_t start_kick,
+                   std::vector<uint32_t>* joined) {
+    while (!entries_.empty() && now_us - entries_.front().us > kWindowUs) {
+      entries_.pop_front();
+    }
+    if (entries_.size() == kMaxEntries) {
+      entries_.pop_front();
+    }
+    entries_.push_back({now_us, ctx, rate, start_kick, 0});
+    Entry& self = entries_.back();
+    uint32_t serial = 0;
+    if (start_kick) {
+      for (const auto& k : kicks_) {
+        if (k.first == start_kick) {
+          serial = k.second;
+        }
+      }
+    }
+    std::vector<uint32_t> others;
+    for (const Entry& e : entries_) {
+      if (&e != &self && e.rate == rate && e.ctx != ctx &&
+          std::find(others.begin(), others.end(), e.ctx) == others.end()) {
+        others.push_back(e.ctx);
+        if (!serial && e.serial) {
+          serial = e.serial;
+        }
+      }
+    }
+    if (others.size() >= kMinOthers && !serial) {
+      serial = ++next_serial_;
+    }
+    if (!serial) {
+      return 0;
+    }
+    const bool window_burst = others.size() >= kMinOthers;
+    for (Entry& e : entries_) {
+      const bool member = &e == &self || (window_burst && e.rate == rate);
+      if (member && !e.serial) {
+        e.serial = serial;
+        if (joined) {
+          joined->push_back(e.ctx);
+        }
+        if (e.start_kick) {
+          RememberKick(e.start_kick, serial);
+        }
+      }
+    }
+    return serial;
+  }
+
+ private:
+  struct Entry {
+    int64_t us;
+    uint32_t ctx;
+    uint32_t rate;
+    uint32_t start_kick;
+    uint32_t serial;
+  };
+  void RememberKick(uint32_t kick, uint32_t serial) {
+    for (const auto& k : kicks_) {
+      if (k.first == kick) {
+        return;
+      }
+    }
+    if (kicks_.size() == kMaxKicks) {
+      kicks_.pop_front();
+    }
+    kicks_.push_back({kick, serial});
+  }
+  std::deque<Entry> entries_;
+  std::deque<std::pair<uint32_t, uint32_t>> kicks_;
+  uint32_t next_serial_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // First-decode burst budget: a context whose first decode comes within 50 ms
