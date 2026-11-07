@@ -23,6 +23,7 @@
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/doubling_fixes.h>
 #include <rex/audio/xma/frame_trim.h>
+#include <rex/audio/xma/frame_walk.h>
 #include <rex/audio/xma/helpers.h>
 #include <rex/audio/xma/sibling_trace.h>
 #include <rex/cvar.h>
@@ -92,6 +93,20 @@ REXCVAR_DEFINE_BOOL(xma_dump_burst_only, true, "Audio",
                     "KI-071: with xma_dump_contexts, dump only contexts whose first decode falls "
                     "within 50 ms of first decodes of 3+ other contexts of the same rate, and "
                     "their siblings (same start kick burst), for the whole wave");
+// KI-071 step 4 (frame walk continuity); see rex/audio/xma/frame_walk.h.
+REXCVAR_DEFINE_BOOL(xma_frame_walk_trace, false, "Audio",
+                    "KI-071: log the first 8 XMA frame-walk anomalies per context (a frame "
+                    "starting before the previous frame's end or after a skipped frame start); "
+                    "the counters in MCLA_XMA_SIB always run");
+REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, false, "Audio",
+                    "KI-071: count an XMA frame whose 15-bit header straddles the packet end "
+                    "from the previous frame's trailer bit (upstream relies on the packet "
+                    "header frame count and skips the frame), and never re-decode bits before "
+                    "the previous frame's end within a packet");
+REXCVAR_DEFINE_BOOL(xma_dump_input, false, "Audio",
+                    "KI-071: with xma_dump_contexts, also write each dumped context's input "
+                    "buffers (<wav>-input.bin, 2 KiB packets in decode order, index "
+                    "<wav>-input.csv) and a per-frame walk record (<wav>-walk.csv)");
 
 namespace rex::audio {
 
@@ -139,6 +154,31 @@ struct XmaSiblingCounters {
   std::atomic<uint64_t> burst_first_decodes{0};
 };
 XmaSiblingCounters g_xma_sib;
+
+// KI-071 step 4 frame-walk totals (MCLA_XMA_SIB v=3), all contexts.
+struct XmaWalkCounters {
+  std::atomic<uint64_t> dup{0};
+  std::atomic<uint64_t> gap{0};
+  std::atomic<uint64_t> ctxs{0};
+  std::atomic<uint64_t> boundary{0};
+  std::atomic<uint64_t> split_tail{0};
+  std::atomic<uint64_t> split_counted{0};
+  std::atomic<uint64_t> split_lost{0};
+  std::atomic<uint64_t> split_real{0};
+  std::atomic<uint64_t> split_claimed{0};
+  std::atomic<uint64_t> split_padding{0};
+  std::atomic<uint64_t> dup_prevented{0};
+  std::atomic<uint64_t> resyncs{0};
+  std::atomic<uint64_t> input_files{0};
+};
+XmaWalkCounters g_xma_walk;
+// Minute epoch for walk ctxs (incremented by TakeWalkMinuteTotals); starts at
+// 1 so a fresh context (epoch 0) counts.
+std::atomic<uint32_t> g_xma_walk_epoch{1};
+// xma_dump_input caps.
+constexpr uint64_t kInputDumpMaxBytes = 32ull * 1024 * 1024;
+constexpr size_t kInputPendingMaxBytes = 2 * 1024 * 1024;
+constexpr size_t kWalkCsvPendingMaxBytes = 1024 * 1024;
 // Minute epoch for trim_ctxs (incremented by TakeSiblingMinuteTotals).
 std::atomic<uint32_t> g_xma_trim_epoch{1};
 
@@ -216,6 +256,8 @@ class XmaLineBudget {
 XmaLineBudget g_xma_burst_budget(128, 32);
 // Per-frame trim lines (first 4 non-zero frames per context).
 XmaLineBudget g_xma_trim_budget(64, 16);
+// Frame-walk anomaly and summary lines (first 8 per context).
+XmaLineBudget g_xma_walk_budget(96, 8);
 // First decodes of 44.1 kHz contexts in the last 50 ms.
 std::mutex g_xma_start_window_mutex;
 xma::StartBurstWindow g_xma_start_window;
@@ -467,6 +509,9 @@ bool XmaContext::Work() {
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
     Decode(&data);
+    // KI-071 step 4: where this Decode left the walk (guest seek detection).
+    walk_left_read_offset_ = data.input_buffer_read_offset;
+    walk_left_buffer_ = data.current_buffer;
     Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
@@ -567,7 +612,26 @@ void XmaContext::ResetDecoderState() {
   start_pending_ = true;
   trim_carry_.Reset();
   sib_frame_index_ = 0;
+  if ((walk_dup_ || walk_gap_) && REXCVAR_GET(xma_frame_walk_trace) && g_xma_walk_budget.Allow()) {
+    REXAPU_INFO("[xma] walk-summary: ctx={} frames={} dup={} gap={} fix={}", id(), walk_frames_,
+                walk_dup_, walk_gap_, int(REXCVAR_GET(xma_frame_walk_fix)));
+  }
+  walk_prev_ = {};
+  walk_after_swap_ = false;
+  walk_after_ff_ = false;
+  walk_frames_ = 0;
+  walk_dup_ = 0;
+  walk_gap_ = 0;
+  walk_logged_ = 0;
   CloseDumpLocked("clear");
+  input_pending_.clear();
+  input_pending_.shrink_to_fit();
+  input_idx_pending_.clear();
+  walk_csv_pending_.clear();
+  input_bytes_ = 0;
+  input_dumped_epoch_ = UINT32_MAX;
+  input_seq_ = 0;
+  input_blocked_ = false;
   dump_blocked_ = false;
   dump_pending_.clear();
   if (id_ < g_xma_dump_serial.size()) {
@@ -683,6 +747,9 @@ void XmaContext::DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTE
         "file={}",
         id(), serial, rate, uint32_t(stereo), n, sib_start_kick_.load(std::memory_order_relaxed),
         dump_pending_.size(), dump_->path().string());
+    if (REXCVAR_GET(xma_dump_input) && !input_blocked_) {
+      OpenInputDumpLocked(dump_->path());
+    }
     if (!dump_pending_.empty()) {
       const bool more = dump_->Write(dump_pending_.data(), dump_pending_.size());
       dump_pending_.clear();
@@ -708,6 +775,118 @@ void XmaContext::CloseDumpLocked(const char* reason) {
   REXAPU_INFO("[xma] dump: close ctx={} reason={} bytes={} seconds={:.2f} file={}", id(), reason,
               dump_->data_bytes(), dump_->seconds(), dump_->path().string());
   dump_.reset();
+  CloseInputDumpLocked();
+}
+
+void XmaContext::OpenInputDumpLocked(const std::filesystem::path& wav_path) {
+  std::filesystem::path base = wav_path;
+  base.replace_extension();
+  const std::string stem = base.string();
+  input_bin_ =
+      std::make_unique<std::ofstream>(stem + "-input.bin", std::ios::binary | std::ios::trunc);
+  input_idx_ = std::make_unique<std::ofstream>(stem + "-input.csv", std::ios::trunc);
+  walk_csv_ = std::make_unique<std::ofstream>(stem + "-walk.csv", std::ios::trunc);
+  if (!*input_bin_ || !*input_idx_ || !*walk_csv_) {
+    REXAPU_WARN("[xma] input dump: cannot open {}-input.bin/.csv/-walk.csv", stem);
+    CloseInputDumpLocked();
+    input_blocked_ = true;
+    return;
+  }
+  Bump(g_xma_walk.input_files);
+  *input_idx_ << "seq,buffer_epoch,buffer_index,buffer_ptr,packet_count,packet,file_offset,"
+                 "first_frame_offset,header_frame_count,skip,read_offset\n";
+  *walk_csv_ << "frame,buffer_epoch,buffer_ptr,packet,packet_addr,start_bit,frame_bits,"
+                "bits_in_packet,path,verdict,prev_trailer,hdr_count,walked,frame_count,current,"
+                "first_frame_offset,skip,split_tail_bits,split_counted,split_claimed,"
+                "entry_read_offset,read_after,after_swap,after_ff,dup_prevented\n";
+  input_bin_->write(reinterpret_cast<const char*>(input_pending_.data()),
+                    std::streamsize(input_pending_.size()));
+  *input_idx_ << input_idx_pending_;
+  *walk_csv_ << walk_csv_pending_;
+  REXAPU_INFO("[xma] input dump: open ctx={} held_bytes={} file={}-input.bin", id(),
+              input_pending_.size(), stem);
+  input_pending_.clear();
+  input_pending_.shrink_to_fit();
+  input_idx_pending_.clear();
+  input_idx_pending_.shrink_to_fit();
+  walk_csv_pending_.clear();
+  walk_csv_pending_.shrink_to_fit();
+}
+
+void XmaContext::CloseInputDumpLocked() {
+  if (!input_bin_) {
+    return;
+  }
+  input_bin_->close();
+  input_idx_->close();
+  walk_csv_->close();
+  REXAPU_INFO("[xma] input dump: close ctx={} bytes={}", id(), input_bytes_);
+  input_bin_.reset();
+  input_idx_.reset();
+  walk_csv_.reset();
+  input_blocked_ = true;
+}
+
+// Appends to the open dump files, or holds the data until the PCM dump opens.
+// Stops once the stream is not (or no longer) dumped.
+void XmaContext::WriteInputDump(const uint8_t* bytes, size_t size, const std::string& index_row,
+                                const std::string& walk_row) {
+  if (input_blocked_) {
+    return;
+  }
+  if (input_bin_) {
+    if (size && input_bytes_ + size <= kInputDumpMaxBytes) {
+      input_bin_->write(reinterpret_cast<const char*>(bytes), std::streamsize(size));
+      input_bytes_ += size;
+      *input_idx_ << index_row;
+    }
+    *walk_csv_ << walk_row;
+    return;
+  }
+  if (dump_blocked_ || input_pending_.size() + size > kInputPendingMaxBytes ||
+      walk_csv_pending_.size() + walk_row.size() > kWalkCsvPendingMaxBytes) {
+    // Not a dumped stream (rate, burst rule, file cap) or held too long.
+    input_pending_.clear();
+    input_pending_.shrink_to_fit();
+    input_idx_pending_.clear();
+    input_idx_pending_.shrink_to_fit();
+    walk_csv_pending_.clear();
+    walk_csv_pending_.shrink_to_fit();
+    input_blocked_ = true;
+    return;
+  }
+  if (size) {
+    input_pending_.insert(input_pending_.end(), bytes, bytes + size);
+    input_bytes_ += size;
+  }
+  input_idx_pending_ += index_row;
+  walk_csv_pending_ += walk_row;
+}
+
+void XmaContext::DumpInputBuffer(XMA_CONTEXT_DATA* data) {
+  if (input_blocked_ || input_dumped_epoch_ == walk_buffer_epoch_) {
+    return;
+  }
+  input_dumped_epoch_ = walk_buffer_epoch_;
+  const uint32_t rate = uint32_t(GetSampleRate(data->sample_rate));
+  if (rate != 44100 && !REXCVAR_GET(xma_dump_all_rates)) {
+    input_blocked_ = true;
+    return;
+  }
+  const uint32_t ptr = data->GetCurrentInputBufferAddress();
+  const uint32_t packets = data->GetCurrentInputBufferPacketCount();
+  const uint8_t* buffer = memory()->TranslatePhysical(ptr);
+  std::string rows;
+  for (uint32_t i = 0; i < packets; ++i) {
+    const uint8_t* packet = buffer + size_t(i) * kBytesPerPacket;
+    rows += fmt::format("{},{},{},{:08X},{},{},{},{},{},{},{}\n", input_seq_, walk_buffer_epoch_,
+                        uint32_t(data->current_buffer), ptr, packets, i,
+                        input_bytes_ + uint64_t(i) * kBytesPerPacket,
+                        xma::WalkFirstFrameOffset(packet), xma::WalkHeaderFrameCount(packet),
+                        xma::WalkSkipCount(packet), uint32_t(data->input_buffer_read_offset));
+  }
+  ++input_seq_;
+  WriteInputDump(buffer, size_t(packets) * kBytesPerPacket, rows, std::string());
 }
 
 void XmaContext::FinalizeDump() {
@@ -771,6 +950,28 @@ xma::SiblingMinuteTotals XmaContext::TakeSiblingMinuteTotals() {
   t.burst_first_decodes = take(g_xma_sib.burst_first_decodes);
   g_xma_trim_epoch.fetch_add(1, std::memory_order_relaxed);
   return t;
+}
+
+xma::WalkMinuteTotals XmaContext::TakeWalkMinuteTotals() {
+  auto take = [](std::atomic<uint64_t>& counter) {
+    return counter.exchange(0, std::memory_order_relaxed);
+  };
+  xma::WalkMinuteTotals w;
+  w.dup = take(g_xma_walk.dup);
+  w.gap = take(g_xma_walk.gap);
+  w.ctxs = take(g_xma_walk.ctxs);
+  w.boundary = take(g_xma_walk.boundary);
+  w.split_tail = take(g_xma_walk.split_tail);
+  w.split_counted = take(g_xma_walk.split_counted);
+  w.split_lost = take(g_xma_walk.split_lost);
+  w.split_real = take(g_xma_walk.split_real);
+  w.split_claimed = take(g_xma_walk.split_claimed);
+  w.split_padding = take(g_xma_walk.split_padding);
+  w.dup_prevented = take(g_xma_walk.dup_prevented);
+  w.resyncs = take(g_xma_walk.resyncs);
+  w.input_files = take(g_xma_walk.input_files);
+  g_xma_walk_epoch.fetch_add(1, std::memory_order_relaxed);
+  return w;
 }
 
 xma::BoundaryAction XmaContext::OnBoundary(xma::BoundaryPath path, bool next_available) {
@@ -882,6 +1083,8 @@ void XmaContext::Release() {
 }
 
 void XmaContext::SwapInputBuffer(XMA_CONTEXT_DATA* data) {
+  ++walk_buffer_epoch_;
+  walk_after_swap_ = true;
   if (data->current_buffer == 0) {
     data->input_buffer_0_valid = 0;
   } else {
@@ -905,6 +1108,8 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
 
   data->input_buffer_read_offset = loop_start;
   loop_start_skip_pending_ = true;
+  // KI-071 step 4: a loop jump starts a new frame chain.
+  walk_prev_.valid = false;
 
   if (data->loop_count < 255) {
     data->loop_count--;
@@ -973,17 +1178,25 @@ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_p
 
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
                                              uint32_t current_input_packet_count) {
-  while (next_packet_index < current_input_packet_count) {
-    uint8_t* next_packet = buffer + (next_packet_index * kBytesPerPacket);
-    const uint32_t packet_frame_offset = xma::GetPacketFrameOffset(next_packet);
+  // KI-071 step 4: the same loop, shared with the frame-walk tests.
+  return xma::FindNextPacketReadOffset(buffer, next_packet_index, current_input_packet_count);
+}
 
-    if (packet_frame_offset <= kMaxFrameSizeinBits) {
-      return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
-    }
-    next_packet_index++;
+uint32_t XmaContext::NextPacketGuestAddress(const XMA_CONTEXT_DATA* data,
+                                            uint32_t next_packet_index,
+                                            uint32_t current_input_packet_count) {
+  if (next_packet_index < current_input_packet_count) {
+    return data->GetCurrentInputBufferAddress() + next_packet_index * kBytesPerPacket;
   }
-
-  return kBitsPerPacketHeader;
+  const uint8_t next_buffer_index = data->current_buffer ^ 1;
+  const uint32_t next_buffer_address = data->GetInputBufferAddress(next_buffer_index);
+  if (REXCVAR_GET(xma_swap_carry_packet)) {
+    const xma::SwapCarry carry =
+        xma::ComputeSwapCarry(next_packet_index, current_input_packet_count,
+                              data->GetInputBufferPacketCount(next_buffer_index));
+    return next_buffer_address + carry.start_packet * kBytesPerPacket;
+  }
+  return next_buffer_address;
 }
 
 memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
@@ -1007,58 +1220,6 @@ memory::RingBuffer XmaContext::PrepareOutputRingBuffer(XMA_CONTEXT_DATA* data) {
       static_cast<int32_t>(output_rb.write_count()) / kOutputBytesPerBlock;
 
   return output_rb;
-}
-
-kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
-  kPacketInfo packet_info = {};
-
-  const uint32_t first_frame_offset = xma::GetPacketFrameOffset(packet);
-  BitStream stream(packet, kBitsPerPacket);
-  stream.SetOffset(first_frame_offset);
-
-  if (frame_offset < first_frame_offset) {
-    packet_info.current_frame_ = 0;
-    packet_info.current_frame_size_ = first_frame_offset - frame_offset;
-  }
-
-  while (true) {
-    if (stream.BitsRemaining() < kBitsPerFrameHeader) {
-      break;
-    }
-
-    const uint64_t frame_size = stream.Peek(kBitsPerFrameHeader);
-    if (frame_size == 0 || frame_size == xma::kMaxFrameLength) {
-      break;
-    }
-
-    if (stream.offset_bits() == frame_offset) {
-      packet_info.current_frame_ = packet_info.frame_count_;
-      packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
-    }
-
-    packet_info.frame_count_++;
-
-    if (frame_size > stream.BitsRemaining()) {
-      break;
-    }
-
-    stream.Advance(frame_size - 1);
-
-    if (stream.Read(1) == 0) {
-      break;
-    }
-  }
-
-  if (xma::IsPacketXma2Type(packet)) {
-    const uint8_t xma2_frame_count = xma::GetPacketFrameCount(packet);
-    if (xma2_frame_count > packet_info.frame_count_) {
-      if (packet_info.current_frame_size_ == 0) {
-        packet_info.current_frame_ = packet_info.frame_count_;
-      }
-      packet_info.frame_count_ = xma2_frame_count;
-    }
-  }
-  return packet_info;
 }
 
 void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
@@ -1219,6 +1380,14 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
+  // KI-071 step 4: the guest moved the read offset (or buffer) since the last
+  // Decode: a seek, not a walk step.
+  if (walk_prev_.valid && (uint32_t(data->input_buffer_read_offset) != walk_left_read_offset_ ||
+                           uint32_t(data->current_buffer) != walk_left_buffer_)) {
+    walk_prev_.valid = false;
+    Bump(g_xma_walk.resyncs);
+  }
+
   if (!data->IsCurrentInputBufferValid()) {
     SwapInputBuffer(data);
     if (!data->IsCurrentInputBufferValid()) {
@@ -1292,10 +1461,30 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     relative_offset = packet_first_frame_offset;
   }
 
+  // KI-071 step 4: frame continuity. The start of this frame is compared with
+  // the end of the previous one (walk_prev_).
+  const bool walk_fix = REXCVAR_GET(xma_frame_walk_fix);
+  const uint32_t packet_addr =
+      data->GetCurrentInputBufferAddress() + packet_index * kBytesPerPacket;
+  bool dup_prevented = false;
+  if (walk_fix && walk_prev_.valid && walk_prev_.packet_addr == packet_addr &&
+      relative_offset < walk_prev_.end_bit && walk_prev_.trailer &&
+      walk_prev_.end_bit < kBitsPerPacket) {
+    // Never decode bits of this packet before the previous frame's end again.
+    data->input_buffer_read_offset = packet_index * kBitsPerPacket + walk_prev_.end_bit;
+    relative_offset = walk_prev_.end_bit;
+    dup_prevented = true;
+    Bump(g_xma_walk.dup_prevented);
+  }
+  if (REXCVAR_GET(xma_dump_input) && !REXCVAR_GET(xma_dump_contexts).empty()) {
+    DumpInputBuffer(data);
+  }
+
   const uint8_t skip_count = xma::GetPacketSkipCount(packet);
 
   // Full packet skip (0xFF) -- no new frames begin in this packet.
   if (skip_count == 0xFF) {
+    walk_after_ff_ = true;
     uint32_t next_input_offset =
         GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
     if (next_input_offset == kBitsPerPacketHeader) {
@@ -1311,9 +1500,38 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
-  kPacketInfo packet_info = GetPacketInfo(packet, relative_offset);
   const uint32_t packet_to_skip = skip_count + 1;
   const uint32_t next_packet_index = packet_index + packet_to_skip;
+  // Upstream GetPacketInfo plus the split-tail record (frame_walk.h).
+  xma::PacketFrames frames = xma::AnalyzePacketFrames(packet, relative_offset);
+  // A frame header straddling the packet end that upstream does not count:
+  // check the next packet's continuation (stats always, claim with the fix).
+  xma::SplitTailCheck split_check = xma::SplitTailCheck::kNotReal;
+  if (frames.split_tail_bits) {
+    const uint8_t* tail_next = GetNextPacket(data, next_packet_index, current_input_packet_count);
+    if (tail_next) {
+      split_check = xma::CheckSplitTail(packet, tail_next, frames.split_tail_pos);
+    }
+    if (walk_fix && !frames.split_tail_counted &&
+        (!tail_next || split_check != xma::SplitTailCheck::kNotReal)) {
+      xma::ClaimSplitTail(&frames, relative_offset);
+    }
+  }
+  // xma_frame_walk_fix: a tail claimed earlier (next packet not yet valid)
+  // that the next packet now shows to be padding: continue as upstream does
+  // after the packet's last frame instead of parsing the padding.
+  if (walk_fix && frames.split_tail_bits && relative_offset == frames.split_tail_pos &&
+      !frames.split_tail_counted && !frames.split_tail_claimed) {
+    Bump(g_xma_walk.split_padding);
+    AdvanceAfterLastFrame(data, uint32_t(packet_index), next_packet_index, current_input_buffer,
+                          current_input_packet_count);
+    return;
+  }
+  kPacketInfo packet_info = {};
+  packet_info.frame_count_ = uint8_t(frames.frame_count);
+  packet_info.current_frame_ = uint8_t(frames.current_frame);
+  packet_info.current_frame_size_ = frames.current_frame_size;
+  const bool split_header_frame = packet_info.current_frame_size_ == 0;
 
   // Frame header split across packet boundary.
   if (packet_info.current_frame_size_ == 0) {
@@ -1384,6 +1602,88 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   const uint32_t padding_start =
       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
+
+  // KI-071 step 4: continuity of this frame against the previous one, then
+  // record where this frame ends (its last bit is its trailer).
+  WalkFrameInfo walk;
+  {
+    const uint32_t frame_size = packet_info.current_frame_size_;
+    walk.frame_index = walk_frames_++;
+    walk.packet_index = uint32_t(packet_index);
+    walk.packet_addr = packet_addr;
+    walk.start_bit = relative_offset;
+    walk.frame_size = frame_size;
+    walk.bits_in_packet = uint32_t(bits_to_copy);
+    walk.entry_read_offset = entry_read_offset;
+    walk.first_frame_offset = packet_first_frame_offset;
+    walk.skip = skip_count;
+    walk.info = frames;
+    walk.prev = walk_prev_;
+    walk.after_swap = walk_after_swap_;
+    walk.after_ff = walk_after_ff_;
+    walk.dup_prevented = dup_prevented;
+    const bool spans = bits_to_copy < frame_size;
+    walk.path = split_header_frame                  ? xma::WalkPath::kSplitHeader
+                : spans                             ? xma::WalkPath::kSpanning
+                : packet_info.isLastFrameInPacket() ? xma::WalkPath::kLastInPacket
+                                                    : xma::WalkPath::kInPacket;
+    walk.verdict = xma::ClassifyFrameStart(walk_prev_, packet_addr, relative_offset,
+                                           packet_first_frame_offset);
+    walk_after_swap_ = false;
+    walk_after_ff_ = false;
+
+    xma::WalkFrameEnd end;
+    end.valid = true;
+    if (spans) {
+      end.packet_addr = NextPacketGuestAddress(data, next_packet_index, current_input_packet_count);
+      end.end_bit = kBitsPerPacketHeader + (frame_size - uint32_t(bits_to_copy));
+    } else {
+      end.packet_addr = packet_addr;
+      end.end_bit = relative_offset + frame_size;
+    }
+    end.trailer = xma::ReadBitsMsb(xma_frame_.data() + 1, (xma_frame_.size() - 1) * 8,
+                                   padding_start + frame_size - 1, 1) != 0;
+    if (!spans) {
+      end.next_is_marker = xma::LengthMarkerAt(packet, end.end_bit);
+    } else if (const uint8_t* end_packet =
+                   GetNextPacket(data, next_packet_index, current_input_packet_count)) {
+      end.next_is_marker = xma::LengthMarkerAt(end_packet, end.end_bit);
+    }
+    walk_prev_ = end;
+
+    const uint32_t minute_epoch = g_xma_walk_epoch.load(std::memory_order_relaxed);
+    if (walk.verdict == xma::WalkVerdict::kDup || walk.verdict == xma::WalkVerdict::kGap) {
+      if (walk.verdict == xma::WalkVerdict::kDup) {
+        ++walk_dup_;
+        Bump(g_xma_walk.dup);
+      } else {
+        ++walk_gap_;
+        Bump(g_xma_walk.gap);
+      }
+      if (walk_minute_epoch_ != minute_epoch) {
+        walk_minute_epoch_ = minute_epoch;
+        Bump(g_xma_walk.ctxs);
+      }
+    }
+    if (spans || split_header_frame) {
+      Bump(g_xma_walk.boundary);
+    }
+    // This frame ends where a straddling header starts with trailer 1 (P of
+    // the split-tail case): will the walk decode the next frame?
+    if (!spans && frames.split_tail_bits && end.end_bit == frames.split_tail_pos && end.trailer) {
+      Bump(g_xma_walk.split_tail);
+      if (frames.split_tail_counted) {
+        Bump(g_xma_walk.split_counted);
+      } else if (frames.split_tail_claimed) {
+        Bump(g_xma_walk.split_claimed);
+      } else {
+        Bump(g_xma_walk.split_lost);
+      }
+      if (split_check != xma::SplitTailCheck::kNotReal) {
+        Bump(g_xma_walk.split_real);
+      }
+    }
+  }
 
   raw_frame_.fill(0);
 
@@ -1494,26 +1794,36 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   }
 
   // Compute where to go next.
-  if (is_loop_end_frame) {
-    UpdateLoopStatus(data);
-    return;
-  }
+  [&]() {
+    if (is_loop_end_frame) {
+      UpdateLoopStatus(data);
+      return;
+    }
 
-  if (!packet_info.isLastFrameInPacket()) {
-    const uint32_t next_frame_offset =
-        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
-    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
-    return;
-  }
+    if (!packet_info.isLastFrameInPacket()) {
+      // Upstream arithmetic: same packet, modulo the packet size.
+      data->input_buffer_read_offset =
+          xma::NextReadOffsetInPacket(data->input_buffer_read_offset, uint32_t(bits_to_copy));
+      return;
+    }
 
+    AdvanceAfterLastFrame(data, uint32_t(packet_index), next_packet_index, current_input_buffer,
+                          current_input_packet_count);
+  }();
+  LogWalkFrame(walk, data);
+}
+
+void XmaContext::AdvanceAfterLastFrame(XMA_CONTEXT_DATA* data, uint32_t packet_index,
+                                       uint32_t next_packet_index, uint8_t* current_input_buffer,
+                                       uint32_t current_input_packet_count) {
   uint32_t next_input_offset =
       GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
 
   if (next_input_offset == kBitsPerPacketHeader) {
     SwapInputBuffer(data);
     // KI-071 C1: 0 (upstream) unless xma_swap_carry_packet carries the stream.
-    const uint32_t start_packet = OnInputBufferSwap(data, uint32_t(packet_index), next_packet_index,
-                                                    current_input_packet_count);
+    const uint32_t start_packet =
+        OnInputBufferSwap(data, packet_index, next_packet_index, current_input_packet_count);
     if (data->IsAnyInputBufferValid()) {
       next_input_offset = xma::GetPacketFrameOffset(
           memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
@@ -1528,6 +1838,48 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     }
   }
   data->input_buffer_read_offset = next_input_offset;
+}
+
+void XmaContext::LogWalkFrame(const WalkFrameInfo& f, const XMA_CONTEXT_DATA* data) {
+  const uint32_t read_after = data->input_buffer_read_offset;
+  if (REXCVAR_GET(xma_dump_input) && !input_blocked_ && !REXCVAR_GET(xma_dump_contexts).empty()) {
+    WriteInputDump(
+        nullptr, 0, std::string(),
+        fmt::format("{},{},{:08X},{},{:08X},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},"
+                    "{},{}\n",
+                    f.frame_index, walk_buffer_epoch_, data->GetCurrentInputBufferAddress(),
+                    f.packet_index, f.packet_addr, f.start_bit, f.frame_size, f.bits_in_packet,
+                    xma::WalkPathName(f.path), xma::WalkVerdictName(f.verdict),
+                    f.prev.valid ? int(f.prev.trailer) : -1, f.info.header_count, f.info.walked,
+                    f.info.frame_count, f.info.current_frame, f.first_frame_offset, f.skip,
+                    f.info.split_tail_bits, int(f.info.split_tail_counted),
+                    int(f.info.split_tail_claimed), f.entry_read_offset, read_after,
+                    int(f.after_swap), int(f.after_ff), int(f.dup_prevented)));
+  }
+  if (f.verdict != xma::WalkVerdict::kDup && f.verdict != xma::WalkVerdict::kGap) {
+    return;
+  }
+  if (!REXCVAR_GET(xma_frame_walk_trace) || walk_logged_ >= xma::kWalkLogPerContext ||
+      !g_xma_walk_budget.Allow()) {
+    return;
+  }
+  ++walk_logged_;
+  const uint32_t left_bits = f.prev.end_bit < kBitsPerPacket ? kBitsPerPacket - f.prev.end_bit : 0;
+  REXAPU_INFO(
+      "[xma] walk: ctx={} kind={} frame={} path={} rate={} packet={} buffer={:08X} packets={} "
+      "packet_addr={:08X} hdr_count={} xma2={} walked={} frame_count={} current={} ffo={} "
+      "skip={} start_bit={} frame_bits={} bits_in_packet={} prev_end={:08X}:{} prev_trailer={} "
+      "left_bits={} split_tail={}:{} counted={} claimed={} read_before={} read_after={} "
+      "after_swap={} after_ff={} dup_prevented={} dup={} gap={} fix={}",
+      id(), xma::WalkVerdictName(f.verdict), f.frame_index, xma::WalkPathName(f.path),
+      GetSampleRate(data->sample_rate), f.packet_index, data->GetCurrentInputBufferAddress(),
+      data->GetCurrentInputBufferPacketCount(), f.packet_addr, f.info.header_count,
+      int(f.info.xma2), f.info.walked, f.info.frame_count, f.info.current_frame,
+      f.first_frame_offset, f.skip, f.start_bit, f.frame_size, f.bits_in_packet, f.prev.packet_addr,
+      f.prev.end_bit, int(f.prev.trailer), left_bits, f.info.split_tail_pos, f.info.split_tail_bits,
+      int(f.info.split_tail_counted), int(f.info.split_tail_claimed), f.entry_read_offset,
+      read_after, int(f.after_swap), int(f.after_ff), int(f.dup_prevented), walk_dup_, walk_gap_,
+      int(REXCVAR_GET(xma_frame_walk_fix)));
 }
 
 uint32_t XmaContext::OnInputBufferSwap(const XMA_CONTEXT_DATA* data, uint32_t last_packet_index,

@@ -26,6 +26,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/audio/xma/frame_walk.h>
 #include <rex/cvar.h>
 
 // Trace: per-context frame/drop counters, a first-Decode record, one paced
@@ -330,23 +331,26 @@ struct SiblingMinuteSummary {
   bool reset_fix = false;
   bool trim_fix = false;
   bool trim_block = false;
+  // KI-071 step 4: frame-continuity counters (v=3).
+  WalkMinuteTotals walk;
+  bool walk_fix = false;
 };
 
 inline std::string FormatSiblingMinuteLine(const SiblingMinuteSummary& m) {
   const SiblingMinuteTotals& t = m.totals;
   return fmt::format(
-      "MCLA_XMA_SIB v=2 kind=minute groups={} max_frame_delta={} drops_split={} drops_ff={} "
+      "MCLA_XMA_SIB v=3 kind=minute groups={} max_frame_delta={} drops_split={} drops_ff={} "
       "err4={} decode_fail={} max_lost_delta={} stalls={} stall_timeouts={} err4_cleared={} "
       "swapbacks={} no_bits={} start_skips={} start_skips_applied={} codec_resets={} "
       "first_decodes={} stall_fix={} skip_fix={} reset_fix={} trim_frames={} trim_samples={} "
       "trim_ctxs={} trim_applied_samples={} trim_unapplied={} trim_parse_errors={} "
-      "burst_first_decodes={} trim_fix={} trim_block={}",
+      "burst_first_decodes={} trim_fix={} trim_block={} {}",
       m.groups, m.max_frame_delta, t.drops_split, t.drops_ff, t.err4, t.decode_fail,
       m.max_lost_delta, t.stalls, t.stall_timeouts, t.err4_cleared, t.swapbacks, t.no_bits,
       t.start_skips, t.start_skips_applied, t.codec_resets, t.first_decodes, int(m.stall_fix),
       int(m.skip_fix), int(m.reset_fix), t.trim_frames, t.trim_samples, t.trim_ctxs,
       t.trim_applied_samples, t.trim_unapplied, t.trim_parse_errors, t.burst_first_decodes,
-      int(m.trim_fix), int(m.trim_block));
+      int(m.trim_fix), int(m.trim_block), FormatWalkMinuteFields(m.walk, m.walk_fix));
 }
 
 // ---------------------------------------------------------------------------

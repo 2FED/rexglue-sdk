@@ -13,11 +13,14 @@
 
 #include <array>
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
 
 #include <rex/audio/xma/frame_trim.h>
+#include <rex/audio/xma/frame_walk.h>
 #include <rex/audio/xma/sibling_trace.h>
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -244,14 +247,16 @@ class XmaContext {
   static xma::SiblingMinuteTotals TakeSiblingMinuteTotals();
   // KI-071 step 3: close this context's PCM dump (WAV header fixed up).
   void FinalizeDump();
+  // KI-071 step 4: frame-continuity totals since the previous call.
+  static xma::WalkMinuteTotals TakeWalkMinuteTotals();
 
  private:
-  static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
+  // KI-071 step 4: not static; counts buffer swaps for the walk trace.
+  void SwapInputBuffer(XMA_CONTEXT_DATA* data);
   static int GetSampleRate(int id);
   static int16_t GetPacketNumber(size_t size, size_t bit_offset);
   static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
 
-  kPacketInfo GetPacketInfo(uint8_t* packet, uint32_t frame_offset);
   uint32_t GetAmountOfBitsToRead(uint32_t remaining_stream_bits, uint32_t frame_size);
   const uint8_t* GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
                                uint32_t current_input_packet_count);
@@ -295,6 +300,41 @@ class XmaContext {
   // KI-071 step 3: append blocks written to the ring to the PCM dump.
   void DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTEXT_DATA* data);
   void CloseDumpLocked(const char* reason);
+
+  // Upstream next-offset step after the last frame of a packet (next packet's
+  // first frame, or swap to the other input buffer).
+  void AdvanceAfterLastFrame(XMA_CONTEXT_DATA* data, uint32_t packet_index,
+                             uint32_t next_packet_index, uint8_t* current_input_buffer,
+                             uint32_t current_input_packet_count);
+  // KI-071 step 4: guest address of the packet GetNextPacket returns.
+  uint32_t NextPacketGuestAddress(const XMA_CONTEXT_DATA* data, uint32_t next_packet_index,
+                                  uint32_t current_input_packet_count);
+  // Continuity check, counters and the paced anomaly line for one frame.
+  struct WalkFrameInfo {
+    uint32_t frame_index = 0;
+    uint32_t packet_index = 0;
+    uint32_t packet_addr = 0;
+    uint32_t start_bit = 0;
+    uint32_t frame_size = 0;
+    uint32_t bits_in_packet = 0;
+    uint32_t entry_read_offset = 0;
+    uint32_t first_frame_offset = 0;
+    uint32_t skip = 0;
+    xma::WalkPath path = xma::WalkPath::kInPacket;
+    xma::PacketFrames info;
+    xma::WalkVerdict verdict = xma::WalkVerdict::kFirst;
+    xma::WalkFrameEnd prev;
+    bool after_swap = false;
+    bool after_ff = false;
+    bool dup_prevented = false;
+  };
+  void LogWalkFrame(const WalkFrameInfo& f, const XMA_CONTEXT_DATA* data);
+  // xma_dump_input: the current input buffer once per buffer epoch.
+  void DumpInputBuffer(XMA_CONTEXT_DATA* data);
+  void WriteInputDump(const uint8_t* bytes, size_t size, const std::string& index_row,
+                      const std::string& walk_row);
+  void OpenInputDumpLocked(const std::filesystem::path& wav_path);
+  void CloseInputDumpLocked();
 
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
@@ -375,6 +415,30 @@ class XmaContext {
   // xma_dump_burst_only: first blocks held until the burst decision (lock_).
   std::vector<uint8_t> dump_pending_;
   int64_t dump_start_us_ = 0;  // first decode since Clear
+
+  // KI-071 step 4: frame walk continuity (lock_).
+  xma::WalkFrameEnd walk_prev_;
+  uint32_t walk_left_read_offset_ = 0;  // read offset / buffer at the end of the last Decode
+  uint32_t walk_left_buffer_ = 0;
+  uint32_t walk_buffer_epoch_ = 0;  // buffer swaps since Setup
+  bool walk_after_swap_ = false;
+  bool walk_after_ff_ = false;
+  uint32_t walk_frames_ = 0;  // frames walked since Clear
+  uint32_t walk_dup_ = 0;
+  uint32_t walk_gap_ = 0;
+  uint32_t walk_logged_ = 0;
+  uint32_t walk_minute_epoch_ = 0;
+  // xma_dump_input (lock_): opened with the PCM dump; data held until then.
+  std::unique_ptr<std::ofstream> input_bin_;
+  std::unique_ptr<std::ofstream> input_idx_;
+  std::unique_ptr<std::ofstream> walk_csv_;
+  std::vector<uint8_t> input_pending_;
+  std::string input_idx_pending_;
+  std::string walk_csv_pending_;
+  uint64_t input_bytes_ = 0;
+  uint32_t input_dumped_epoch_ = UINT32_MAX;
+  uint32_t input_seq_ = 0;
+  bool input_blocked_ = false;
 };
 
 }  // namespace rex::audio

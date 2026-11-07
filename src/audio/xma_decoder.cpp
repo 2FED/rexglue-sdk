@@ -475,6 +475,8 @@ void XmaDecoder::MaybeEmitSiblingTrace() {
     summary.reset_fix = REXCVAR_GET(xma_reset_codec_on_clear);
     summary.trim_fix = REXCVAR_GET(xma_honor_frame_trim);
     summary.trim_block = REXCVAR_GET(xma_frame_trim_block_granular);
+    summary.walk = XmaContext::TakeWalkMinuteTotals();
+    summary.walk_fix = REXCVAR_GET(xma_frame_walk_fix);
     REXAPU_INFO("{} suppressed_group_lines={}", xma::FormatSiblingMinuteLine(summary),
                 sib_suppressed_groups_);
     sib_minute_ms_ = now_ms;

@@ -164,10 +164,13 @@ TEST_CASE("XMA sibling: line formatting", "[audio][xma][ki071]") {
   m.totals.trim_ctxs = 7;
   m.trim_fix = true;
   CHECK(FormatSiblingMinuteLine(m) ==
-        "MCLA_XMA_SIB v=2 kind=minute groups=3 max_frame_delta=2 drops_split=4 drops_ff=1 "
+        "MCLA_XMA_SIB v=3 kind=minute groups=3 max_frame_delta=2 drops_split=4 drops_ff=1 "
         "err4=2 decode_fail=0 max_lost_delta=1 stalls=5 stall_timeouts=0 err4_cleared=0 "
         "swapbacks=0 no_bits=0 start_skips=0 start_skips_applied=0 codec_resets=0 "
         "first_decodes=0 stall_fix=1 skip_fix=0 reset_fix=0 trim_frames=9 trim_samples=4608 "
         "trim_ctxs=7 trim_applied_samples=0 trim_unapplied=0 trim_parse_errors=0 "
-        "burst_first_decodes=0 trim_fix=1 trim_block=0");
+        "burst_first_decodes=0 trim_fix=1 trim_block=0 walk_dup=0 walk_gap=0 walk_ctxs=0 "
+        "walk_boundary=0 walk_split_tail=0 walk_split_counted=0 walk_split_lost=0 "
+        "walk_split_real=0 walk_split_claimed=0 walk_split_padding=0 walk_dup_prevented=0 "
+        "walk_resyncs=0 walk_fix=0 input_dump_files=0");
 }
