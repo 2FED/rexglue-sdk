@@ -10,7 +10,9 @@
 
 namespace rex::graphics {
 
-// M11-007e: deferred fence writes (d3d12_fence_write_deferred).
+// M11-007e: deferred fence writes (d3d12_fence_write_deferred, on by default
+// since l78; A/B evidence M11-007e). "Off" below means the switch set to
+// false, which restores the pre-l78 parse-time store byte for byte.
 //
 // On the Xenos, EVENT_WRITE_SHD makes the GPU store a value into guest memory
 // when the pipeline reaches the event, that is after all the work before it
@@ -76,7 +78,8 @@ inline uint64_t DeferredFenceTargetSubmission(bool submission_open, uint64_t sub
   return submission_current ? submission_current - 1 : 0;
 }
 
-// Off with an empty queue: the old parse-time store (byte-identical path).
+// Off (false) with an empty queue: the old parse-time store (byte-identical
+// path).
 inline bool ShouldDeferFenceWrite(bool enabled, bool queue_empty) {
   return enabled || !queue_empty;
 }

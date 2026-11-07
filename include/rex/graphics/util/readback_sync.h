@@ -200,6 +200,10 @@ inline bool ShouldForceReadbackSync(bool enabled, bool delayed_mode, bool cache_
 // that matches neither rule a nor rule b now; such a resolve keeps the
 // delayed behaviour of its mode. A gap of one frame resets the run, so a key
 // re-used by a one-shot composite is forced again on its first resolve.
+// On by default since l78 (A/B evidence M11-007e: with deferred fence writes
+// the exemption is flicker-free). The "unchanged / byte-identical when off"
+// guarantees in this file now refer to the switch set to false, which
+// restores the pre-l78 behaviour.
 constexpr uint32_t kReadbackSyncSteadyMinFrames = 30;
 
 // Consecutive frames, `frame` included, in which a key was resolved, from
@@ -786,8 +790,8 @@ struct ReadbackSyncCounters {
 };
 
 // Fields appended to the MCLA_READBACK_SYNC minute and mark lines: empty
-// while d3d12_readback_sync_steady_exempt is off and nothing was exempt (the
-// line is unchanged then).
+// while d3d12_readback_sync_steady_exempt is off (false; on by default since
+// l78) and nothing was exempt (the line is unchanged then).
 inline std::string ReadbackSyncSteadyReport(const ReadbackSyncCounters& c, bool enabled) {
   if (!enabled && !c.steady_exempt) {
     return std::string();

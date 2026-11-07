@@ -44,12 +44,14 @@ REXCVAR_DEFINE_BOOL(d3d12_streaming_replay, true, "GPU/D3D12",
                     "thread while they are being recorded")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(d3d12_fence_write_deferred, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_fence_write_deferred, true, "GPU/D3D12",
                     "M11-007e: store EVENT_WRITE_SHD fence values into guest memory only when "
                     "the host GPU has completed the submission holding the work before the "
                     "event (hardware order), instead of when the command processor parses the "
                     "packet. The guest's fence waits then wait for real GPU progress. Counters "
-                    "fence_* on the MCLA readback minute line, kind=fence_defer INFO lines")
+                    "fence_* on the MCLA readback minute line, kind=fence_defer INFO lines. "
+                    "On by default since l78; A/B evidence M11-007e. false: the parse-time "
+                    "store (byte-identical with the pre-l78 default)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
@@ -144,7 +146,7 @@ REXCVAR_DEFINE_INT32(d3d12_readback_sync_kick_draws, 512, "GPU/D3D12",
     .range(0, 1000000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_exempt, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_exempt, true, "GPU/D3D12",
                     "M11-007a: with d3d12_readback_sync_composite on, the composite-shape rule "
                     "does not force a resolve whose key was resolved in each of the last 30 "
                     "frames and that matches neither the shared-range nor the sporadic rule "
@@ -152,7 +154,9 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_exempt, false, "GPU/D3D12",
                     "Adds steady* fields and kind=steady_key lines to MCLA_READBACK_SYNC. "
                     "M11-007b: a key that ever matched the shared-range or sporadic rule, or "
                     "that has a mip-chain neighbour among the live read-back keys, is never "
-                    "exempt, and no key is exempt while more than one would be")
+                    "exempt, and no key is exempt while more than one would be. "
+                    "On by default since l78; A/B evidence M11-007e. false: rule c forces "
+                    "every matching key (byte-identical with the pre-l78 default)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_fast, true, "GPU/D3D12",
@@ -6259,8 +6263,9 @@ void D3D12CommandProcessor::ShutdownReadbackGpuTimers() {
 }
 
 std::string D3D12CommandProcessor::ReadbackCountersReport(const char* kind, const char* reason) {
-  // M11-007e: fence_* fields only while d3d12_fence_write_deferred is on or
-  // something was counted in the window (the line is unchanged otherwise).
+  // M11-007e: fence_* fields only while d3d12_fence_write_deferred is on (the
+  // default since l78) or something was counted in the window (the line is
+  // unchanged otherwise, i.e. with the switch set to false).
   return ReadbackReport(readback_counters_, kind, reason, frame_current_,
                         LiveryDiagReadbackModeName(
                             GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
