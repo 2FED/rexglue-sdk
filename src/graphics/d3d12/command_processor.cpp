@@ -54,6 +54,15 @@ REXCVAR_DEFINE_BOOL(d3d12_fence_write_deferred, true, "GPU/D3D12",
                     "store (byte-identical with the pre-l78 default)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(d3d12_fence_defer_min_gap_us, 0, "GPU/D3D12",
+                     "l78: with d3d12_fence_write_deferred on, an early submit for a deferred "
+                     "fence write (idle, WAIT_REG_MEM or draw boundary) is skipped when the "
+                     "open submission began less than this many microseconds ago; the next "
+                     "poll point retries. Coalesces small submissions (CPU cost under vkd3d). "
+                     "0: never skipped. Counter fence_early_coalesced")
+    .range(0, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2660,7 +2669,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {
-    EndSubmission(false);
+    EndSubmissionFor(SubmissionEndReason::kPrimaryEnd);
   }
 }
 
@@ -3183,7 +3192,7 @@ ReadbackTargetedResult D3D12CommandProcessor::AwaitReadbackCopySubmission(
   wait.backlog_draws = readback_sync_submission_draws_;
   wait.gpu_busy_at_submit = submission_fence_->GetCompletedValue() + 1 < copy_submission;
   uint64_t submit_start_us = LiveryDiag2NowUs();
-  EndSubmission(false);
+  EndSubmissionFor(SubmissionEndReason::kForcedWait);
   uint64_t fence_start_us = LiveryDiag2NowUs();
   wait.submit_us = fence_start_us - submit_start_us;
   if (ReadbackTargetedSubmissionEnded(copy_submission, submission_current_)) {
@@ -3351,8 +3360,16 @@ void D3D12CommandProcessor::ServiceDeferredFenceWrites(bool waiting, bool may_su
       return;
     }
   }
+  if (ShouldCoalesceFenceEarlySubmit(
+          uint32_t(std::max(REXCVAR_GET(d3d12_fence_defer_min_gap_us), int32_t(0))),
+          submission_begin_us_, LiveryDiag2NowUs())) {
+    // A later poll point retries (the idle wait polls every 1 ms while the
+    // head is in the open submission).
+    fence_defer_queue_.NoteEarlyCoalesced();
+    return;
+  }
   fence_defer_query_block_us_ = 0;
-  if (EndSubmission(false)) {
+  if (EndSubmissionFor(waiting ? SubmissionEndReason::kIdle : SubmissionEndReason::kFenceEarly)) {
     fence_defer_queue_.NoteEarlySubmit();
   }
   // A fast GPU may already be done; store without waiting.
@@ -3515,7 +3532,7 @@ void D3D12CommandProcessor::MaybeKickReadbackSyncSubmission() {
     return;
   }
   uint64_t kick_start_us = LiveryDiag2NowUs();
-  EndSubmission(false);
+  EndSubmissionFor(SubmissionEndReason::kDrawFull);
   readback_sync_minute_.kick_us += LiveryDiag2NowUs() - kick_start_us;
   ++readback_sync_minute_.kicks;
 }
@@ -5408,7 +5425,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (await_submission >= submission_current_) {
     if (submission_open_) {
-      EndSubmission(false);
+      EndSubmissionFor(SubmissionEndReason::kForcedWait);
     }
     // Ending an open submission should result in queue operations done directly
     // (like UpdateTileMappings) to be tracked within the scope of that
@@ -5637,6 +5654,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (!submission_open_) {
     submission_open_ = true;
+    submission_begin_us_ = LiveryDiag2NowUs();
     readback_sync_submission_draws_ = 0;
 
     // Start a new deferred command list - will submit it to the real one in the
@@ -5760,6 +5778,14 @@ bool D3D12CommandProcessor::EnsureWritableCommandAllocator() {
   return true;
 }
 
+bool D3D12CommandProcessor::EndSubmissionFor(SubmissionEndReason reason) {
+  const SubmissionEndReason previous = submission_end_reason_;
+  submission_end_reason_ = reason;
+  const bool result = EndSubmission(false);
+  submission_end_reason_ = previous;
+  return result;
+}
+
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   rex::perf::ScopedPerfRegion perf_submit(perf_split_active_, rex::perf::PerfRegion::kSubmit);
@@ -5857,6 +5883,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    submission_stats_.NoteEnd(is_swap ? SubmissionEndReason::kFrameEnd : submission_end_reason_);
     // M11-007c: submissions below this one were executed.
     readback_pending_.SetNextSubmission(submission_current_);
 
@@ -5872,6 +5899,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       ObserveAlwaysPipelineWait();
     }
     ++readback_counters_.frames;
+    // l78 CP lead gauge: submissions and frames the GPU has not completed
+    // when this frame ends (this frame's closing submission included).
+    if (submission_fence_) {
+      const uint64_t completed = submission_fence_->GetCompletedValue();
+      frame_end_submissions_.Push(submission_current_ - 1);
+      submission_stats_.lead.Sample(SubmissionsInFlight(submission_current_, completed),
+                                    frame_end_submissions_.InFlight(completed));
+    }
     // KI-069 freeze watchdog: one completed frame.
     freeze_last_frame_ns_.store(rex::perf::CpScopeNowNs(), std::memory_order_relaxed);
     freeze_frames_.store(freeze_frames_.load(std::memory_order_relaxed) + 1,
@@ -5935,6 +5970,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         REXGPU_INFO("{}", ReadbackCountersReport("minute", "minute"));
         readback_counters_ = {};
         fence_defer_queue_.TakeCounters();
+        submission_stats_ = {};
         // M10 watch census (memory_watch_census).
         if (shared_memory_) {
           const std::string watch =
@@ -6265,15 +6301,18 @@ void D3D12CommandProcessor::ShutdownReadbackGpuTimers() {
 std::string D3D12CommandProcessor::ReadbackCountersReport(const char* kind, const char* reason) {
   // M11-007e: fence_* fields only while d3d12_fence_write_deferred is on (the
   // default since l78) or something was counted in the window (the line is
-  // unchanged otherwise, i.e. with the switch set to false).
+  // unchanged otherwise, i.e. with the switch set to false). l78: the
+  // submission end reasons and the CP lead gauge are always appended.
   return ReadbackReport(readback_counters_, kind, reason, frame_current_,
                         LiveryDiagReadbackModeName(
                             GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
                         REXCVAR_GET(d3d12_readback_elide_unread),
                         REXCVAR_GET(d3d12_readback_gpu_timing), readback_timestamp_frequency_) +
-         FormatDeferredFenceFields(fence_defer_queue_.counters(),
-                                   REXCVAR_GET(d3d12_fence_write_deferred),
-                                   fence_defer_queue_.size());
+         FormatDeferredFenceFields(
+             fence_defer_queue_.counters(), REXCVAR_GET(d3d12_fence_write_deferred),
+             fence_defer_queue_.size(),
+             uint32_t(std::max(REXCVAR_GET(d3d12_fence_defer_min_gap_us), int32_t(0)))) +
+         FormatSubmissionStatsFields(submission_stats_);
 }
 
 bool D3D12CommandProcessor::InitializePerformanceTelemetry() {

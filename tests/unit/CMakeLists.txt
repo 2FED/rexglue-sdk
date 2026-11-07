@@ -46,6 +46,7 @@ add_executable(unit_tests
     graphics/readback_slots_test.cpp
     graphics/readback_pending_test.cpp
     graphics/deferred_fence_writes_test.cpp
+    graphics/submission_stats_test.cpp
     graphics/cp_freeze_watchdog_test.cpp
     graphics/fetch_identity_test.cpp
     core/sha256_test.cpp

@@ -9,12 +9,15 @@
 
 using rex::graphics::DeferredFenceAction;
 using rex::graphics::DeferredFenceCounters;
+using rex::graphics::DeferredFenceLateFrameBucket;
+using rex::graphics::DeferredFenceLateMsBucket;
 using rex::graphics::DeferredFenceTargetSubmission;
 using rex::graphics::DeferredFenceWrite;
 using rex::graphics::DeferredFenceWriteQueue;
 using rex::graphics::FormatDeferredFenceFields;
 using rex::graphics::kFenceDeferLines;
 using rex::graphics::PlanDeferredFenceProgress;
+using rex::graphics::ShouldCoalesceFenceEarlySubmit;
 using rex::graphics::ShouldDeferFenceWrite;
 
 namespace {
@@ -64,7 +67,7 @@ TEST_CASE("Deferred fence: cvar off keeps the parse-time store", "[graphics][fen
   // Turned off with writes still queued: later fences queue behind them.
   CHECK(ShouldDeferFenceWrite(false, false));
   // Nothing counted and the mode off: the minute line gains no fields.
-  CHECK(FormatDeferredFenceFields(DeferredFenceCounters{}, false, 0).empty());
+  CHECK(FormatDeferredFenceFields(DeferredFenceCounters{}, false, 0, 0).empty());
 }
 
 TEST_CASE("Deferred fence: immediate when the GPU is already past", "[graphics][fence_defer]") {
@@ -146,12 +149,14 @@ TEST_CASE("Deferred fence: latency counters and idle flushes", "[graphics][fence
   CHECK(c.early_submits == 1);
   CHECK(c.written == 2);
   CHECK(q.counters().written == 0);
-  CHECK(FormatDeferredFenceFields(c, true, 0) ==
+  CHECK(FormatDeferredFenceFields(c, true, 0, 0) ==
         " fence_defer=1 fence_events=2 fence_deferred=2 fence_immediate=0 fence_written=2 "
         "fence_deferred_max_frames=2 fence_deferred_ms_max=4.500 fence_flush_on_idle=1 "
-        "fence_early_submits=1 fence_queue_max=2 fence_queue_now=0");
+        "fence_early_submits=1 fence_queue_max=2 fence_queue_now=0 fence_late_f0=0 "
+        "fence_late_f1=1 fence_late_f2p=1 fence_late_lt5ms=2 fence_late_5_20ms=0 "
+        "fence_late_20_50ms=0 fence_late_gt50ms=0 fence_min_gap_us=0 fence_early_coalesced=0");
   // Off, but writes still queued: the fields stay.
-  CHECK_FALSE(FormatDeferredFenceFields(DeferredFenceCounters{}, false, 1).empty());
+  CHECK_FALSE(FormatDeferredFenceFields(DeferredFenceCounters{}, false, 1, 0).empty());
 }
 
 TEST_CASE("Deferred fence: progress plan (deadlock rules)", "[graphics][fence_defer]") {
@@ -223,4 +228,73 @@ TEST_CASE("Deferred fence: line budget restarts on enable", "[graphics][fence_de
   q.Clear();
   CHECK(q.empty());
   CHECK(q.head_submission() == 0);
+}
+
+TEST_CASE("Deferred fence: lateness histogram buckets", "[graphics][fence_defer]") {
+  CHECK(DeferredFenceLateFrameBucket(0) == 0);
+  CHECK(DeferredFenceLateFrameBucket(1) == 1);
+  CHECK(DeferredFenceLateFrameBucket(2) == 2);
+  CHECK(DeferredFenceLateFrameBucket(9) == 2);
+  CHECK(DeferredFenceLateMsBucket(0) == 0);
+  CHECK(DeferredFenceLateMsBucket(4999) == 0);
+  CHECK(DeferredFenceLateMsBucket(5000) == 1);
+  CHECK(DeferredFenceLateMsBucket(19999) == 1);
+  CHECK(DeferredFenceLateMsBucket(20000) == 2);
+  CHECK(DeferredFenceLateMsBucket(50000) == 2);
+  CHECK(DeferredFenceLateMsBucket(50001) == 3);
+
+  DeferredFenceWriteQueue q;
+  REQUIRE(q.Push(MakeWrite(0x100, 1, 2, 10, 0), 0));
+  REQUIRE(q.Push(MakeWrite(0x100, 2, 3, 10, 0), 0));
+  REQUIRE(q.Push(MakeWrite(0x100, 3, 4, 10, 0), 0));
+  REQUIRE(q.Push(MakeWrite(0x100, 4, 5, 10, 0), 0));
+  std::vector<Stored> out;
+  CHECK(FlushInto(q, 2, out, 10, 1000) == 1);   // same frame, 1 ms
+  CHECK(FlushInto(q, 3, out, 11, 12000) == 1);  // 1 frame, 12 ms
+  CHECK(FlushInto(q, 4, out, 12, 30000) == 1);  // 2 frames, 30 ms
+  CHECK(FlushInto(q, 5, out, 14, 60000) == 1);  // 4 frames, 60 ms
+  const DeferredFenceCounters& c = q.counters();
+  CHECK(c.late_frames[0] == 1);
+  CHECK(c.late_frames[1] == 1);
+  CHECK(c.late_frames[2] == 2);
+  CHECK(c.late_ms[0] == 1);
+  CHECK(c.late_ms[1] == 1);
+  CHECK(c.late_ms[2] == 1);
+  CHECK(c.late_ms[3] == 1);
+}
+
+TEST_CASE("Deferred fence: min-gap coalescing of early submits", "[graphics][fence_defer]") {
+  // 0 = the l77 behaviour: never skipped.
+  CHECK_FALSE(ShouldCoalesceFenceEarlySubmit(0, 1000, 1001));
+  // Unknown submission start: never skipped.
+  CHECK_FALSE(ShouldCoalesceFenceEarlySubmit(2000, 0, 1));
+  // Young submission: skipped; old enough: submitted.
+  CHECK(ShouldCoalesceFenceEarlySubmit(2000, 10000, 10000));
+  CHECK(ShouldCoalesceFenceEarlySubmit(2000, 10000, 11999));
+  CHECK_FALSE(ShouldCoalesceFenceEarlySubmit(2000, 10000, 12000));
+  CHECK_FALSE(ShouldCoalesceFenceEarlySubmit(2000, 10000, 50000));
+  // A clock behind the start counts as elapsed 0.
+  CHECK(ShouldCoalesceFenceEarlySubmit(2000, 10000, 9000));
+  // Bounded: polling a held head over time eventually submits.
+  uint64_t now = 10000;
+  int polls = 0;
+  while (ShouldCoalesceFenceEarlySubmit(2000, 10000, now)) {
+    now += 1000;  // the idle wait polls every 1 ms
+    ++polls;
+  }
+  CHECK(polls == 2);
+
+  DeferredFenceWriteQueue q;
+  q.NoteEarlyCoalesced();
+  q.NoteEarlyCoalesced();
+  q.NoteEarlySubmit();
+  const DeferredFenceCounters c = q.TakeCounters();
+  CHECK(c.early_coalesced == 2);
+  CHECK(c.early_submits == 1);
+  const std::string fields = FormatDeferredFenceFields(c, true, 0, 2000);
+  CHECK(fields.find(" fence_min_gap_us=2000 fence_early_coalesced=2") != std::string::npos);
+  // Off with only coalesced skips counted: the fields stay.
+  DeferredFenceCounters only;
+  only.early_coalesced = 1;
+  CHECK_FALSE(FormatDeferredFenceFields(only, false, 0, 0).empty());
 }

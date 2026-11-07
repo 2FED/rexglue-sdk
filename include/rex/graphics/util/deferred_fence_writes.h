@@ -56,6 +56,41 @@ struct DeferredFenceWrite {
   uint64_t seq = 0;         // queued writes since the last enable
 };
 
+// Lateness buckets of queued writes (l78; immediate stores are not counted):
+// frames between parse and store (same frame, 1, 2+) and time (<5 ms,
+// 5-20 ms, 20-50 ms, >50 ms).
+inline constexpr size_t kFenceLateFrameBuckets = 3;
+inline constexpr size_t kFenceLateMsBuckets = 4;
+
+inline size_t DeferredFenceLateFrameBucket(uint64_t frames) {
+  return frames >= 2 ? 2 : size_t(frames);
+}
+
+inline size_t DeferredFenceLateMsBucket(uint64_t us) {
+  if (us < 5000) {
+    return 0;
+  }
+  if (us < 20000) {
+    return 1;
+  }
+  return us <= 50000 ? 2 : 3;
+}
+
+// d3d12_fence_defer_min_gap_us (l78, for the CPU-bound Deck under vkd3d):
+// an early submit for a deferred write (idle, WAIT_REG_MEM or draw boundary)
+// is skipped when the open submission began less than min_gap_us ago; the
+// next poll point retries (the idle loop polls at least every 1-5 ms, so a
+// skipped write is delayed by at most about min_gap_us plus one poll).
+// 0: never skipped (the l77 behaviour). submission_begin_us 0 = unknown.
+inline bool ShouldCoalesceFenceEarlySubmit(uint32_t min_gap_us, uint64_t submission_begin_us,
+                                           uint64_t now_us) {
+  if (!min_gap_us || !submission_begin_us) {
+    return false;
+  }
+  const uint64_t elapsed = now_us >= submission_begin_us ? now_us - submission_begin_us : 0;
+  return elapsed < min_gap_us;
+}
+
 struct DeferredFenceCounters {
   uint64_t events = 0;         // fence events seen in the deferred mode
   uint64_t deferred = 0;       // writes queued
@@ -66,6 +101,9 @@ struct DeferredFenceCounters {
   uint64_t flush_on_idle = 0;  // queued writes stored by an idle or WAIT_REG_MEM poll
   uint64_t early_submits = 0;  // submissions ended for an outstanding write
   uint64_t max_depth = 0;      // longest queue
+  uint64_t late_frames[kFenceLateFrameBuckets] = {};  // DeferredFenceLateFrameBucket
+  uint64_t late_ms[kFenceLateMsBuckets] = {};         // DeferredFenceLateMsBucket
+  uint64_t early_coalesced = 0;                       // early submits skipped by the min gap
 };
 
 // The submission whose completion means the GPU has passed an event parsed
@@ -148,6 +186,8 @@ class DeferredFenceWriteQueue {
       store(w, frames, us);
       counters_.max_frames = std::max(counters_.max_frames, frames);
       counters_.max_us = std::max(counters_.max_us, us);
+      ++counters_.late_frames[DeferredFenceLateFrameBucket(frames)];
+      ++counters_.late_ms[DeferredFenceLateMsBucket(us)];
       ++counters_.written;
       if (waiting) {
         ++counters_.flush_on_idle;
@@ -159,6 +199,7 @@ class DeferredFenceWriteQueue {
   }
 
   void NoteEarlySubmit() { ++counters_.early_submits; }
+  void NoteEarlyCoalesced() { ++counters_.early_coalesced; }
 
   // A new enable restarts the INFO line budget.
   void RestartLines() { next_seq_ = 0; }
@@ -180,18 +221,23 @@ class DeferredFenceWriteQueue {
 
 // Fields appended to the MCLA readback minute/mark line while the mode is on
 // or something was counted in the window (empty otherwise, so the line is
-// unchanged with the mode off).
+// unchanged with the mode off). l78 appends the lateness histogram, the
+// min-gap cvar and the coalesced early submits after the l77 fields.
 inline std::string FormatDeferredFenceFields(const DeferredFenceCounters& c, bool enabled,
-                                             size_t depth) {
-  if (!enabled && !c.events && !c.written && !c.early_submits && !depth) {
+                                             size_t depth, uint32_t min_gap_us) {
+  if (!enabled && !c.events && !c.written && !c.early_submits && !c.early_coalesced && !depth) {
     return std::string();
   }
   return fmt::format(
       " fence_defer={} fence_events={} fence_deferred={} fence_immediate={} fence_written={} "
       "fence_deferred_max_frames={} fence_deferred_ms_max={:.3f} fence_flush_on_idle={} "
-      "fence_early_submits={} fence_queue_max={} fence_queue_now={}",
+      "fence_early_submits={} fence_queue_max={} fence_queue_now={} fence_late_f0={} "
+      "fence_late_f1={} fence_late_f2p={} fence_late_lt5ms={} fence_late_5_20ms={} "
+      "fence_late_20_50ms={} fence_late_gt50ms={} fence_min_gap_us={} fence_early_coalesced={}",
       int(enabled), c.events, c.deferred, c.immediate, c.written, c.max_frames,
-      double(c.max_us) / 1000.0, c.flush_on_idle, c.early_submits, c.max_depth, depth);
+      double(c.max_us) / 1000.0, c.flush_on_idle, c.early_submits, c.max_depth, depth,
+      c.late_frames[0], c.late_frames[1], c.late_frames[2], c.late_ms[0], c.late_ms[1],
+      c.late_ms[2], c.late_ms[3], min_gap_us, c.early_coalesced);
 }
 
 }  // namespace rex::graphics

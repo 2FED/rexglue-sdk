@@ -48,6 +48,7 @@
 #include <rex/graphics/util/readback_pending.h>
 #include <rex/graphics/util/readback_slots.h>
 #include <rex/graphics/util/readback_sync.h>
+#include <rex/graphics/util/submission_stats.h>
 #include <rex/graphics/xenos.h>
 #include <rex/perf/perf_split.h>
 #include <rex/system/kernel_state.h>
@@ -468,6 +469,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  // EndSubmission(false) counted under `reason` in submission_stats_ (l78).
+  bool EndSubmissionFor(SubmissionEndReason reason);
 
   bool InitializePerformanceTelemetry();
   void ShutdownPerformanceTelemetry();
@@ -613,6 +616,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // is active: when the wait began (0 = not blocked). The submission is
   // ended anyway after kFenceDeferQueryGraceUs.
   uint64_t fence_defer_query_block_us_ = 0;
+  // l78: submissions by end reason and the CP lead gauge of the current
+  // minute (MCLA readback minute/mark line), the reason of the
+  // EndSubmission in progress, the closing submissions of the last frames,
+  // and when the open submission began (d3d12_fence_defer_min_gap_us).
+  SubmissionStats submission_stats_;
+  SubmissionEndReason submission_end_reason_ = SubmissionEndReason::kOther;
+  FrameEndSubmissionRing<kCpLeadFrameRing> frame_end_submissions_;
+  uint64_t submission_begin_us_ = 0;
 
   bool submission_open_ = false;
   // Values of submission_fence_.
