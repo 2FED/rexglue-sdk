@@ -385,6 +385,7 @@ void CommandProcessor::WorkerThreadMain() {
                             std::chrono::milliseconds(wait_time_ms));
         }
 
+        OnIdlePoll();
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();

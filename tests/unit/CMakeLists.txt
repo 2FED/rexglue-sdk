@@ -43,6 +43,7 @@ add_executable(unit_tests
     graphics/wait_reg_mem_stats_test.cpp
     graphics/replay_wake_test.cpp
     graphics/readback_slots_test.cpp
+    graphics/readback_pending_test.cpp
     graphics/cp_freeze_watchdog_test.cpp
     graphics/fetch_identity_test.cpp
     core/sha256_test.cpp

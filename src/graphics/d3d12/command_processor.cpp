@@ -1821,6 +1821,12 @@ bool D3D12CommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // M11-007c: rex::gpu::ReadbackSyncQueryRange / ReadbackSyncEnsureRange.
+  readback_pending_.Clear();
+  readback_pending_.SetNextSubmission(submission_current_);
+  readback_range_bridge_ = std::make_unique<ReadbackRangeBridge>(*this);
+  rex::gpu::SetReadbackRangeProvider(readback_range_bridge_.get());
+
   return true;
 }
 
@@ -1849,6 +1855,12 @@ void D3D12CommandProcessor::EmitRenderAuditSummary(const char* phase) {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  // M11-007c: no caller may enter the bridge once the fences and slots go.
+  if (readback_range_bridge_) {
+    rex::gpu::SetReadbackRangeProvider(nullptr);
+    readback_range_bridge_.reset();
+  }
+  readback_pending_.Clear();
   FreezeWatchdogStop();
   PerfSplitShutdown();
   AwaitAllQueueOperationsCompletion();
@@ -1862,6 +1874,7 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
+  readback_pending_.Clear();
   for (auto& resolve_readback_pair : readback_buffers_) {
     auto& readback = resolve_readback_pair.second;
     for (uint32_t i = 0; i < 2; ++i) {
@@ -3083,11 +3096,13 @@ std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
   line += ReadbackSyncSteadyWaitReport(
       c, readback_sync_steady_was_enabled_,
       uint32_t(std::max(REXCVAR_GET(d3d12_readback_sync_steady_fast_wait_ms), int32_t(0))));
+  line += ReadbackEnsureReport(readback_ensure_counters_.Peek());
   return line;
 }
 
 void D3D12CommandProcessor::ResetReadbackSyncMinute() {
   readback_sync_minute_ = {};
+  readback_ensure_counters_.Take();
   // Keys counted in steady_exempt_keys are counted again in the next minute.
   ++readback_sync_minute_epoch_;
 }
@@ -3180,6 +3195,130 @@ bool D3D12CommandProcessor::AwaitReadbackSubmissionBounded(uint64_t submission, 
   }
   elapsed_us = LiveryDiag2NowUs() - start_us;
   return reached;
+}
+
+void D3D12CommandProcessor::HonourReadbackEnsureSubmitRequest() {
+  if (!readback_ensure_submit_request_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!submission_open_) {
+    // Already executed (EndSubmission ran since the request).
+    readback_ensure_submit_request_.store(false, std::memory_order_release);
+    return;
+  }
+  if (active_occlusion_query_.valid || !CanEndSubmissionImmediately()) {
+    return;
+  }
+  readback_ensure_submit_request_.store(false, std::memory_order_release);
+  EndSubmission(false);
+  readback_ensure_counters_.submits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void D3D12CommandProcessor::OnIdlePoll() {
+  HonourReadbackEnsureSubmitRequest();
+}
+
+bool D3D12CommandProcessor::ReadbackRangeBridge::QueryRange(uint32_t guest_phys, uint32_t len,
+                                                            rex::gpu::ReadbackRangeInfo* out) {
+  return processor_.readback_pending_.Query(guest_phys, len, out);
+}
+
+rex::gpu::ReadbackSyncEnsureResult D3D12CommandProcessor::ReadbackRangeBridge::EnsureRange(
+    uint32_t guest_phys, uint32_t len, uint32_t timeout_ms) {
+  // Runs on the caller's thread: only the pending table (its lock), the
+  // fence (free-threaded) and guest memory are touched.
+  D3D12CommandProcessor& p = processor_;
+  ReadbackEnsureCounters& counters = p.readback_ensure_counters_;
+  counters.calls.fetch_add(1, std::memory_order_relaxed);
+  rex::gpu::ReadbackSyncEnsureResult result;
+  ID3D12Fence* fence = p.submission_fence_;
+  if (!fence) {
+    return result;
+  }
+  // A thread's own event, never closed: a timed-out SetEventOnCompletion
+  // may set it later, which the re-poll below absorbs.
+  thread_local HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+  uint64_t start_us = LiveryDiag2NowUs();
+  uint64_t budget_us = uint64_t(timeout_ms) * 1000;
+  uint64_t first_key = 0;
+  bool first_unsubmitted = false;
+  bool by_cp = false;
+  bool any_delivered = false;
+  // Newest pending copy first; a superseded copy retries with the newer
+  // one, then the next overlapping key. Bounded by the timeout and a count.
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    ReadbackPendingRef ref;
+    if (!p.readback_pending_.FindPending(guest_phys, len, &ref)) {
+      break;
+    }
+    if (!result.pending) {
+      result.pending = true;
+      first_key = ref.key;
+      first_unsubmitted = ref.unsubmitted;
+      counters.pending.fetch_add(1, std::memory_order_relaxed);
+    }
+    ReadbackEnsureStep step = PlanReadbackEnsure(ref.submission, fence->GetCompletedValue(),
+                                                 p.readback_pending_.next_submission());
+    if (step == ReadbackEnsureStep::kRequestSubmitThenWait) {
+      p.readback_ensure_submit_request_.store(true, std::memory_order_release);
+      counters.submit_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (step != ReadbackEnsureStep::kDeliverNow) {
+      bool reached = fence->GetCompletedValue() >= ref.submission;
+      while (!reached && wait_event) {
+        uint64_t elapsed_us = LiveryDiag2NowUs() - start_us;
+        if (elapsed_us >= budget_us) {
+          break;
+        }
+        if (FAILED(fence->SetEventOnCompletion(ref.submission, wait_event))) {
+          break;
+        }
+        WaitForSingleObject(wait_event, DWORD((budget_us - elapsed_us + 999) / 1000));
+        reached = fence->GetCompletedValue() >= ref.submission;
+      }
+      if (!reached) {
+        result.timed_out = true;
+        break;
+      }
+    }
+    ReadbackDeliverResult delivered = p.readback_pending_.DeliverPending(
+        ref, [&](uint32_t base, const void* source, uint32_t length) {
+          uint8_t* destination = p.memory_->TranslatePhysical(base);
+          if (destination && source) {
+            std::memcpy(destination, source, length);
+          }
+        });
+    if (delivered == ReadbackDeliverResult::kDelivered) {
+      any_delivered = true;
+    } else if (delivered == ReadbackDeliverResult::kAlreadyDelivered) {
+      any_delivered = true;
+      by_cp = true;
+    }
+  }
+  uint64_t waited_us = LiveryDiag2NowUs() - start_us;
+  result.waited_us = uint32_t(std::min<uint64_t>(waited_us, UINT32_MAX));
+  result.waited_ms = uint32_t(std::min<uint64_t>((waited_us + 999) / 1000, UINT32_MAX));
+  result.delivered = any_delivered && !result.timed_out;
+  if (result.pending) {
+    counters.CountWait(waited_us);
+  }
+  if (result.delivered) {
+    counters.delivered.fetch_add(1, std::memory_order_relaxed);
+    if (by_cp) {
+      counters.delivered_by_cp.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  if (result.timed_out) {
+    counters.timeouts.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (result.pending && p.readback_pending_.TakeEnsureLine(first_key, kReadbackEnsureLinesPerKey)) {
+    REXGPU_INFO(
+        "MCLA_READBACK_SYNC v=1 kind=ensure key_base={:08X} key_len={} base={:08X} len={} "
+        "unsubmitted={} timeout_ms={} waited_us={} delivered={} by_cp={} timed_out={}",
+        uint32_t(first_key >> 32), uint32_t(first_key), guest_phys, len, int(first_unsubmitted),
+        timeout_ms, waited_us, int(result.delivered), int(by_cp), int(result.timed_out));
+  }
+  return result;
 }
 
 void D3D12CommandProcessor::MaybeKickReadbackSyncSubmission() {
@@ -3740,6 +3879,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // while the GPU is idle (a host scheduling point, like the primary buffer
   // end), so that a forced read-back wait has a short backlog.
   MaybeKickReadbackSyncSubmission();
+  HonourReadbackEnsureSubmitRequest();
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -4712,6 +4852,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
   uint32_t write_index = rb.current_index;
   uint32_t size = AlignReadbackBufferSize(written_length);
+  // M11-007c: slot write_index is about to be reallocated or rewritten; a
+  // pending copy in it can no longer be delivered by an ensure call.
+  readback_pending_.SetFrame(frame_current_);
+  readback_pending_.BeginResolve(resolve_key, write_index);
 
   if (size > rb.sizes[write_index]) {
     const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -5032,7 +5176,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
         rex::perf::ScopedPerfRegion perf_memcpy(perf_split_active_,
                                                 rex::perf::PerfRegion::kReadbackMemcpy);
         uint64_t memcpy_start_ns = ReadbackNowNs();
-        std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+        // M11-007c: under the pending table lock (serialised with ensure
+        // calls); marks a pending copy in read_index delivered.
+        readback_pending_.DeliverByCommandProcessor(resolve_key, read_index, [&]() {
+          std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]),
+                      written_length);
+        });
         readback_counters_.memcpy_ns += ReadbackNowNs() - memcpy_start_ns;
       }
       readback_counters_.bytes_cpu_copied += written_length;
@@ -5058,6 +5207,24 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     ++readback_counters_.copies_skipped;
   }
 
+  {
+    // M11-007c: the copy recorded into write_index becomes the key's
+    // pending copy, unless this resolve already copied it to guest RAM.
+    const D3D12RenderTargetCache::LastResolveDiagInfo& info =
+        render_target_cache_->last_resolve_diag_info();
+    ReadbackPendingTable::KeyInfo key_info;
+    key_info.base = written_address;
+    key_info.length = written_length;
+    key_info.slot_size = rb.sizes[write_index];
+    key_info.width = info.width;
+    key_info.height = info.height;
+    key_info.format = info.copy_dest_format;
+    key_info.exempt = diag.sync_rules.steady_exempt;
+    readback_pending_.EndResolve(resolve_key, key_info,
+                                 plan.record_gpu && rb.mapped_data[write_index] != nullptr,
+                                 write_index, submission_current_, rb.mapped_data[write_index],
+                                 perf_outcome.copied && read_index == write_index);
+  }
   rb.current_index = 1 - rb.current_index;
   return true;
 }
@@ -5509,6 +5676,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     }
 
     direct_queue->Signal(submission_fence_, submission_current_++);
+    // M11-007c: submissions below this one were executed.
+    readback_pending_.SetNextSubmission(submission_current_);
 
     submission_open_ = false;
 
@@ -7288,6 +7457,10 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
     if (!evict) {
       ++it;
       continue;
+    }
+    if (&buffer_map == &readback_buffers_) {
+      // M11-007c: before the slot buffers are released.
+      readback_pending_.Erase(it->first);
     }
     for (uint32_t i = 0; i < 2; ++i) {
       if (readback.buffers[i]) {

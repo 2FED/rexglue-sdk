@@ -42,7 +42,9 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/fetch_identity.h>
 #include <rex/graphics/util/livery_diag.h>
+#include <rex/graphics/readback_range.h>
 #include <rex/graphics/util/livery_diag2.h>
+#include <rex/graphics/util/readback_pending.h>
 #include <rex/graphics/util/readback_slots.h>
 #include <rex/graphics/util/readback_sync.h>
 #include <rex/graphics/xenos.h>
@@ -231,6 +233,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                  uint32_t frontbuffer_height) override;
 
   void OnPrimaryBufferEnd() override;
+  // M11-007c: honours a read-back ensure request while the ring is empty.
+  void OnIdlePoll() override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -344,6 +348,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Before a draw: executes the open submission early when
   // ShouldKickReadbackSyncSubmission allows it.
   void MaybeKickReadbackSyncSubmission();
+  // M11-007c (rex::gpu::ReadbackSyncEnsureRange): ends the open submission
+  // when a caller asked for it (readback_ensure_submit_request_) and it can
+  // be ended now; else keeps the request for the next opportunity (before a
+  // draw, the idle loop; the frame end ends the submission anyway).
+  void HonourReadbackEnsureSubmitRequest();
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -895,6 +904,51 @@ class D3D12CommandProcessor : public CommandProcessor {
   ReadbackSyncStickySet readback_sync_steady_sticky_;
   ReadbackSyncSteadyCap readback_sync_steady_cap_;
   PacedLineBudget readback_sync_steady_cap_lines_{2, 16};
+
+  // M11-007c: rex::gpu::ReadbackSyncQueryRange / ReadbackSyncEnsureRange.
+  //
+  // Thread safety. readback_pending_ (readback_pending.h) mirrors, per
+  // read-back key, the newest recorded GPU copy not yet in guest RAM: slot,
+  // submission, mapped pointer, generation. The command processor updates it
+  // under its lock at every read-back resolve (BeginResolve before it
+  // allocates or records into its own slot, its own guest memcpy under the
+  // lock, EndResolve after) and erases entries before slot buffers are
+  // released (eviction, shutdown). A caller copies a pending slot under the
+  // same lock only after it saw the copy's fence reached and only if the
+  // generation is unchanged and undelivered. So while it copies, the slot is
+  // neither rewritten by a later GPU copy (that would need a BeginResolve)
+  // nor released, and guest RAM never goes back to an older resolve.
+  //
+  // Deadlock analysis. The caller is a guest thread that may hold the
+  // game's own locks (the lock core runs inside D3D/rage critical
+  // sections). The command processor never waits for a caller: the table
+  // lock is held on either side only for map updates or one slot memcpy, no
+  // wait or call out happens inside it, and nothing else is shared. The
+  // caller waits only on the host GPU fence, with its own event and its
+  // timeout; the GPU progresses without the command processor once the
+  // submission was executed. A copy in the still open submission needs the
+  // command processor to execute it: the caller only sets
+  // readback_ensure_submit_request_; the command processor honours it
+  // before the next draw or in its idle loop (OnIdlePoll), so it also
+  // progresses when the ring is empty because this very guest thread is
+  // blocked. If the command processor is itself blocked (for example in a
+  // guest-memory wait packet that the caller would satisfy later), the
+  // caller times out and proceeds; the request stays set and is honoured
+  // later. Provider removal (shutdown) waits at most one caller timeout.
+  class ReadbackRangeBridge : public rex::gpu::IReadbackRangeProvider {
+   public:
+    explicit ReadbackRangeBridge(D3D12CommandProcessor& processor) : processor_(processor) {}
+    bool QueryRange(uint32_t guest_phys, uint32_t len, rex::gpu::ReadbackRangeInfo* out) override;
+    rex::gpu::ReadbackSyncEnsureResult EnsureRange(uint32_t guest_phys, uint32_t len,
+                                                   uint32_t timeout_ms) override;
+
+   private:
+    D3D12CommandProcessor& processor_;
+  };
+  ReadbackPendingTable readback_pending_;
+  ReadbackEnsureCounters readback_ensure_counters_;
+  std::atomic<bool> readback_ensure_submit_request_{false};
+  std::unique_ptr<ReadbackRangeBridge> readback_range_bridge_;
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 

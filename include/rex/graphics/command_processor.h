@@ -316,6 +316,10 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Called on every iteration of the idle loop (the ring is empty), on the
+  // command processor thread. M11-007c: the D3D12 command processor honours
+  // a read-back ensure request here (ends the open submission).
+  virtual void OnIdlePoll() {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
