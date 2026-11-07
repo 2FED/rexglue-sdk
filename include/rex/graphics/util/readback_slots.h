@@ -97,6 +97,8 @@ struct ReadbackPlanInput {
   // not elided, its submission fence passed), instead of every 4th resolve;
   // its own GPU copy is never elided. Ignored by full and fast, and for a
   // miss or a forced resolve (they read their own slot anyway).
+  // M11-007c: the command processor sets previous_slot_complete after the
+  // bounded fence wait, or forces the resolve (ReadbackSteadyDelivery).
   bool steady_fast = false;
   bool previous_slot_complete = false;
 };
@@ -188,6 +190,154 @@ inline ReadbackPreviousSlot ClassifyReadbackPreviousSlot(bool slot_elided,
   }
   return submission_written <= submission_completed ? ReadbackPreviousSlot::kComplete
                                                     : ReadbackPreviousSlot::kUnfenced;
+}
+
+// M11-007c: d3d12_readback_sync_steady_fast_wait_ms. How an exempt resolve
+// with steady fast delivery (ReadbackPlanInput::steady_fast) gets its guest
+// copy. The l75 A/B showed that with the GPU as the bottleneck the previous
+// slot (resolve N-1 of the key, one frame ago) is often still queued when
+// resolve N polls it; the l75 path then kept the some cadence, whose every
+// 4th copy read that slot without a wait (pkc=0): 3-6 frames old, or a torn
+// mix while the GPU copy runs during the memcpy. With a wait budget the
+// exempt resolve never reads an unfenced slot:
+// - kFast: the previous slot is complete at the poll: copy it now (1 frame);
+// - kWait: the previous slot is written and its submission was already
+//   executed (submission_written < submission_current), so its fence value
+//   is signalled by the GPU alone: wait on that fence value only, at most
+//   wait_ms (no submission is ended, no queue operation is awaited), then
+//   copy it (kFast) or, on a timeout, force the own slot;
+// - kForce: the previous slot cannot be waited for without CP work (never
+//   written, elided, a different length, or recorded into the still open
+//   submission): force the own slot this frame, as the pre-exemption rule c
+//   did (targeted wait on the own copy, read slot w);
+// - kCadence: wait_ms 0, the l75 behaviour (some cadence, unfenced every
+//   4th copy), kept as the A/B control.
+// The wait returns once the GPU has finished the submission that held the
+// frame N-1 copy, so at this resolve the CP is at most ~1 frame (plus the
+// rest of the submission) ahead of the GPU; while the GPU is the bottleneck
+// the remaining queue (the rest of frame N-1 and frame N so far) keeps it
+// busy, so the cap costs no GPU time.
+// kNone: not a steady fast resolve (switch off, not exempt, not some mode,
+// a miss or a resolve the rules force): the plan is unchanged.
+// Non-exempt keys never reach this decision; they keep the some cadence.
+enum class ReadbackSteadyDelivery : uint8_t {
+  kNone,
+  kFast,
+  kWait,
+  kForce,
+  kCadence,
+};
+
+inline const char* ReadbackSteadyDeliveryName(ReadbackSteadyDelivery delivery) {
+  switch (delivery) {
+    case ReadbackSteadyDelivery::kNone:
+      return "none";
+    case ReadbackSteadyDelivery::kFast:
+      return "fast";
+    case ReadbackSteadyDelivery::kWait:
+      return "wait";
+    case ReadbackSteadyDelivery::kForce:
+      return "force";
+    case ReadbackSteadyDelivery::kCadence:
+      return "cadence";
+  }
+  return "unknown";
+}
+
+struct ReadbackSteadyInput {
+  // ReadbackPlanInput::steady_fast (exempt, some mode, switch on).
+  bool steady_fast = false;
+  // The plan reads the own slot anyway: a miss (previous slot unusable) or
+  // a resolve the rules force.
+  bool own = false;
+  // The previous slot (ClassifyReadbackPreviousSlot with the polled fence)
+  // and whether its written length is this resolve's length.
+  ReadbackPreviousSlot previous = ReadbackPreviousSlot::kUnwritten;
+  bool length_ok = false;
+  // Its submission was executed (submission_written < submission_current):
+  // the fence value is signalled without ending a submission.
+  bool previous_submitted = false;
+  // d3d12_readback_sync_steady_fast_wait_ms (0: kCadence).
+  uint32_t wait_ms = 0;
+};
+
+inline ReadbackSteadyDelivery PlanReadbackSteadyDelivery(const ReadbackSteadyInput& in) {
+  if (!in.steady_fast || in.own) {
+    return ReadbackSteadyDelivery::kNone;
+  }
+  if (in.length_ok && in.previous == ReadbackPreviousSlot::kComplete) {
+    return ReadbackSteadyDelivery::kFast;
+  }
+  if (!in.wait_ms) {
+    return ReadbackSteadyDelivery::kCadence;
+  }
+  if (in.length_ok && in.previous == ReadbackPreviousSlot::kUnfenced && in.previous_submitted) {
+    return ReadbackSteadyDelivery::kWait;
+  }
+  return ReadbackSteadyDelivery::kForce;
+}
+
+// The decision after the wait (wait_completed: kWait only, the fence value
+// was reached within wait_ms).
+struct ReadbackSteadyOutcome {
+  // ReadbackPlanInput::previous_slot_complete.
+  bool previous_slot_complete = false;
+  // Forces the own slot (ReadbackPlanInput::force_unless_miss).
+  bool force = false;
+  bool waited = false;
+  bool wait_timed_out = false;
+  // The previous slot was not complete at the poll (a skip in the l75
+  // terms: waited, forced or cadence).
+  bool skip = false;
+};
+
+inline ReadbackSteadyOutcome ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery delivery,
+                                                           bool wait_completed) {
+  ReadbackSteadyOutcome out;
+  switch (delivery) {
+    case ReadbackSteadyDelivery::kNone:
+      break;
+    case ReadbackSteadyDelivery::kFast:
+      out.previous_slot_complete = true;
+      break;
+    case ReadbackSteadyDelivery::kWait:
+      out.waited = true;
+      out.skip = true;
+      out.previous_slot_complete = wait_completed;
+      out.wait_timed_out = !wait_completed;
+      out.force = !wait_completed;
+      break;
+    case ReadbackSteadyDelivery::kForce:
+      out.skip = true;
+      out.force = true;
+      break;
+    case ReadbackSteadyDelivery::kCadence:
+      out.skip = true;
+      break;
+  }
+  return out;
+}
+
+// steady_unfenced_avoided: the some cadence that the l75 path would have
+// kept for the key (`shadow`, the per-key resolves since its last copy in
+// that path: reset by a fast copy, advanced by a skip). Returns true when
+// that path would have copied the unfenced previous slot here (its every
+// 4th copy) and this resolve does not (it waited for the fence or forced).
+// Not counted for kCadence (the copy is made) or kNone.
+inline bool NoteReadbackSteadyShadowCadence(uint32_t& shadow, ReadbackSteadyDelivery delivery) {
+  if (delivery == ReadbackSteadyDelivery::kNone) {
+    return false;
+  }
+  if (delivery == ReadbackSteadyDelivery::kFast) {
+    shadow = 0;
+    return false;
+  }
+  if (shadow + 1 < kReadbackSlotsSomeInterval) {
+    ++shadow;
+    return false;
+  }
+  shadow = 0;
+  return delivery != ReadbackSteadyDelivery::kCadence;
 }
 
 // The GPU copy into slot `index` was recorded (or elided).

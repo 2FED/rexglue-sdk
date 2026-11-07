@@ -979,4 +979,64 @@ TEST_CASE("Read-back sync steady filter end reasons and fields",
         "suppressed=0");
 }
 
+TEST_CASE("Resolve flight ring keeps about 120 frames", "[graphics][livery-diag2]") {
+  // l75: 64 lines = 37-42 frames; 200 lines = ~120 frames.
+  STATIC_REQUIRE(DiagResolveLineRing::kCapacity == 200);
+  STATIC_REQUIRE(DiagLineRing::kCapacity == 64);
+  DiagResolveLineRing ring;
+  for (int i = 0; i < 450; ++i) {
+    ring.Push("r" + std::to_string(i));
+  }
+  uint64_t pushed = 0;
+  std::vector<std::string> lines = ring.Snapshot(&pushed);
+  REQUIRE(lines.size() == 200);
+  CHECK(lines.front() == "r250");
+  CHECK(lines.back() == "r449");
+  CHECK(pushed == 450);
+}
+
+TEST_CASE("Readback sync steady wait counters and report",
+          "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncCounters c;
+  CHECK_FALSE(c.SteadyWaitCounted());
+  CHECK(ReadbackSyncSteadyWaitReport(c, false, 20).empty());
+  CHECK(ReadbackSyncSteadyWaitReport(c, true, 20) ==
+        " steady_fast_wait_ms=20 steady_fast_waits=0 steady_fast_wait_ms_total=0.000 "
+        "steady_fast_wait_ms_max=0.000 steady_fast_wait_timeouts=0 steady_fast_forced=0 "
+        "steady_unfenced_avoided=0 steady_skip_episodes=0 steady_skip_longest=0");
+  uint32_t run = 0;
+  // fast, wait ok (1.5 ms), wait ok (4 ms), timeout (20 ms, forced), fast,
+  // forced (unwaitable), fast.
+  c.CountSteadyDelivery(false, false, false, false, false, 0, run);
+  CHECK(run == 0);
+  c.CountSteadyDelivery(true, false, false, true, false, 1500, run);
+  c.CountSteadyDelivery(true, false, false, true, false, 4000, run);
+  c.CountSteadyDelivery(true, true, true, true, true, 20000, run);
+  CHECK(run == 3);
+  c.CountSteadyDelivery(false, false, false, false, false, 0, run);
+  CHECK(run == 0);
+  c.CountSteadyDelivery(false, false, true, true, false, 0, run);
+  c.CountSteadyDelivery(false, false, false, false, false, 0, run);
+  CHECK(c.steady_fast_waits == 3);
+  CHECK(c.steady_fast_wait_us == 25500);
+  CHECK(c.steady_fast_wait_max_us == 20000);
+  CHECK(c.steady_fast_wait_timeouts == 1);
+  CHECK(c.steady_fast_forced == 2);
+  CHECK(c.steady_unfenced_avoided == 1);
+  CHECK(c.steady_skip_episodes == 2);
+  CHECK(c.steady_skip_longest == 3);
+  CHECK(c.SteadyWaitCounted());
+  CHECK(ReadbackSyncSteadyWaitReport(c, false, 0) ==
+        " steady_fast_wait_ms=0 steady_fast_waits=3 steady_fast_wait_ms_total=25.500 "
+        "steady_fast_wait_ms_max=20.000 steady_fast_wait_timeouts=1 steady_fast_forced=2 "
+        "steady_unfenced_avoided=1 steady_skip_episodes=2 steady_skip_longest=3");
+  // A run that continues after a minute reset counts in the new minute's
+  // longest but not again as an episode.
+  ReadbackSyncCounters next;
+  run = 5;
+  next.CountSteadyDelivery(false, false, false, true, false, 0, run);
+  CHECK(next.steady_skip_episodes == 0);
+  CHECK(next.steady_skip_longest == 6);
+}
+
 }  // namespace rex::graphics::test

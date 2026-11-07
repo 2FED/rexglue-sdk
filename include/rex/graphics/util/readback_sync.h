@@ -702,6 +702,55 @@ struct ReadbackSyncCounters {
   uint64_t steady_fast_bytes = 0;
   uint64_t steady_fast_skipped = 0;
 
+  // d3d12_readback_sync_steady_fast_wait_ms (M11-007c, readback_slots.h
+  // ReadbackSteadyDelivery): exempt resolves that waited on the previous
+  // slot's fence, the summed and the longest wait, the waits that timed out
+  // (forced the own slot), all forced exempt resolves (timeouts and
+  // previous slots that cannot be waited for), and the every-4th copies of
+  // an unfenced previous slot that the l75 cadence would have made here.
+  uint64_t steady_fast_waits = 0;
+  uint64_t steady_fast_wait_us = 0;
+  uint64_t steady_fast_wait_max_us = 0;
+  uint64_t steady_fast_wait_timeouts = 0;
+  uint64_t steady_fast_forced = 0;
+  uint64_t steady_unfenced_avoided = 0;
+  // Skip episodes: runs of consecutive exempt resolves of a key whose
+  // previous slot was not complete at the poll (waited, forced or cadence);
+  // the runs that started in this minute and the longest run seen in it (a
+  // run that continues across a minute line counts in both minutes'
+  // longest, once in the episodes).
+  uint64_t steady_skip_episodes = 0;
+  uint32_t steady_skip_longest = 0;
+
+  // One exempt steady fast resolve. `skip_run` is the key's current skip
+  // run (kept with the key; reset by a resolve that is not a skip).
+  void CountSteadyDelivery(bool waited, bool timed_out, bool forced, bool skip,
+                           bool unfenced_avoided, uint64_t wait_us, uint32_t& skip_run) {
+    if (waited) {
+      ++steady_fast_waits;
+      steady_fast_wait_us += wait_us;
+      steady_fast_wait_max_us =
+          wait_us > steady_fast_wait_max_us ? wait_us : steady_fast_wait_max_us;
+    }
+    steady_fast_wait_timeouts += timed_out ? 1 : 0;
+    steady_fast_forced += forced ? 1 : 0;
+    steady_unfenced_avoided += unfenced_avoided ? 1 : 0;
+    if (!skip) {
+      skip_run = 0;
+      return;
+    }
+    if (!skip_run) {
+      ++steady_skip_episodes;
+    }
+    ++skip_run;
+    steady_skip_longest = skip_run > steady_skip_longest ? skip_run : steady_skip_longest;
+  }
+
+  bool SteadyWaitCounted() const {
+    return steady_fast_waits || steady_fast_wait_timeouts || steady_fast_forced ||
+           steady_unfenced_avoided || steady_skip_episodes || steady_skip_longest;
+  }
+
   void CountSteadyFilter(ReadbackSyncSteadyFilter filter) {
     steady_sticky_excluded += filter == ReadbackSyncSteadyFilter::kSticky ? 1 : 0;
     steady_shape_excluded += filter == ReadbackSyncSteadyFilter::kShape ? 1 : 0;
@@ -762,6 +811,23 @@ inline std::string ReadbackSyncSteadyFilterReport(const ReadbackSyncCounters& c,
       "steady_fast_copies={} steady_fast_kb={} steady_fast_skipped={}",
       int(fast_enabled), c.steady_sticky_excluded, c.steady_shape_excluded, c.steady_cap_skipped,
       c.steady_fast_copies, c.steady_fast_bytes / 1024, c.steady_fast_skipped);
+}
+
+// The M11-007c fields appended after ReadbackSyncSteadyFilterReport: empty
+// while the exemption is off and none of them counted (the line is unchanged
+// then). steady_fast_wait_ms is the cvar (0: the l75 cadence).
+inline std::string ReadbackSyncSteadyWaitReport(const ReadbackSyncCounters& c, bool enabled,
+                                                uint32_t wait_ms) {
+  if (!enabled && !c.SteadyWaitCounted()) {
+    return std::string();
+  }
+  return fmt::format(
+      " steady_fast_wait_ms={} steady_fast_waits={} steady_fast_wait_ms_total={:.3f} "
+      "steady_fast_wait_ms_max={:.3f} steady_fast_wait_timeouts={} steady_fast_forced={} "
+      "steady_unfenced_avoided={} steady_skip_episodes={} steady_skip_longest={}",
+      wait_ms, c.steady_fast_waits, double(c.steady_fast_wait_us) / 1000.0,
+      double(c.steady_fast_wait_max_us) / 1000.0, c.steady_fast_wait_timeouts, c.steady_fast_forced,
+      c.steady_unfenced_avoided, c.steady_skip_episodes, c.steady_skip_longest);
 }
 
 // One kind=steady_cap line (prefix added by the caller): the first refusal

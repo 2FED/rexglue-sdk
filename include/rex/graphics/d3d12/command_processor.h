@@ -293,6 +293,12 @@ class D3D12CommandProcessor : public CommandProcessor {
     ReadbackSyncRules sync_rules;
     bool sync_forced = false;
     uint64_t sync_wait_us = 0;
+    // M11-007c: the steady fast delivery of an exempt resolve
+    // (ReadbackSteadyDeliveryName; nullptr: not a steady fast resolve, the
+    // line is unchanged) and its bounded fence wait.
+    const char* steady_delivery = nullptr;
+    bool steady_wait_timed_out = false;
+    uint64_t steady_wait_us = 0;
     ~LiveryResolveDiagScope();
   };
   void LiveryDiagReportResolve(const LiveryResolveDiagScope& scope);
@@ -327,6 +333,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // for exactly its fence value; `wait` gets the timings. Requires an open
   // submission.
   ReadbackTargetedResult AwaitReadbackCopySubmission(ReadbackTargetedWait& wait);
+  // d3d12_readback_sync_steady_fast_wait_ms (M11-007c): waits at most
+  // `wait_ms` for submission_fence_ to reach `submission`, which must have
+  // been executed already (below submission_current_). Only the fence is
+  // waited for: no submission is ended, no queue operation is awaited and
+  // submission_completed_ is not updated (CheckSubmissionFence reclaims as
+  // usual). Returns true when the value was reached; `elapsed_us` gets the
+  // wait.
+  bool AwaitReadbackSubmissionBounded(uint64_t submission, uint32_t wait_ms, uint64_t& elapsed_us);
   // Before a draw: executes the open submission early when
   // ShouldKickReadbackSyncSubmission allows it.
   void MaybeKickReadbackSyncSubmission();
@@ -506,6 +520,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t consecutive_frames = 0;
     bool steady_exempt = false;
     uint64_t steady_exempt_epoch = 0;
+    // M11-007c (readback_slots.h ReadbackSteadyDelivery): the l75 cadence
+    // shadow counter (steady_unfenced_avoided) and the current skip run
+    // (steady_skip_episodes / steady_skip_longest) of the key.
+    uint32_t steady_shadow_since_copy = 0;
+    uint32_t steady_skip_run = 0;
     // M11-007b shape filter: the shape of the key's last evaluated resolve.
     bool shape_known = false;
     ReadbackSyncKeyShape shape;
@@ -557,6 +576,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool cache_clear_requested_ = false;
 
   HANDLE fence_completion_event_ = nullptr;
+  // d3d12_readback_sync_steady_fast_wait_ms: a separate auto-reset event for
+  // the bounded fence wait. A timed-out SetEventOnCompletion stays
+  // registered and sets its event later; on fence_completion_event_ that
+  // late signal would end a later INFINITE wait early.
+  HANDLE readback_steady_wait_event_ = nullptr;
 
   bool submission_open_ = false;
   // Values of submission_fence_.
@@ -843,7 +867,7 @@ class D3D12CommandProcessor : public CommandProcessor {
                                                    kLiveryDiag2LineBurst};
   PacedLineBudget livery_diag2_composite_lines_{kLiveryDiag2CompositeLinesPerSecond,
                                                 kLiveryDiag2CompositeLineBurst};
-  DiagLineRing livery_diag2_resolve_ring_;
+  DiagResolveLineRing livery_diag2_resolve_ring_;
   RecentKeyFilter livery_diag2_overlap_pairs_{kLiveryDiag2OverlapQuietFrames};
   ReadbackKeyHistory livery_diag2_keys_;
   PendingLongWaits livery_diag2_pending_waits_;

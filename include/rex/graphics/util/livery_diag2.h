@@ -118,9 +118,10 @@ class PacedLineBudget {
 // The last kCapacity diagnostic lines of one kind, kept whether or not they
 // were logged, written to the log when F10 fires (flight recorder).
 // Internally locked: texture loads may be reported from other threads.
-class DiagLineRing {
+template <size_t Capacity>
+class BasicDiagLineRing {
  public:
-  static constexpr size_t kCapacity = 64;
+  static constexpr size_t kCapacity = Capacity;
 
   void Push(std::string line) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -155,6 +156,18 @@ class DiagLineRing {
   std::array<std::string, kCapacity> lines_;
   uint64_t pushed_ = 0;
 };
+
+// The atlas ring (64 lines).
+using DiagLineRing = BasicDiagLineRing<64>;
+
+// The per-resolve ring (M11-007c): ~120 frames of resolve lines. The l75 F10
+// rings held 64 lines = 37-42 frames (1.5-1.7 read-back resolves per frame
+// in the race), so 200 lines cover ~120 frames (~3 s at 40 fps), enough for
+// the owner's reaction time. Memory: 200 std::string objects (~6 KB) plus
+// the line text (~0.3-0.6 KB each, ~120 KB at most), filled only while
+// d3d12_livery_diag2 is on.
+inline constexpr size_t kLiveryDiag2ResolveFlightLines = 200;
+using DiagResolveLineRing = BasicDiagLineRing<kLiveryDiag2ResolveFlightLines>;
 
 inline bool IsSporadicReadbackResolve(bool seen_before, uint64_t previous_frame, uint64_t frame) {
   return !seen_before || frame < previous_frame ||

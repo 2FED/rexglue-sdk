@@ -154,6 +154,17 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_sync_steady_fast, true, "GPU/D3D12",
                     "instead of every 4th resolve")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(d3d12_readback_sync_steady_fast_wait_ms, 20, "GPU/D3D12",
+                     "M11-007c: with d3d12_readback_sync_steady_fast on, an exempt resolve whose "
+                     "previous read-back slot is not complete waits at most this long for that "
+                     "slot's submission fence (fence only, no submission is ended) and copies "
+                     "it (1 frame old); on a timeout, or when the slot cannot be waited for, the "
+                     "resolve is forced (own slot, as without the exemption). The unfenced "
+                     "every-4th copy is never made for an exempt key. 0: the M11-007b "
+                     "behaviour (some cadence, every 4th copy without a wait)")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_elide_unread, false, "GPU/D3D12",
                     "M10-002 step 1: with readback_resolve some, do not record the GPU copy "
                     "(downscale or shared-memory copy, slot copy and their barriers) of a "
@@ -1038,6 +1049,11 @@ bool D3D12CommandProcessor::SetupContext() {
   fence_completion_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
   if (fence_completion_event_ == nullptr) {
     REXGPU_ERROR("Failed to create the fence completion event");
+    return false;
+  }
+  readback_steady_wait_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+  if (readback_steady_wait_event_ == nullptr) {
+    REXGPU_ERROR("Failed to create the read-back steady wait event");
     return false;
   }
   if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&submission_fence_)))) {
@@ -1979,6 +1995,10 @@ void D3D12CommandProcessor::ShutdownContext() {
     CloseHandle(fence_completion_event_);
     fence_completion_event_ = nullptr;
   }
+  if (readback_steady_wait_event_) {
+    CloseHandle(readback_steady_wait_event_);
+    readback_steady_wait_event_ = nullptr;
+  }
 
   device_removed_ = false;
 
@@ -2843,7 +2863,7 @@ bool D3D12CommandProcessor::LiveryDiag2Enabled() {
         texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 0,
         texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 0, kLiveryDiag2LineBurst,
         kLiveryDiag2LinesPerSecond, kLiveryDiag2CompositeLineBurst,
-        kLiveryDiag2CompositeLinesPerSecond, DiagLineRing::kCapacity,
+        kLiveryDiag2CompositeLinesPerSecond, DiagResolveLineRing::kCapacity,
         int(REXCVAR_GET(d3d12_readback_sync_composite)), kLiveryDiag2SporadicMinFrames,
         kLiveryDiag2ReadbackWindowFrames, kLiveryDiag2LongWaitUs, FrameWaitWindow::kFrames);
   }
@@ -2968,6 +2988,11 @@ void D3D12CommandProcessor::LiveryDiag2ReportResolve(const LiveryResolveDiagScop
       scope.sync_evaluated ? ReadbackSyncRuleNames(scope.sync_rules) : "off",
       int(scope.sync_forced), scope.sync_wait_us, fence_wait_us + pipeline_wait_us, fence_wait_us,
       pipeline_wait_us);
+  if (scope.steady_delivery) {
+    fields +=
+        fmt::format(" steady_delivery={} steady_wait_us={} steady_wait_timeout={}",
+                    scope.steady_delivery, scope.steady_wait_us, int(scope.steady_wait_timed_out));
+  }
   std::string body;
   bool allowed;
   if (composite) {
@@ -3055,6 +3080,9 @@ std::string D3D12CommandProcessor::ReadbackSyncMinuteReport() {
   line += ReadbackSyncSteadyReport(c, readback_sync_steady_was_enabled_);
   line += ReadbackSyncSteadyFilterReport(c, readback_sync_steady_was_enabled_,
                                          REXCVAR_GET(d3d12_readback_sync_steady_fast));
+  line += ReadbackSyncSteadyWaitReport(
+      c, readback_sync_steady_was_enabled_,
+      uint32_t(std::max(REXCVAR_GET(d3d12_readback_sync_steady_fast_wait_ms), int32_t(0))));
   return line;
 }
 
@@ -3125,6 +3153,33 @@ ReadbackTargetedResult D3D12CommandProcessor::AwaitReadbackCopySubmission(
     wait.fence_us = LiveryDiag2NowUs() - fence_start_us;
   }
   return ClassifyReadbackTargetedWait(copy_submission, submission_current_, submission_completed_);
+}
+
+bool D3D12CommandProcessor::AwaitReadbackSubmissionBounded(uint64_t submission, uint32_t wait_ms,
+                                                           uint64_t& elapsed_us) {
+  uint64_t start_us = LiveryDiag2NowUs();
+  elapsed_us = 0;
+  if (!submission_fence_ || !readback_steady_wait_event_ || submission >= submission_current_) {
+    return false;
+  }
+  uint64_t budget_us = uint64_t(wait_ms) * 1000;
+  bool reached = submission_fence_->GetCompletedValue() >= submission;
+  // A late signal of an earlier timed-out registration may wake the wait
+  // early: re-poll the fence and wait again for the rest of the budget.
+  while (!reached) {
+    uint64_t now_us = LiveryDiag2NowUs();
+    if (now_us - start_us >= budget_us) {
+      break;
+    }
+    if (FAILED(submission_fence_->SetEventOnCompletion(submission, readback_steady_wait_event_))) {
+      break;
+    }
+    DWORD remaining_ms = DWORD((budget_us - (now_us - start_us) + 999) / 1000);
+    WaitForSingleObject(readback_steady_wait_event_, remaining_ms);
+    reached = submission_fence_->GetCompletedValue() >= submission;
+  }
+  elapsed_us = LiveryDiag2NowUs() - start_us;
+  return reached;
 }
 
 void D3D12CommandProcessor::MaybeKickReadbackSyncSubmission() {
@@ -4587,8 +4642,15 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       ShouldForceReadbackSync(sync_enabled, use_delayed_sync, false, diag.sync_rules);
   plan_input.elide_unread = REXCVAR_GET(d3d12_readback_elide_unread);
   // M11-007b fast delivery: an exempt resolve in some mode reads the previous
-  // slot when its copy is already complete; the fence is only polled, never
-  // waited for.
+  // slot when its copy is already complete (the fence is polled).
+  // M11-007c (readback_slots.h ReadbackSteadyDelivery): when it is not, the
+  // resolve waits at most d3d12_readback_sync_steady_fast_wait_ms for that
+  // slot's fence (fence only) and copies it, or forces the own slot; the
+  // unfenced every-4th copy is made only with the wait at 0. Non-exempt keys
+  // never get here and keep the some cadence unchanged.
+  ReadbackSteadyDelivery steady_delivery = ReadbackSteadyDelivery::kNone;
+  ReadbackSteadyOutcome steady_outcome;
+  uint64_t steady_wait_us = 0;
   if (diag.sync_rules.steady_exempt && plan_input.mode == ReadbackPlanMode::kSome &&
       REXCVAR_GET(d3d12_readback_sync_steady_fast)) {
     plan_input.steady_fast = true;
@@ -4599,10 +4661,36 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       uint64_t polled = submission_fence_->GetCompletedValue();
       completed = polled > completed ? polled : completed;
     }
-    plan_input.previous_slot_complete =
-        plan_input.previous_slot_usable && rb.written_size[previous_index] == written_length &&
-        ClassifyReadbackPreviousSlot(rb.slot_elided[previous_index], previous_submission,
-                                     completed) == ReadbackPreviousSlot::kComplete;
+    ReadbackSteadyInput steady_input;
+    steady_input.steady_fast = true;
+    steady_input.own = !plan_input.previous_slot_usable || plan_input.force_unless_miss;
+    steady_input.previous = ClassifyReadbackPreviousSlot(rb.slot_elided[previous_index],
+                                                         previous_submission, completed);
+    steady_input.length_ok = rb.written_size[previous_index] == written_length;
+    steady_input.previous_submitted = previous_submission < submission_current_;
+    steady_input.wait_ms =
+        uint32_t(std::max(REXCVAR_GET(d3d12_readback_sync_steady_fast_wait_ms), int32_t(0)));
+    steady_delivery = PlanReadbackSteadyDelivery(steady_input);
+    bool wait_completed = false;
+    if (steady_delivery == ReadbackSteadyDelivery::kWait) {
+      rex::perf::ScopedPerfRegion perf_wait(perf_split_active_,
+                                            rex::perf::PerfRegion::kReadbackWait);
+      wait_completed =
+          AwaitReadbackSubmissionBounded(previous_submission, steady_input.wait_ms, steady_wait_us);
+      readback_counters_.readback_wait_ns += steady_wait_us * 1000;
+    }
+    steady_outcome = ResolveReadbackSteadyDelivery(steady_delivery, wait_completed);
+    if (diag.processor) {
+      diag.steady_delivery = ReadbackSteadyDeliveryName(steady_delivery);
+      diag.steady_wait_timed_out = steady_outcome.wait_timed_out;
+      diag.steady_wait_us = steady_wait_us;
+    }
+    plan_input.previous_slot_complete = steady_outcome.previous_slot_complete;
+    if (steady_outcome.force) {
+      // The pre-exemption behaviour: the forced path below waits for the own
+      // copy (targeted) and reads the own slot; counted as rule c.
+      plan_input.force_unless_miss = true;
+    }
   }
   ReadbackSlotState slot_state;
   slot_state.current_index = rb.current_index;
@@ -4849,9 +4937,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       sync_counters.CountSteadyFilter(steady_filter);
       if (diag.sync_rules.steady_exempt) {
-        // Rule c alone on a steady key: not forced (plan.forced is false).
+        // Rule c alone on a steady key: not forced by the rules (plan.forced
+        // only after a steady fast wait timeout or an unwaitable slot).
         sync_counters.CountSteadyExempt(rb.steady_exempt_epoch != readback_sync_minute_epoch_);
         rb.steady_exempt_epoch = readback_sync_minute_epoch_;
+      }
+      if (steady_delivery != ReadbackSteadyDelivery::kNone) {
+        bool unfenced_avoided =
+            NoteReadbackSteadyShadowCadence(rb.steady_shadow_since_copy, steady_delivery);
+        sync_counters.CountSteadyDelivery(steady_outcome.waited, steady_outcome.wait_timed_out,
+                                          steady_outcome.force, steady_outcome.skip,
+                                          unfenced_avoided, steady_wait_us, rb.steady_skip_run);
       }
       // Planned with the same inputs: ShouldForceReadbackSync and not a miss.
       if (plan.forced) {

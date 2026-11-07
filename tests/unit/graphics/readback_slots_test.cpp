@@ -666,4 +666,198 @@ TEST_CASE("Readback plan without steady fast is unchanged",
   }
 }
 
+// M11-007c: d3d12_readback_sync_steady_fast_wait_ms.
+TEST_CASE("Readback steady delivery decision", "[graphics][readback-slots][readback-steady]") {
+  ReadbackSteadyInput in;
+  in.steady_fast = true;
+  in.length_ok = true;
+  in.previous_submitted = true;
+  in.wait_ms = 20;
+  // Complete at the poll: fast (with or without a wait budget).
+  in.previous = ReadbackPreviousSlot::kComplete;
+  CHECK(PlanReadbackSteadyDelivery(in) == ReadbackSteadyDelivery::kFast);
+  ReadbackSteadyInput no_wait = in;
+  no_wait.wait_ms = 0;
+  CHECK(PlanReadbackSteadyDelivery(no_wait) == ReadbackSteadyDelivery::kFast);
+  // Written, submitted, not complete: wait (budget) or the l75 cadence (0).
+  in.previous = ReadbackPreviousSlot::kUnfenced;
+  CHECK(PlanReadbackSteadyDelivery(in) == ReadbackSteadyDelivery::kWait);
+  no_wait.previous = ReadbackPreviousSlot::kUnfenced;
+  CHECK(PlanReadbackSteadyDelivery(no_wait) == ReadbackSteadyDelivery::kCadence);
+  // Cannot be waited for without CP work, or holds nothing usable: force.
+  ReadbackSteadyInput open = in;
+  open.previous_submitted = false;
+  CHECK(PlanReadbackSteadyDelivery(open) == ReadbackSteadyDelivery::kForce);
+  ReadbackSteadyInput unwritten = in;
+  unwritten.previous = ReadbackPreviousSlot::kUnwritten;
+  CHECK(PlanReadbackSteadyDelivery(unwritten) == ReadbackSteadyDelivery::kForce);
+  ReadbackSteadyInput length = in;
+  length.length_ok = false;
+  CHECK(PlanReadbackSteadyDelivery(length) == ReadbackSteadyDelivery::kForce);
+  length.previous = ReadbackPreviousSlot::kComplete;
+  CHECK(PlanReadbackSteadyDelivery(length) == ReadbackSteadyDelivery::kForce);
+  // Not a steady fast resolve, or own slot anyway: unchanged.
+  ReadbackSteadyInput off = in;
+  off.steady_fast = false;
+  CHECK(PlanReadbackSteadyDelivery(off) == ReadbackSteadyDelivery::kNone);
+  ReadbackSteadyInput own = in;
+  own.own = true;
+  CHECK(PlanReadbackSteadyDelivery(own) == ReadbackSteadyDelivery::kNone);
+  CHECK(std::string(ReadbackSteadyDeliveryName(ReadbackSteadyDelivery::kWait)) == "wait");
+  CHECK(std::string(ReadbackSteadyDeliveryName(ReadbackSteadyDelivery::kCadence)) == "cadence");
+
+  // Outcomes.
+  ReadbackSteadyOutcome o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kFast, false);
+  CHECK(o.previous_slot_complete);
+  CHECK_FALSE(o.force);
+  CHECK_FALSE(o.waited);
+  CHECK_FALSE(o.skip);
+  o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kWait, true);
+  CHECK(o.previous_slot_complete);
+  CHECK_FALSE(o.force);
+  CHECK(o.waited);
+  CHECK_FALSE(o.wait_timed_out);
+  CHECK(o.skip);
+  o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kWait, false);
+  CHECK_FALSE(o.previous_slot_complete);
+  CHECK(o.force);
+  CHECK(o.waited);
+  CHECK(o.wait_timed_out);
+  o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kForce, false);
+  CHECK(o.force);
+  CHECK_FALSE(o.waited);
+  CHECK(o.skip);
+  o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kCadence, false);
+  CHECK_FALSE(o.force);
+  CHECK_FALSE(o.previous_slot_complete);
+  CHECK(o.skip);
+  o = ResolveReadbackSteadyDelivery(ReadbackSteadyDelivery::kNone, true);
+  CHECK_FALSE(o.force);
+  CHECK_FALSE(o.previous_slot_complete);
+  CHECK_FALSE(o.skip);
+}
+
+namespace {
+// The plan after the steady decision, as the command processor builds it.
+ReadbackPlan PlanSteady(const ReadbackSlotState& state, ReadbackSteadyDelivery delivery,
+                        bool wait_completed) {
+  ReadbackPlanInput in;
+  in.mode = ReadbackPlanMode::kSome;
+  in.previous_slot_usable = true;
+  in.elide_unread = true;
+  in.steady_fast = true;
+  ReadbackSteadyOutcome o = ResolveReadbackSteadyDelivery(delivery, wait_completed);
+  in.previous_slot_complete = o.previous_slot_complete;
+  in.force_unless_miss = o.force;
+  return PlanReadbackResolve(state, in);
+}
+}  // namespace
+
+TEST_CASE("Readback plan steady fast wait never reads an unfenced slot",
+          "[graphics][readback-slots][readback-steady]") {
+  for (uint32_t since = 0; since < kReadbackSlotsSomeInterval; ++since) {
+    INFO("resolves_since_copy " << since);
+    ReadbackSlotState state;
+    state.current_index = 1;
+    state.resolves_since_copy = since;
+    // Fast and wait-completed: the previous (fenced) slot, every resolve.
+    for (ReadbackSteadyDelivery d :
+         {ReadbackSteadyDelivery::kFast, ReadbackSteadyDelivery::kWait}) {
+      ReadbackPlan plan = PlanSteady(state, d, true);
+      CHECK(plan.steady_fast_copy);
+      CHECK_FALSE(plan.steady_fast_skipped);
+      CHECK(plan.copies_now);
+      CHECK(plan.read_index == 0);
+      CHECK_FALSE(plan.forced);
+      CHECK(plan.record_gpu);
+      CHECK(plan.next_resolves_since_copy == 0);
+    }
+    // Timeout and unwaitable: forced, own slot, copied now.
+    for (ReadbackSteadyDelivery d :
+         {ReadbackSteadyDelivery::kWait, ReadbackSteadyDelivery::kForce}) {
+      ReadbackPlan plan = PlanSteady(state, d, false);
+      CHECK(plan.forced);
+      CHECK(plan.own_slot());
+      CHECK(plan.read_index == 1);
+      CHECK(plan.copies_now);
+      CHECK(plan.record_gpu);
+      CHECK_FALSE(plan.steady_fast_copy);
+      CHECK_FALSE(plan.steady_fast_skipped);
+      CHECK(plan.next_resolves_since_copy == 0);
+    }
+    // wait_ms 0: the l75 cadence (previous slot every 4th resolve).
+    ReadbackPlan cadence = PlanSteady(state, ReadbackSteadyDelivery::kCadence, false);
+    CHECK(cadence.steady_fast_skipped);
+    CHECK(cadence.copies_now == (since + 1 >= kReadbackSlotsSomeInterval));
+    CHECK(cadence.read_index == 0);
+    CHECK_FALSE(cadence.forced);
+  }
+}
+
+TEST_CASE("Readback plan of a non-exempt key ignores the steady wait",
+          "[graphics][readback-slots][readback-steady]") {
+  // steady_fast off (non-exempt key): the steady decision is kNone and the
+  // plan is the plain some cadence, bit for bit.
+  for (uint32_t bits = 0; bits < 64; ++bits) {
+    ReadbackSlotState state;
+    state.current_index = bits & 1;
+    state.resolves_since_copy = (bits >> 1) & 3;
+    state.slot_elided[0] = (bits >> 3) & 1;
+    state.slot_elided[1] = (bits >> 4) & 1;
+    ReadbackPlanInput in;
+    in.mode = ReadbackPlanMode::kSome;
+    in.previous_slot_usable = (bits >> 5) & 1;
+    in.elide_unread = true;
+    ReadbackSteadyInput steady;
+    steady.steady_fast = false;
+    steady.previous = ReadbackPreviousSlot::kUnfenced;
+    steady.length_ok = true;
+    steady.previous_submitted = true;
+    steady.wait_ms = 20;
+    ReadbackSteadyDelivery d = PlanReadbackSteadyDelivery(steady);
+    REQUIRE(d == ReadbackSteadyDelivery::kNone);
+    ReadbackSteadyOutcome o = ResolveReadbackSteadyDelivery(d, false);
+    ReadbackPlanInput with = in;
+    with.previous_slot_complete = o.previous_slot_complete;
+    with.force_unless_miss = o.force;
+    ReadbackPlan a = PlanReadbackResolve(state, in);
+    ReadbackPlan b = PlanReadbackResolve(state, with);
+    INFO("bits " << bits);
+    CHECK(a.read_index == b.read_index);
+    CHECK(a.copies_now == b.copies_now);
+    CHECK(a.record_gpu == b.record_gpu);
+    CHECK(a.forced == b.forced);
+    CHECK(a.miss == b.miss);
+    CHECK(a.guard_miss == b.guard_miss);
+    CHECK(a.next_resolves_since_copy == b.next_resolves_since_copy);
+  }
+}
+
+TEST_CASE("Readback steady shadow cadence counts avoided unfenced copies",
+          "[graphics][readback-slots][readback-steady]") {
+  uint32_t shadow = 0;
+  // Three skips, the fourth would have been the l75 unfenced copy.
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kWait));
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kForce));
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kWait));
+  CHECK(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kWait));
+  CHECK(shadow == 0);
+  // A fast copy resets the cadence.
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kWait));
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kFast));
+  CHECK(shadow == 0);
+  for (int i = 0; i < 3; ++i) {
+    CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kWait));
+  }
+  CHECK(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kForce));
+  // The l75 cadence itself makes the copy: not avoided.
+  for (int i = 0; i < 3; ++i) {
+    CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kCadence));
+  }
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kCadence));
+  CHECK(shadow == 0);
+  CHECK_FALSE(NoteReadbackSteadyShadowCadence(shadow, ReadbackSteadyDelivery::kNone));
+  CHECK(shadow == 0);
+}
+
 }  // namespace rex::graphics::test
