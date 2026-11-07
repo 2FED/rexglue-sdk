@@ -510,7 +510,7 @@ TEST_CASE("Read-back sync steady end reasons", "[graphics][readback-sync][readba
   ReadbackSyncRules b = c_only;
   b.sporadic = true;
   CHECK(std::string(ReadbackSyncSteadyEndReason(true, b, 50)) == "rule_b");
-  CHECK(std::string(ReadbackSyncSteadyEndReason(true, ReadbackSyncRules(), 50)) == "shape");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, ReadbackSyncRules(), 50)) == "not_c");
 }
 
 TEST_CASE("Read-back sync steady counters and report",
@@ -663,6 +663,320 @@ TEST_CASE("F10 marks request a flight-recorder dump even with the split off",
   rex::perf::RequestDiagFlightDump("x y");
   REQUIRE(rex::perf::TakeDiagFlightDump(reason));
   CHECK(reason == "x_y");
+}
+
+// M11-007b: sticky, shape and cap filters.
+
+namespace {
+
+struct ShapeEntry {
+  bool shape_known = true;
+  ReadbackSyncKeyShape shape;
+};
+using ShapeKeys = std::unordered_map<uint64_t, ShapeEntry>;
+
+ReadbackSyncKeyShape Shape(uint32_t address, uint32_t size, uint32_t format = 6,
+                           uint32_t src_base = 0) {
+  ReadbackSyncKeyShape s;
+  s.address = address;
+  s.width = size;
+  s.height = size;
+  s.length = size * size * 4;
+  s.dest_format = format;
+  s.source_edram_base = src_base;
+  return s;
+}
+
+void AddShape(ShapeKeys& keys, const ReadbackSyncKeyShape& s) {
+  keys[Key(s.address, s.length)].shape = s;
+}
+
+}  // namespace
+
+TEST_CASE("Read-back sync steady chain neighbour", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncKeyShape k256 = Shape(0x039CA000, 256);
+  REQUIRE(k256.length == 0x40000);
+  // The key itself.
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, k256));
+  // The next smaller level after the key.
+  CHECK(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x40000, 128)));
+  // The next larger level before the key (512x512 = 1 MB ending at it).
+  CHECK(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 - 0x100000, 512)));
+  // A half-size key ending at the key is not a level of its chain.
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039BA000, 128)));
+  // A double-size key starting right after it is not either.
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x40000, 512)));
+  // Adjacent same-size keys are not levels.
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x40000, 256)));
+  // Another format or EDRAM source base does not count for adjacency.
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x40000, 128, 2)));
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x40000, 128, 6, 224)));
+  // Overlap of the same format counts whatever the source base and size; of
+  // another format it does not.
+  CHECK(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000, 1024, 6, 224)));
+  CHECK(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000 + 0x3F000, 64)));
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, Shape(0x039CA000, 1024, 2)));
+  // Not square (width only halved): not a level.
+  ReadbackSyncKeyShape wide = Shape(0x039CA000 + 0x40000, 128);
+  wide.height = 256;
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(k256, wide));
+  // Address arithmetic does not wrap at the top of the address space.
+  ReadbackSyncKeyShape top = Shape(0xFFFC0000, 256);
+  CHECK_FALSE(IsReadbackSyncChainNeighbour(top, Shape(0x00000000, 128)));
+}
+
+TEST_CASE("Read-back sync steady shape filter on the l74 key sets",
+          "[graphics][readback-sync][readback-steady]") {
+  // Race-time keys: the steady 256x256 start-of-frame resolve at 039CA000,
+  // the 128x128 key ending exactly at it, and the round-robin k_8 tiles
+  // from EDRAM base 224.
+  ShapeKeys race;
+  ReadbackSyncKeyShape steady = Shape(0x039CA000, 256);
+  AddShape(race, steady);
+  AddShape(race, Shape(0x039BA000, 128));
+  ReadbackSyncKeyShape tile128 = Shape(0x03A0A000, 128, 2, 224);
+  tile128.length = 128 * 128;
+  AddShape(race, tile128);
+  ReadbackSyncKeyShape tile256 = Shape(0x03A0E000, 256, 2, 224);
+  tile256.length = 256 * 256;
+  AddShape(race, tile256);
+  CHECK_FALSE(HasReadbackSyncChainNeighbour(steady, race));
+
+  // The pre-race showcase adds the player-car livery chain (512 at +0, 256
+  // at +1 MB, 128 at +1.25 MB, 64 at +1.31 MB): none of its levels may be
+  // exempt, and 039CA000 stays exempt.
+  ShapeKeys showcase = race;
+  const ReadbackSyncKeyShape chain[] = {Shape(0x05368000, 512), Shape(0x05468000, 256),
+                                        Shape(0x054A8000, 128), Shape(0x054B8000, 64)};
+  REQUIRE(chain[0].address + chain[0].length == chain[1].address);
+  REQUIRE(chain[1].address + chain[1].length == chain[2].address);
+  REQUIRE(chain[2].address + chain[2].length == chain[3].address);
+  for (const ReadbackSyncKeyShape& level : chain) {
+    AddShape(showcase, level);
+  }
+  CHECK_FALSE(HasReadbackSyncChainNeighbour(steady, showcase));
+  for (const ReadbackSyncKeyShape& level : chain) {
+    INFO("level " << level.width);
+    CHECK(HasReadbackSyncChainNeighbour(level, showcase));
+  }
+  // The 1024 level at the same base alone (other levels evicted) also keeps
+  // the 512 level out (overlap).
+  ShapeKeys overlap;
+  AddShape(overlap, Shape(0x05368000, 1024));
+  AddShape(overlap, chain[0]);
+  CHECK(HasReadbackSyncChainNeighbour(chain[0], overlap));
+  // An entry whose shape is not known is ignored.
+  ShapeKeys unknown;
+  AddShape(unknown, chain[1]);
+  unknown.begin()->second.shape_known = false;
+  CHECK_FALSE(HasReadbackSyncChainNeighbour(chain[0], unknown));
+  // A lone 256x256 fmt 6 key is not refused by the shape filter: the
+  // allowlist of the size alone would not separate it from the chain's 256
+  // level, the neighbours do.
+  ShapeKeys lone;
+  AddShape(lone, chain[1]);
+  CHECK_FALSE(HasReadbackSyncChainNeighbour(chain[1], lone));
+}
+
+TEST_CASE("Read-back sync steady sticky set", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncStickySet sticky;
+  ReadbackSyncStickyKey k512 = MakeReadbackSyncStickyKey(Shape(0x05368000, 512));
+  ReadbackSyncStickyKey k256 = MakeReadbackSyncStickyKey(Shape(0x039CA000, 256));
+  CHECK_FALSE(sticky.Excludes(k512));
+  sticky.Note(k512);
+  sticky.Note(k512);
+  CHECK(sticky.size() == 1);
+  CHECK(sticky.Excludes(k512));
+  CHECK_FALSE(sticky.Excludes(k256));
+  // The identity includes format and size.
+  ReadbackSyncStickyKey other_format = k512;
+  other_format.dest_format = 2;
+  CHECK_FALSE(sticky.Excludes(other_format));
+  ReadbackSyncStickyKey other_size = k512;
+  other_size.width = 256;
+  CHECK_FALSE(sticky.Excludes(other_size));
+  sticky.Clear();
+  CHECK_FALSE(sticky.Excludes(k512));
+  // Saturation excludes every key.
+  for (uint32_t i = 0; i < kReadbackSyncStickyMaxKeys; ++i) {
+    sticky.Note(ReadbackSyncStickyKey{i << 12, 0x1000, 32, 32, 6});
+  }
+  CHECK_FALSE(sticky.saturated());
+  CHECK_FALSE(sticky.Excludes(k256));
+  sticky.Note(k512);
+  CHECK(sticky.saturated());
+  CHECK(sticky.Excludes(k256));
+  sticky.Clear();
+  CHECK_FALSE(sticky.saturated());
+  CHECK(sticky.size() == 0);
+}
+
+TEST_CASE("Read-back sync steady sticky rule on a frame sequence",
+          "[graphics][readback-sync][readback-steady]") {
+  // A livery-like key: one sporadic (rule b) resolve, then a 40-frame run of
+  // rule c alone. Without sticky it would be exempt from its 30th frame;
+  // with sticky it never is. The steady key next to it is unaffected.
+  ReadbackSyncStickySet sticky;
+  ReadbackSyncSteadyCap cap;
+  ShapeKeys none;
+  ReadbackSyncKeyShape livery = Shape(0x05468000, 256);
+  ReadbackSyncKeyShape steady = Shape(0x039CA000, 256);
+  const uint64_t livery_key = Key(livery.address, livery.length);
+  const uint64_t steady_key = Key(steady.address, steady.length);
+  LiveKeys live;
+  live[livery_key].last_used_frame = 100;
+  ReadbackSyncResolve r = Composite(256, livery.address, livery.length);
+  r.key_live = true;
+  r.previous_frame = 100;
+  r.frame = 120;
+  ReadbackSyncRules rules = EvaluateReadbackSyncRules(r, ReadbackSyncScope::kComposite, live, 0);
+  REQUIRE(rules.sporadic);
+  if (rules.shared_range || rules.sporadic) {
+    sticky.Note(MakeReadbackSyncStickyKey(livery));
+  }
+  ReadbackSyncRules c_only;
+  c_only.composite_shape = true;
+  auto filter = [&](const ReadbackSyncKeyShape& s, uint64_t key, uint32_t run, uint64_t frame) {
+    bool candidate = IsReadbackSyncSteadyExempt(c_only, run);
+    return FilterReadbackSyncSteady(
+        candidate, candidate && sticky.Excludes(MakeReadbackSyncStickyKey(s)),
+        [&]() { return HasReadbackSyncChainNeighbour(s, none); }, cap, frame, key, nullptr);
+  };
+  for (uint32_t run = 1; run <= 40; ++run) {
+    uint64_t frame = 120 + run;
+    INFO("run " << run);
+    ReadbackSyncSteadyFilter f = filter(livery, livery_key, run, frame);
+    CHECK(f ==
+          (run < 30 ? ReadbackSyncSteadyFilter::kNotCandidate : ReadbackSyncSteadyFilter::kSticky));
+  }
+  // A different key in a later frame: exempt (the sticky livery resolves
+  // never reached the cap).
+  CHECK(filter(steady, steady_key, 30, 161) == ReadbackSyncSteadyFilter::kExempt);
+  ReadbackSyncCounters c;
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kSticky);
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kShape);
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kShape);
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kCap);
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kExempt);
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kNotCandidate);
+  CHECK(c.steady_sticky_excluded == 1);
+  CHECK(c.steady_shape_excluded == 2);
+  CHECK(c.steady_cap_skipped == 1);
+}
+
+TEST_CASE("Read-back sync steady filter order", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncSteadyCap cap;
+  int chain_checks = 0;
+  auto chain = [&](bool result) {
+    return [&chain_checks, result]() {
+      ++chain_checks;
+      return result;
+    };
+  };
+  CHECK(FilterReadbackSyncSteady(false, true, chain(true), cap, 1, 1, nullptr) ==
+        ReadbackSyncSteadyFilter::kNotCandidate);
+  CHECK(FilterReadbackSyncSteady(true, true, chain(true), cap, 1, 1, nullptr) ==
+        ReadbackSyncSteadyFilter::kSticky);
+  CHECK(chain_checks == 0);
+  CHECK(FilterReadbackSyncSteady(true, false, chain(true), cap, 1, 1, nullptr) ==
+        ReadbackSyncSteadyFilter::kShape);
+  CHECK(chain_checks == 1);
+  // Refused candidates never reach the cap.
+  CHECK_FALSE(cap.has_frame);
+  ReadbackSyncSteadyCap::Result result;
+  CHECK(FilterReadbackSyncSteady(true, false, chain(false), cap, 1, 1, &result) ==
+        ReadbackSyncSteadyFilter::kExempt);
+  CHECK(result.allowed);
+  CHECK(result.keys == 1);
+}
+
+TEST_CASE("Read-back sync steady single-key cap", "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncSteadyCap cap;
+  const uint64_t a = Key(0x039CA000, 0x40000);
+  const uint64_t b = Key(0x05468000, 0x40000);
+  // One key per frame: always allowed (also twice in one frame).
+  for (uint64_t frame = 10; frame < 20; ++frame) {
+    CHECK(cap.Admit(frame, a).allowed);
+    CHECK(cap.Admit(frame, a).allowed);
+  }
+  // A second key in frame 20: A's first resolve was already allowed, B and
+  // every later resolve of either key in this frame are refused; the episode
+  // starts once.
+  CHECK(cap.Admit(20, a).allowed);
+  ReadbackSyncSteadyCap::Result r = cap.Admit(20, b);
+  CHECK_FALSE(r.allowed);
+  CHECK(r.episode_started);
+  CHECK(r.keys == 2);
+  r = cap.Admit(20, a);
+  CHECK_FALSE(r.allowed);
+  CHECK_FALSE(r.episode_started);
+  // Frame 21 follows a frame with two keys: refused from its first resolve.
+  r = cap.Admit(21, a);
+  CHECK_FALSE(r.allowed);
+  CHECK_FALSE(r.episode_started);
+  CHECK_FALSE(cap.Admit(21, b).allowed);
+  // B stops after frame 21: frame 22 still follows a two-key frame.
+  CHECK_FALSE(cap.Admit(22, a).allowed);
+  // Frame 23 follows a one-key frame: allowed again, the episode ended.
+  CHECK(cap.Admit(23, a).allowed);
+  CHECK_FALSE(cap.episode);
+  // A new episode is reported again.
+  r = cap.Admit(24, b);
+  CHECK(r.allowed);
+  r = cap.Admit(24, a);
+  CHECK_FALSE(r.allowed);
+  CHECK(r.episode_started);
+  // A gap of frames resets the previous-frame count and the episode.
+  r = cap.Admit(40, a);
+  CHECK(r.allowed);
+  CHECK_FALSE(cap.episode);
+  r = cap.Admit(40, b);
+  CHECK_FALSE(r.allowed);
+  CHECK(r.episode_started);
+  cap.Reset();
+  CHECK_FALSE(cap.has_frame);
+  CHECK(cap.Admit(41, b).allowed);
+}
+
+TEST_CASE("Read-back sync steady filter end reasons and fields",
+          "[graphics][readback-sync][readback-steady]") {
+  ReadbackSyncRules c_only;
+  c_only.composite_shape = true;
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, ReadbackSyncRules(), 50)) == "not_c");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 50,
+                                                ReadbackSyncSteadyFilter::kSticky)) == "sticky");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 50,
+                                                ReadbackSyncSteadyFilter::kShape)) == "shape");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 50,
+                                                ReadbackSyncSteadyFilter::kCap)) == "cap");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(
+            true, c_only, 50, ReadbackSyncSteadyFilter::kNotCandidate)) == "none");
+  // The rule reasons come first.
+  ReadbackSyncRules b = c_only;
+  b.sporadic = true;
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, b, 50, ReadbackSyncSteadyFilter::kCap)) ==
+        "rule_b");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(true, c_only, 3,
+                                                ReadbackSyncSteadyFilter::kNotCandidate)) == "gap");
+  CHECK(std::string(ReadbackSyncSteadyEndReason(
+            false, c_only, 50, ReadbackSyncSteadyFilter::kNotCandidate)) == "disabled");
+
+  ReadbackSyncCounters c;
+  // Off and nothing counted: the minute line is unchanged.
+  CHECK(ReadbackSyncSteadyFilterReport(c, false, true).empty());
+  CHECK(ReadbackSyncSteadyFilterReport(c, true, true) ==
+        " steady_fast=1 steady_sticky_excluded=0 steady_shape_excluded=0 steady_cap_skipped=0 "
+        "steady_fast_copies=0 steady_fast_kb=0 steady_fast_skipped=0");
+  c.CountSteadyFilter(ReadbackSyncSteadyFilter::kShape);
+  c.steady_fast_copies = 3;
+  c.steady_fast_bytes = 3 * 0x40000;
+  c.steady_fast_skipped = 1;
+  CHECK(ReadbackSyncSteadyFilterReport(c, false, false) ==
+        " steady_fast=0 steady_sticky_excluded=0 steady_shape_excluded=1 steady_cap_skipped=0 "
+        "steady_fast_copies=3 steady_fast_kb=768 steady_fast_skipped=1");
+  CHECK(FormatReadbackSyncSteadyCapLine(1433, 7, 0x05468000, 0x40000, 2, 0) ==
+        "kind=steady_cap event=start frame=1433 draw=7 base=05468000 len=262144 keys=2 "
+        "suppressed=0");
 }
 
 }  // namespace rex::graphics::test

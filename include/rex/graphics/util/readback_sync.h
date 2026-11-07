@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
@@ -236,9 +238,263 @@ inline const char* ReadbackSyncSteadyEndReason(bool enabled, const ReadbackSyncR
     return "rule_b";
   }
   if (!rules.composite_shape) {
-    return "shape";
+    return "not_c";
   }
   return run < kReadbackSyncSteadyMinFrames ? "gap" : "none";
+}
+
+// d3d12_readback_sync_steady_exempt filters (M11-007b). The l74 PC A/B showed
+// that the player-car livery composite (a 512..64 k_8_8_8_8 mip chain laid
+// out back to back after its 1024 level, a CPU-read composite) is resolved
+// in every frame for 30-80+ frames in the pre-race showcase, so the run
+// alone exempted it. A candidate (IsReadbackSyncSteadyExempt) is therefore
+// exempt only if, in this order:
+// - sticky: its key never matched rule a or rule b in this session (the
+//   identity is address, length, format and size; the set is cleared only
+//   when the read-back cache is torn down with the device);
+// - shape: it has no mip-chain neighbour among the live read-back keys
+//   (IsReadbackSyncChainNeighbour);
+// - cap: no other key was a candidate that passed the two filters above in
+//   this frame or in the previous frame (ReadbackSyncSteadyCap).
+// Each refusal leaves the resolve forced by rule c, as without the switch.
+
+// The shape of a read-back key as the filters see it (its last resolve).
+struct ReadbackSyncKeyShape {
+  uint32_t address = 0;
+  uint32_t length = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t dest_format = 0;
+  uint32_t source_edram_base = 0;
+};
+
+// Whether `other` is a mip-chain neighbour of `key`. Only keys of the same
+// destination format count. A neighbour is
+// - any other key whose range overlaps the key's range (a larger level whose
+//   chain starts at the same address: the 1024 + 512 livery layout), or,
+//   with the same EDRAM source base,
+// - the next SMALLER level after the key: it starts exactly at
+//   key.address + key.length with half the width and half the height, or
+// - the next LARGER level before the key: it ends exactly at key.address
+//   with twice the width and twice the height.
+// A chain is laid out from the largest level down (each level follows the
+// previous, larger one), so a half-size key that ENDS at the key's address
+// is not a level of the key's chain: in a chain the level before a 256x256
+// level is 512x512. The symmetric definition ("half size and adjacent")
+// would make the unrelated 128x128 key at 039BA000, which ends exactly at
+// the steady 256x256 per-frame key at 039CA000 (PC l74), a neighbour and
+// remove the whole gain; with the direction 039CA000 stays exempt, while
+// every level of the livery chain 05368000 512x512 -> 05468000 256x256 ->
+// 054A8000 128x128 -> 054B8000 64x64 has a neighbour (the next smaller level
+// after it, the next larger one before it, or both) and is never exempt.
+inline bool IsReadbackSyncChainNeighbour(const ReadbackSyncKeyShape& key,
+                                         const ReadbackSyncKeyShape& other) {
+  if (other.dest_format != key.dest_format) {
+    return false;
+  }
+  if (other.address == key.address && other.length == key.length) {
+    // The key itself.
+    return false;
+  }
+  if (GuestRangesOverlap(key.address, key.length, other.address, other.length)) {
+    return true;
+  }
+  if (other.source_edram_base != key.source_edram_base) {
+    return false;
+  }
+  uint64_t key_end = uint64_t(key.address) + key.length;
+  if (uint64_t(other.address) == key_end && uint64_t(other.width) * 2 == key.width &&
+      uint64_t(other.height) * 2 == key.height) {
+    return true;
+  }
+  uint64_t other_end = uint64_t(other.address) + other.length;
+  return other_end == key.address && other.width == uint64_t(key.width) * 2 &&
+         other.height == uint64_t(key.height) * 2;
+}
+
+// The shape filter over the known keys: `keys` iterates (key, entry) pairs
+// whose entry has `shape_known` and `shape` (ReadbackSyncKeyShape).
+template <typename Keys>
+bool HasReadbackSyncChainNeighbour(const ReadbackSyncKeyShape& key, const Keys& keys) {
+  for (const auto& entry : keys) {
+    if (entry.second.shape_known && IsReadbackSyncChainNeighbour(key, entry.second.shape)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Sticky identity of a key (address, length, format, size).
+struct ReadbackSyncStickyKey {
+  uint32_t address = 0;
+  uint32_t length = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t dest_format = 0;
+
+  bool operator==(const ReadbackSyncStickyKey&) const = default;
+};
+
+struct ReadbackSyncStickyKeyHash {
+  size_t operator()(const ReadbackSyncStickyKey& k) const {
+    uint64_t h = (uint64_t(k.address) << 32) | k.length;
+    h ^= (uint64_t(k.width) << 40) ^ (uint64_t(k.height) << 20) ^ uint64_t(k.dest_format);
+    h *= 0x9E3779B97F4A7C15ull;
+    return size_t(h ^ (h >> 29));
+  }
+};
+
+inline ReadbackSyncStickyKey MakeReadbackSyncStickyKey(const ReadbackSyncKeyShape& s) {
+  return ReadbackSyncStickyKey{s.address, s.length, s.width, s.height, s.dest_format};
+}
+
+// Keys that ever matched rule a or rule b. Bounded: a key that would grow it
+// past kReadbackSyncStickyMaxKeys saturates it, and a saturated set excludes
+// every key (no exemption at all is the conservative side).
+constexpr size_t kReadbackSyncStickyMaxKeys = 4096;
+
+class ReadbackSyncStickySet {
+ public:
+  // Records a resolve whose rules matched a or b.
+  void Note(const ReadbackSyncStickyKey& key) {
+    if (saturated_ || keys_.count(key)) {
+      return;
+    }
+    if (keys_.size() >= kReadbackSyncStickyMaxKeys) {
+      saturated_ = true;
+      return;
+    }
+    keys_.insert(key);
+  }
+  bool Excludes(const ReadbackSyncStickyKey& key) const {
+    return saturated_ || keys_.count(key) != 0;
+  }
+  void Clear() {
+    keys_.clear();
+    saturated_ = false;
+  }
+  size_t size() const { return keys_.size(); }
+  bool saturated() const { return saturated_; }
+
+ private:
+  std::unordered_set<ReadbackSyncStickyKey, ReadbackSyncStickyKeyHash> keys_;
+  bool saturated_ = false;
+};
+
+// Single-key cap. Admit is called for every candidate resolve that passed
+// the sticky and shape filters; it allows the exemption only while at most
+// one distinct key was such a candidate in this frame and in the previous
+// frame. The decision is made per resolve, so when a second key appears
+// mid-frame the first key's earlier resolves of that frame stay exempt;
+// every later resolve of either key is refused until a frame that follows a
+// frame with at most one key sees only one key again. An episode is a run of
+// refusals; `episode_started` is set on its first refusal.
+struct ReadbackSyncSteadyCap {
+  struct Result {
+    bool allowed = true;
+    bool episode_started = false;
+    // Distinct candidate keys (2 = more than one) in this or the previous
+    // frame, whichever is larger.
+    uint32_t keys = 0;
+  };
+
+  bool has_frame = false;
+  uint64_t frame = 0;
+  uint64_t first_key = 0;
+  // Distinct candidate keys in `frame` (saturates at 2) and in the frame
+  // before it (0 after a gap).
+  uint32_t keys = 0;
+  uint32_t previous_keys = 0;
+  bool episode = false;
+
+  Result Admit(uint64_t frame_now, uint64_t key) {
+    if (!has_frame || frame_now != frame) {
+      previous_keys = (has_frame && frame + 1 == frame_now) ? keys : 0;
+      if (previous_keys <= 1) {
+        episode = false;
+      }
+      has_frame = true;
+      frame = frame_now;
+      keys = 0;
+    }
+    if (!keys) {
+      keys = 1;
+      first_key = key;
+    } else if (key != first_key) {
+      keys = 2;
+    }
+    Result result;
+    result.keys = keys > previous_keys ? keys : previous_keys;
+    if (keys <= 1 && previous_keys <= 1) {
+      episode = false;
+      return result;
+    }
+    result.allowed = false;
+    result.episode_started = !episode;
+    episode = true;
+    return result;
+  }
+
+  void Reset() { *this = ReadbackSyncSteadyCap(); }
+};
+
+// The filter decision for one evaluated resolve.
+enum class ReadbackSyncSteadyFilter : uint32_t {
+  // Not a candidate (rules or run), or the switch is off.
+  kNotCandidate,
+  kExempt,
+  kSticky,
+  kShape,
+  kCap,
+};
+
+inline const char* ReadbackSyncSteadyFilterReason(ReadbackSyncSteadyFilter f) {
+  switch (f) {
+    case ReadbackSyncSteadyFilter::kSticky:
+      return "sticky";
+    case ReadbackSyncSteadyFilter::kShape:
+      return "shape";
+    case ReadbackSyncSteadyFilter::kCap:
+      return "cap";
+    default:
+      return "none";
+  }
+}
+
+// The filters in order for a candidate; `has_chain_neighbour` and `cap` are
+// evaluated only when needed (the cap sees only resolves that passed the
+// sticky and shape filters).
+template <typename ChainCheck>
+ReadbackSyncSteadyFilter FilterReadbackSyncSteady(bool candidate, bool sticky,
+                                                  ChainCheck&& has_chain_neighbour,
+                                                  ReadbackSyncSteadyCap& cap, uint64_t frame,
+                                                  uint64_t key,
+                                                  ReadbackSyncSteadyCap::Result* cap_result) {
+  if (!candidate) {
+    return ReadbackSyncSteadyFilter::kNotCandidate;
+  }
+  if (sticky) {
+    return ReadbackSyncSteadyFilter::kSticky;
+  }
+  if (has_chain_neighbour()) {
+    return ReadbackSyncSteadyFilter::kShape;
+  }
+  ReadbackSyncSteadyCap::Result r = cap.Admit(frame, key);
+  if (cap_result) {
+    *cap_result = r;
+  }
+  return r.allowed ? ReadbackSyncSteadyFilter::kExempt : ReadbackSyncSteadyFilter::kCap;
+}
+
+// End reason of a key that was exempt: the rule reasons first, then the
+// filter that refused it.
+inline const char* ReadbackSyncSteadyEndReason(bool enabled, const ReadbackSyncRules& rules,
+                                               uint32_t run, ReadbackSyncSteadyFilter filter) {
+  const char* reason = ReadbackSyncSteadyEndReason(enabled, rules, run);
+  if (std::string_view(reason) != "none") {
+    return reason;
+  }
+  return ReadbackSyncSteadyFilterReason(filter);
 }
 
 // One kind=steady_key line (the MCLA_READBACK_SYNC v=1 prefix is added by the
@@ -434,6 +690,29 @@ struct ReadbackSyncCounters {
   uint64_t steady_exempt_keys = 0;
   uint32_t steady_max_run = 0;
 
+  // d3d12_readback_sync_steady_exempt filters (M11-007b): candidates
+  // refused by the sticky, shape and cap filters; and with
+  // d3d12_readback_sync_steady_fast, exempt resolves copied from the
+  // complete previous slot (and their bytes), and exempt resolves whose
+  // previous slot was not known complete (kept the some cadence).
+  uint64_t steady_sticky_excluded = 0;
+  uint64_t steady_shape_excluded = 0;
+  uint64_t steady_cap_skipped = 0;
+  uint64_t steady_fast_copies = 0;
+  uint64_t steady_fast_bytes = 0;
+  uint64_t steady_fast_skipped = 0;
+
+  void CountSteadyFilter(ReadbackSyncSteadyFilter filter) {
+    steady_sticky_excluded += filter == ReadbackSyncSteadyFilter::kSticky ? 1 : 0;
+    steady_shape_excluded += filter == ReadbackSyncSteadyFilter::kShape ? 1 : 0;
+    steady_cap_skipped += filter == ReadbackSyncSteadyFilter::kCap ? 1 : 0;
+  }
+
+  bool SteadyFilterCounted() const {
+    return steady_sticky_excluded || steady_shape_excluded || steady_cap_skipped ||
+           steady_fast_copies || steady_fast_skipped;
+  }
+
   void CountSteadyRun(uint32_t run) {
     steady_max_run = run > steady_max_run ? run : steady_max_run;
   }
@@ -469,6 +748,30 @@ inline std::string ReadbackSyncSteadyReport(const ReadbackSyncCounters& c, bool 
       "steady_max_run={}",
       int(enabled), kReadbackSyncSteadyMinFrames, c.steady_exempt, c.steady_exempt_keys,
       c.steady_max_run);
+}
+
+// The M11-007b fields appended after ReadbackSyncSteadyReport: empty while
+// the exemption is off and none of them counted (the line is unchanged then).
+inline std::string ReadbackSyncSteadyFilterReport(const ReadbackSyncCounters& c, bool enabled,
+                                                  bool fast_enabled) {
+  if (!enabled && !c.SteadyFilterCounted()) {
+    return std::string();
+  }
+  return fmt::format(
+      " steady_fast={} steady_sticky_excluded={} steady_shape_excluded={} steady_cap_skipped={} "
+      "steady_fast_copies={} steady_fast_kb={} steady_fast_skipped={}",
+      int(fast_enabled), c.steady_sticky_excluded, c.steady_shape_excluded, c.steady_cap_skipped,
+      c.steady_fast_copies, c.steady_fast_bytes / 1024, c.steady_fast_skipped);
+}
+
+// One kind=steady_cap line (prefix added by the caller): the first refusal
+// of a cap episode.
+inline std::string FormatReadbackSyncSteadyCapLine(uint64_t frame, uint32_t draw, uint32_t address,
+                                                   uint32_t length, uint32_t keys,
+                                                   uint64_t suppressed) {
+  return fmt::format(
+      "kind=steady_cap event=start frame={} draw={} base={:08X} len={} keys={} suppressed={}",
+      frame, draw, address, length, keys, suppressed);
 }
 
 }  // namespace rex::graphics

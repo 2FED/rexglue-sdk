@@ -91,6 +91,14 @@ struct ReadbackPlanInput {
   bool force_unless_miss = false;
   // d3d12_readback_elide_unread.
   bool elide_unread = false;
+  // d3d12_readback_sync_steady_fast (some mode, readback_sync.h): this
+  // resolve is steady-exempt and gets a guest copy from the previous slot
+  // whenever that slot is known complete (previous_slot_complete: written,
+  // not elided, its submission fence passed), instead of every 4th resolve;
+  // its own GPU copy is never elided. Ignored by full and fast, and for a
+  // miss or a forced resolve (they read their own slot anyway).
+  bool steady_fast = false;
+  bool previous_slot_complete = false;
 };
 
 struct ReadbackPlan {
@@ -111,6 +119,10 @@ struct ReadbackPlan {
   bool record_gpu = true;
   // resolves_since_copy after this resolve (some mode; other modes keep it).
   uint32_t next_resolves_since_copy = 0;
+  // steady_fast: the guest copy is a fast copy of the complete previous
+  // slot, or the slot was not known complete and the some cadence applied.
+  bool steady_fast_copy = false;
+  bool steady_fast_skipped = false;
 
   bool own_slot() const { return read_index == write_index; }
 };
@@ -130,7 +142,12 @@ inline ReadbackPlan PlanReadbackResolve(const ReadbackSlotState& state,
   plan.forced = in.force_unless_miss && !plan.miss;
   bool own = plan.miss || plan.forced;
   if (in.mode == ReadbackPlanMode::kSome) {
-    plan.copies_now = own || state.resolves_since_copy + 1 >= kReadbackSlotsSomeInterval;
+    if (in.steady_fast && !own) {
+      plan.steady_fast_copy = in.previous_slot_complete;
+      plan.steady_fast_skipped = !in.previous_slot_complete;
+    }
+    plan.copies_now =
+        own || plan.steady_fast_copy || state.resolves_since_copy + 1 >= kReadbackSlotsSomeInterval;
     plan.next_resolves_since_copy = plan.copies_now ? 0 : state.resolves_since_copy + 1;
   }
   // The previous slot is read now only by a guest copy that is not own-slot.
@@ -140,7 +157,8 @@ inline ReadbackPlan PlanReadbackResolve(const ReadbackSlotState& state,
   }
   plan.read_index = own ? plan.write_index : previous_index;
   if (in.mode == ReadbackPlanMode::kSome && in.elide_unread) {
-    plan.record_gpu = own || plan.next_resolves_since_copy + 1 >= kReadbackSlotsSomeInterval;
+    plan.record_gpu =
+        own || in.steady_fast || plan.next_resolves_since_copy + 1 >= kReadbackSlotsSomeInterval;
   }
   return plan;
 }

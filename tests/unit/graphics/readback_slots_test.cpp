@@ -552,4 +552,118 @@ TEST_CASE("Readback slots: counters and report line", "[graphics][readback-slots
   CHECK(ReadbackPlanModeName(ReadbackPlanMode::kFull) == std::string("full"));
 }
 
+// M11-007b: d3d12_readback_sync_steady_fast in the planner.
+TEST_CASE("Readback plan steady fast delivery", "[graphics][readback-slots][readback-steady]") {
+  ReadbackPlanInput in;
+  in.mode = ReadbackPlanMode::kSome;
+  in.previous_slot_usable = true;
+  in.elide_unread = true;
+  in.steady_fast = true;
+  in.previous_slot_complete = true;
+  for (uint32_t since = 0; since < kReadbackSlotsSomeInterval; ++since) {
+    INFO("resolves_since_copy " << since);
+    ReadbackSlotState state;
+    state.current_index = 1;
+    state.resolves_since_copy = since;
+    // Complete previous slot: copied on every resolve from it, no wait,
+    // own copy recorded.
+    ReadbackPlan plan = PlanReadbackResolve(state, in);
+    CHECK(plan.steady_fast_copy);
+    CHECK_FALSE(plan.steady_fast_skipped);
+    CHECK(plan.copies_now);
+    CHECK(plan.read_index == 0);
+    CHECK(plan.write_index == 1);
+    CHECK_FALSE(plan.wait_full);
+    CHECK_FALSE(plan.miss);
+    CHECK_FALSE(plan.guard_miss);
+    CHECK_FALSE(plan.forced);
+    CHECK(plan.record_gpu);
+    CHECK(plan.next_resolves_since_copy == 0);
+    // Not known complete: the some cadence (no wait), counted as skipped,
+    // own copy still recorded.
+    ReadbackPlanInput incomplete = in;
+    incomplete.previous_slot_complete = false;
+    plan = PlanReadbackResolve(state, incomplete);
+    CHECK_FALSE(plan.steady_fast_copy);
+    CHECK(plan.steady_fast_skipped);
+    CHECK(plan.copies_now == (since + 1 >= kReadbackSlotsSomeInterval));
+    CHECK_FALSE(plan.wait_full);
+    CHECK_FALSE(plan.miss);
+    CHECK(plan.record_gpu);
+    CHECK(plan.read_index == 0);
+  }
+  // A miss or a forced resolve reads its own slot: no fast copy.
+  ReadbackSlotState state;
+  ReadbackPlanInput miss = in;
+  miss.previous_slot_usable = false;
+  ReadbackPlan plan = PlanReadbackResolve(state, miss);
+  CHECK(plan.miss);
+  CHECK_FALSE(plan.steady_fast_copy);
+  CHECK_FALSE(plan.steady_fast_skipped);
+  ReadbackPlanInput forced = in;
+  forced.force_unless_miss = true;
+  plan = PlanReadbackResolve(state, forced);
+  CHECK(plan.forced);
+  CHECK_FALSE(plan.steady_fast_copy);
+  // fast and full modes ignore it.
+  for (ReadbackPlanMode mode : {ReadbackPlanMode::kFast, ReadbackPlanMode::kFull}) {
+    ReadbackPlanInput other = in;
+    other.mode = mode;
+    ReadbackPlanInput off = other;
+    off.steady_fast = false;
+    off.previous_slot_complete = false;
+    ReadbackPlan a = PlanReadbackResolve(state, other);
+    ReadbackPlan b = PlanReadbackResolve(state, off);
+    CHECK_FALSE(a.steady_fast_copy);
+    CHECK_FALSE(a.steady_fast_skipped);
+    CHECK(a.copies_now == b.copies_now);
+    CHECK(a.read_index == b.read_index);
+    CHECK(a.record_gpu == b.record_gpu);
+    CHECK(a.wait_full == b.wait_full);
+  }
+  // A previous slot whose copy was elided is never fast-copied (the caller
+  // reports it incomplete); if the cadence copies, the guard turns it into
+  // a miss as before.
+  ReadbackSlotState elided;
+  elided.current_index = 0;
+  elided.slot_elided[1] = true;
+  elided.resolves_since_copy = kReadbackSlotsSomeInterval - 1;
+  ReadbackPlanInput incomplete = in;
+  incomplete.previous_slot_complete = false;
+  plan = PlanReadbackResolve(elided, incomplete);
+  CHECK(plan.guard_miss);
+  CHECK(plan.read_index == plan.write_index);
+}
+
+TEST_CASE("Readback plan without steady fast is unchanged",
+          "[graphics][readback-slots][readback-steady]") {
+  // previous_slot_complete alone (steady_fast off) changes nothing.
+  for (int mode = 0; mode < 3; ++mode) {
+    for (uint32_t bits = 0; bits < 64; ++bits) {
+      ReadbackSlotState state;
+      state.current_index = bits & 1;
+      state.resolves_since_copy = (bits >> 1) & 3;
+      state.slot_elided[0] = (bits >> 3) & 1;
+      state.slot_elided[1] = (bits >> 4) & 1;
+      ReadbackPlanInput in;
+      in.mode = ReadbackPlanMode(mode);
+      in.previous_slot_usable = (bits >> 5) & 1;
+      in.elide_unread = true;
+      ReadbackPlanInput with = in;
+      with.previous_slot_complete = true;
+      ReadbackPlan a = PlanReadbackResolve(state, in);
+      ReadbackPlan b = PlanReadbackResolve(state, with);
+      INFO("mode " << mode << " bits " << bits);
+      CHECK(a.read_index == b.read_index);
+      CHECK(a.copies_now == b.copies_now);
+      CHECK(a.record_gpu == b.record_gpu);
+      CHECK(a.guard_miss == b.guard_miss);
+      CHECK(a.miss == b.miss);
+      CHECK(a.next_resolves_since_copy == b.next_resolves_since_copy);
+      CHECK_FALSE(b.steady_fast_copy);
+      CHECK_FALSE(b.steady_fast_skipped);
+    }
+  }
+}
+
 }  // namespace rex::graphics::test

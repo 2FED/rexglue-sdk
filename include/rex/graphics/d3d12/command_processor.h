@@ -506,6 +506,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t consecutive_frames = 0;
     bool steady_exempt = false;
     uint64_t steady_exempt_epoch = 0;
+    // M11-007b shape filter: the shape of the key's last evaluated resolve.
+    bool shape_known = false;
+    ReadbackSyncKeyShape shape;
   };
   // In "some" mode a resolve target is copied to guest memory on a cache miss
   // and additionally every this many resolves, so CPU readers such as Photo
@@ -863,6 +866,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool readback_sync_steady_was_enabled_ = false;
   uint64_t readback_sync_minute_epoch_ = 1;
   PacedLineBudget readback_sync_steady_lines_{2, 16};
+  // M11-007b: keys that ever matched rule a or b (cleared with the read-back
+  // cache in ShutdownContext), the single-key cap and its line budget.
+  ReadbackSyncStickySet readback_sync_steady_sticky_;
+  ReadbackSyncSteadyCap readback_sync_steady_cap_;
+  PacedLineBudget readback_sync_steady_cap_lines_{2, 16};
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 
