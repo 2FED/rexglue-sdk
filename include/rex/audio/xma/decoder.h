@@ -14,6 +14,7 @@
 #include <atomic>
 #include <mutex>
 #include <queue>
+#include <set>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/register_file.h>
@@ -58,6 +59,10 @@ class XmaDecoder {
 
  private:
   void WorkerThreadMain();
+  // KI-071 sibling trace (xma_sibling_trace): kick burst ids, and once per
+  // second one line per active sibling group plus the per-minute summary.
+  uint32_t NextKickGroup();
+  void MaybeEmitSiblingTrace();
 
   static uint32_t MMIOReadRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr) {
     return as->ReadRegister(addr);
@@ -87,6 +92,19 @@ class XmaDecoder {
 
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;
+
+  // KI-071 sibling trace state. The kick fields are approximate under
+  // concurrent kicks (trace only); the scan state is owned by the thread that
+  // wins sib_second_ms_.
+  std::atomic<uint32_t> sib_kick_group_ = 0;
+  std::atomic<int64_t> sib_last_kick_us_ = -1;
+  std::atomic<int64_t> sib_second_ms_ = -1;
+  int64_t sib_minute_ms_ = -1;
+  uint64_t sib_last_emitted_[kContextCount] = {};
+  std::set<uint32_t> sib_minute_groups_;
+  uint64_t sib_minute_max_frame_delta_ = 0;
+  uint64_t sib_minute_max_lost_delta_ = 0;
+  uint64_t sib_suppressed_groups_ = 0;
 };
 
 }  // namespace rex::audio

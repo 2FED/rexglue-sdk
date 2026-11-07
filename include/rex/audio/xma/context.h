@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 
+#include <rex/audio/xma/sibling_trace.h>
 #include <rex/kernel.h>
 #include <rex/memory.h>
 #include <rex/thread.h>
@@ -230,6 +231,14 @@ class XmaContext {
     }
   }
 
+  // KI-071 sibling trace (xma_sibling_trace). The decoder sets the kick burst
+  // id before the inline Work of a kicked context; SiblingSnapshot is read by
+  // the decoder's per-second group scan from another thread.
+  void set_kick_group(uint32_t group) { sib_kick_group_.store(group, std::memory_order_relaxed); }
+  xma::SiblingCtxSample SiblingSnapshot() const;
+  // Global event totals since the previous call (reset on read).
+  static xma::SiblingMinuteTotals TakeSiblingMinuteTotals();
+
  private:
   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
   static int GetSampleRate(int id);
@@ -267,6 +276,13 @@ class XmaContext {
   std::string FormatSharedBufferContexts(uint32_t ptr);
 
   static void ConvertFrame(const uint8_t** samples, bool is_two_channel, uint8_t* output_buffer);
+
+  // KI-071 D2: apply the boundary decision for one path; returns the action
+  // taken and counts it. Sets stalled_this_work_ on a stall.
+  xma::BoundaryAction OnBoundary(xma::BoundaryPath path, bool next_available);
+  // KI-071 first-Decode record (paced INFO, xma_sibling_trace).
+  void LogFirstDecode(const XMA_CONTEXT_DATA* data, uint32_t entry_read_offset, int codec_reinit);
+  void ResetSiblingCounters();
 
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
@@ -306,6 +322,26 @@ class XmaContext {
   // KI-071 C1: carry packet recorded at a swap that found the next input buffer
   // not yet valid; applied when decoding resumes at the buffer start.
   uint32_t pending_swap_carry_packet_ = 0;
+
+  // KI-071 step 2 (D1/D2/trace). Plain fields are touched only under lock_.
+  // D2: Work ends after a stall; consecutive stalls fall back to upstream.
+  bool stalled_this_work_ = false;
+  uint32_t consecutive_stalls_ = 0;
+  // D1 / first-Decode record: armed by ResetDecoderState (Clear/Release).
+  bool start_pending_ = true;
+  // Per-context counters since the last Clear/Release (atomics: read by the
+  // decoder's group scan without the context lock).
+  std::atomic<uint64_t> sib_frames_parsed_ = 0;
+  std::atomic<uint64_t> sib_frames_emitted_ = 0;
+  std::atomic<uint64_t> sib_blocks_written_ = 0;
+  std::atomic<uint64_t> sib_blocks_consumed_ = 0;
+  std::atomic<uint64_t> sib_blocks_skipped_ = 0;
+  std::atomic<uint64_t> sib_drops_split_ = 0;
+  std::atomic<uint64_t> sib_drops_ff_ = 0;
+  std::atomic<uint64_t> sib_err4_ = 0;
+  std::atomic<uint64_t> sib_decode_fail_ = 0;
+  std::atomic<uint32_t> sib_start_skip_ = 0;
+  std::atomic<uint32_t> sib_kick_group_ = 0;
 };
 
 }  // namespace rex::audio

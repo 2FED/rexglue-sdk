@@ -9,8 +9,12 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+#include <vector>
+
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
+#include <rex/audio/xma/sibling_trace.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -158,6 +162,8 @@ void XmaDecoder::WorkerThreadMain() {
       resume_fence_.Wait();
     }
 
+    MaybeEmitSiblingTrace();
+
     if (did_work) {
       continue;
     }
@@ -295,17 +301,25 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         context.Enable();
       }
     }
+    // KI-071 trace: one id per burst of kick writes (the guest kick helper
+    // sub_823EE050 writes one kick register per stream in stream order).
+    const bool sibling_trace = REXCVAR_GET(xma_sibling_trace);
+    const uint32_t kick_group = sibling_trace ? NextKickGroup() : 0;
     // Decode inline. waiting on the worker sweep stalls the realtime
     // audio thread 50-100ms during kick bursts.
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+        if (sibling_trace) {
+          context.set_kick_group(kick_group);
+        }
         if (context.Work()) {
           context.SignalWorkDone();
         }
       }
     }
+    MaybeEmitSiblingTrace();
     work_event_->Set();
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
@@ -353,6 +367,110 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       }
 #pragma warning(suppress : 4065)
     }
+  }
+}
+
+namespace {
+// Kick writes closer together than this belong to one burst.
+constexpr int64_t kKickBurstGapUs = 1000;
+// At most this many group lines per second (the rest are counted).
+constexpr uint32_t kMaxGroupLinesPerSecond = 16;
+
+int64_t SiblingSteadyNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+uint32_t XmaDecoder::NextKickGroup() {
+  const int64_t now = SiblingSteadyNowUs();
+  const int64_t last = sib_last_kick_us_.exchange(now, std::memory_order_relaxed);
+  if (last < 0 || now - last > kKickBurstGapUs) {
+    return sib_kick_group_.fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+  return sib_kick_group_.load(std::memory_order_relaxed);
+}
+
+void XmaDecoder::MaybeEmitSiblingTrace() {
+  if (!REXCVAR_GET(xma_sibling_trace) || !context_data_first_ptr_) {
+    return;
+  }
+  const int64_t now_ms = SiblingSteadyNowUs() / 1000;
+  int64_t last = sib_second_ms_.load(std::memory_order_relaxed);
+  if (last >= 0 && now_ms - last < 1000) {
+    return;
+  }
+  if (!sib_second_ms_.compare_exchange_strong(last, now_ms, std::memory_order_relaxed)) {
+    return;
+  }
+  if (sib_minute_ms_ < 0) {
+    sib_minute_ms_ = now_ms;
+  }
+
+  // Snapshot every allocated context that has decoded since its last Clear,
+  // and the input buffer slices it points at (read-only guest reads).
+  std::vector<xma::SiblingCtxSample> samples(kContextCount);
+  std::vector<bool> active(kContextCount, false);
+  std::vector<xma::BufferSlice> slices;
+  for (uint32_t i = 0; i < kContextCount; ++i) {
+    XmaContext& context = contexts_[i];
+    if (!context.is_allocated()) {
+      sib_last_emitted_[i] = 0;
+      continue;
+    }
+    samples[i] = context.SiblingSnapshot();
+    if (samples[i].frames_parsed == 0) {
+      sib_last_emitted_[i] = 0;
+      continue;
+    }
+    active[i] = samples[i].frames_emitted != sib_last_emitted_[i];
+    sib_last_emitted_[i] = samples[i].frames_emitted;
+    const XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
+    slices.push_back({i, data.input_buffer_0_ptr, data.input_buffer_0_packet_count});
+    slices.push_back({i, data.input_buffer_1_ptr, data.input_buffer_1_packet_count});
+  }
+
+  uint32_t lines = 0;
+  for (const std::vector<uint32_t>& group : xma::GroupContiguousSlices(std::move(slices))) {
+    bool any_active = false;
+    std::vector<xma::SiblingCtxSample> members;
+    members.reserve(group.size());
+    for (uint32_t ctx : group) {
+      any_active = any_active || active[ctx];
+      members.push_back(samples[ctx]);
+    }
+    if (!any_active) {
+      continue;
+    }
+    const xma::SiblingGroupDeltas deltas = xma::ComputeGroupDeltas(members);
+    sib_minute_max_frame_delta_ = std::max(sib_minute_max_frame_delta_, deltas.frame_delta);
+    sib_minute_max_lost_delta_ = std::max(sib_minute_max_lost_delta_, deltas.lost_delta);
+    sib_minute_groups_.insert(group.front());
+    if (lines == kMaxGroupLinesPerSecond) {
+      ++sib_suppressed_groups_;
+      continue;
+    }
+    ++lines;
+    REXAPU_INFO("{}", xma::FormatSiblingGroupLine(group.front(), members));
+  }
+
+  if (now_ms - sib_minute_ms_ >= 60000) {
+    xma::SiblingMinuteSummary summary;
+    summary.groups = sib_minute_groups_.size();
+    summary.max_frame_delta = sib_minute_max_frame_delta_;
+    summary.max_lost_delta = sib_minute_max_lost_delta_;
+    summary.totals = XmaContext::TakeSiblingMinuteTotals();
+    summary.stall_fix = REXCVAR_GET(xma_stall_on_invalid_next);
+    summary.skip_fix = REXCVAR_GET(xma_honor_start_skip);
+    summary.reset_fix = REXCVAR_GET(xma_reset_codec_on_clear);
+    REXAPU_INFO("{} suppressed_group_lines={}", xma::FormatSiblingMinuteLine(summary),
+                sib_suppressed_groups_);
+    sib_minute_ms_ = now_ms;
+    sib_minute_groups_.clear();
+    sib_minute_max_frame_delta_ = 0;
+    sib_minute_max_lost_delta_ = 0;
+    sib_suppressed_groups_ = 0;
   }
 }
 

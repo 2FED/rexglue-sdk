@@ -21,6 +21,7 @@
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/doubling_fixes.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/audio/xma/sibling_trace.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -56,6 +57,20 @@ REXCVAR_DEFINE_BOOL(xma_work_lock_recheck, false, "Audio",
                     "do not write back the guest-owned output_buffer_read_offset");
 REXCVAR_DEFINE_BOOL(xma_swap_trace, false, "Audio",
                     "KI-071: log XMA input-buffer swaps (paced) and a per-minute MCLA_XMA line");
+// KI-071 step 2 (sibling contexts); see rex/audio/xma/sibling_trace.h.
+REXCVAR_DEFINE_BOOL(xma_sibling_trace, false, "Audio",
+                    "KI-071: per-context XMA frame/drop counters, first-decode record, paced "
+                    "sibling group lines and a per-minute MCLA_XMA_SIB line");
+REXCVAR_DEFINE_BOOL(xma_stall_on_invalid_next, false, "Audio",
+                    "KI-071 D2: at a buffer boundary with the next input buffer not yet valid, "
+                    "keep the read offset and retry later instead of swapping and dropping the "
+                    "frame; clear error_status 4 after a successful decode");
+REXCVAR_DEFINE_BOOL(xma_honor_start_skip, false, "Audio",
+                    "KI-071 D1: discard dword1 bits 24-26 subframes of the first frame decoded "
+                    "after a context Clear (guest start subframe skip)");
+REXCVAR_DEFINE_BOOL(xma_reset_codec_on_clear, false, "Audio",
+                    "KI-071: re-create the FFmpeg XMA decoder on context Clear/Release so a "
+                    "reused context does not carry the previous wave's overlap tail");
 
 namespace rex::audio {
 
@@ -78,6 +93,28 @@ struct XmaDoublingCounters {
   std::atomic<uint64_t> trace_suppressed{0};
 };
 XmaDoublingCounters g_xma_counters;
+
+// KI-071 step 2 event totals (MCLA_XMA_SIB kind=minute), all contexts.
+struct XmaSiblingCounters {
+  std::atomic<uint64_t> drops_split{0};
+  std::atomic<uint64_t> drops_ff{0};
+  std::atomic<uint64_t> err4{0};
+  std::atomic<uint64_t> decode_fail{0};
+  std::atomic<uint64_t> stalls{0};
+  std::atomic<uint64_t> stall_timeouts{0};
+  std::atomic<uint64_t> err4_cleared{0};
+  std::atomic<uint64_t> swapbacks{0};
+  std::atomic<uint64_t> no_bits{0};
+  std::atomic<uint64_t> start_skips{0};
+  std::atomic<uint64_t> start_skips_applied{0};
+  std::atomic<uint64_t> codec_resets{0};
+  std::atomic<uint64_t> first_decodes{0};
+};
+XmaSiblingCounters g_xma_sib;
+
+void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
+  counter.fetch_add(n, std::memory_order_relaxed);
+}
 std::atomic<int64_t> g_xma_minute_start_ms{-1};
 std::mutex g_xma_trace_mutex;
 int64_t g_xma_trace_last_ms = -1;
@@ -226,6 +263,7 @@ bool XmaContext::Work() {
   }
   set_is_enabled(false);
   blocks_written_this_work_ = 0;
+  stalled_this_work_ = false;
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -236,6 +274,15 @@ bool XmaContext::Work() {
   }
 
   memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
+  {
+    // KI-071 trace: blocks the guest has read = written - still in the ring.
+    const int64_t in_ring = int64_t(data.output_buffer_block_count) -
+                            int64_t(remaining_subframe_blocks_in_output_buffer_);
+    const uint64_t written = sib_blocks_written_.load(std::memory_order_relaxed);
+    const uint64_t buffered = uint64_t(std::max<int64_t>(0, in_ring));
+    sib_blocks_consumed_.store(written > buffered ? written - buffered : 0,
+                               std::memory_order_relaxed);
+  }
 
   // Consume-only context: no input, just drain remaining subframes.
   if (data.IsConsumeOnlyContext()) {
@@ -264,6 +311,10 @@ bool XmaContext::Work() {
     Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+      break;
+    }
+    // KI-071 D2: stalled at a boundary until the guest validates the next buffer.
+    if (stalled_this_work_) {
       break;
     }
   }
@@ -332,11 +383,131 @@ void XmaContext::ResetDecoderState() {
   if (av_context_ && avcodec_is_open(av_context_)) {
     avcodec_flush_buffers(av_context_);
   }
+  // KI-071: the xmaframes codec has no .flush callback (wmaprodec.c
+  // ff_xmaframes_decoder), so the flush above keeps the IMDCT overlap of the
+  // previous wave. Re-create the context; PrepareDecoder re-opens it at the
+  // next decode (rate/channels 0 never match).
+  if (REXCVAR_GET(xma_reset_codec_on_clear) && av_context_ && avcodec_is_open(av_context_)) {
+    avcodec_free_context(&av_context_);
+    av_context_ = avcodec_alloc_context3(av_codec_);
+    if (av_context_) {
+      av_context_->channels = 0;
+      av_context_->sample_rate = 0;
+    } else {
+      REXAPU_ERROR("XmaContext {}: Couldn't re-allocate codec context", id());
+    }
+    Bump(g_xma_sib.codec_resets);
+  }
   raw_frame_.fill(0);
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
   pending_swap_carry_packet_ = 0;
+  stalled_this_work_ = false;
+  consecutive_stalls_ = 0;
+  start_pending_ = true;
+  ResetSiblingCounters();
+}
+
+void XmaContext::ResetSiblingCounters() {
+  for (auto* counter :
+       {&sib_frames_parsed_, &sib_frames_emitted_, &sib_blocks_written_, &sib_blocks_consumed_,
+        &sib_blocks_skipped_, &sib_drops_split_, &sib_drops_ff_, &sib_err4_, &sib_decode_fail_}) {
+    counter->store(0, std::memory_order_relaxed);
+  }
+  sib_start_skip_.store(0, std::memory_order_relaxed);
+}
+
+xma::SiblingCtxSample XmaContext::SiblingSnapshot() const {
+  xma::SiblingCtxSample s;
+  s.ctx = id_;
+  s.frames_parsed = sib_frames_parsed_.load(std::memory_order_relaxed);
+  s.frames_emitted = sib_frames_emitted_.load(std::memory_order_relaxed);
+  s.blocks_written = sib_blocks_written_.load(std::memory_order_relaxed);
+  s.blocks_consumed = sib_blocks_consumed_.load(std::memory_order_relaxed);
+  s.blocks_skipped = sib_blocks_skipped_.load(std::memory_order_relaxed);
+  s.drops_split = sib_drops_split_.load(std::memory_order_relaxed);
+  s.drops_ff = sib_drops_ff_.load(std::memory_order_relaxed);
+  s.err4 = sib_err4_.load(std::memory_order_relaxed);
+  s.decode_fail = sib_decode_fail_.load(std::memory_order_relaxed);
+  s.start_skip = sib_start_skip_.load(std::memory_order_relaxed);
+  s.kick_group = sib_kick_group_.load(std::memory_order_relaxed);
+  return s;
+}
+
+xma::SiblingMinuteTotals XmaContext::TakeSiblingMinuteTotals() {
+  auto take = [](std::atomic<uint64_t>& counter) {
+    return counter.exchange(0, std::memory_order_relaxed);
+  };
+  xma::SiblingMinuteTotals t;
+  t.drops_split = take(g_xma_sib.drops_split);
+  t.drops_ff = take(g_xma_sib.drops_ff);
+  t.err4 = take(g_xma_sib.err4);
+  t.decode_fail = take(g_xma_sib.decode_fail);
+  t.stalls = take(g_xma_sib.stalls);
+  t.stall_timeouts = take(g_xma_sib.stall_timeouts);
+  t.err4_cleared = take(g_xma_sib.err4_cleared);
+  t.swapbacks = take(g_xma_sib.swapbacks);
+  t.no_bits = take(g_xma_sib.no_bits);
+  t.start_skips = take(g_xma_sib.start_skips);
+  t.start_skips_applied = take(g_xma_sib.start_skips_applied);
+  t.codec_resets = take(g_xma_sib.codec_resets);
+  t.first_decodes = take(g_xma_sib.first_decodes);
+  return t;
+}
+
+xma::BoundaryAction XmaContext::OnBoundary(xma::BoundaryPath path, bool next_available) {
+  const bool fix = REXCVAR_GET(xma_stall_on_invalid_next);
+  const xma::BoundaryAction action =
+      xma::DecideBoundary(path, next_available, fix, consecutive_stalls_);
+  if (action == xma::BoundaryAction::kStall) {
+    ++consecutive_stalls_;
+    stalled_this_work_ = true;
+    Bump(g_xma_sib.stalls);
+    return action;
+  }
+  if (!next_available) {
+    if (fix) {
+      Bump(g_xma_sib.stall_timeouts);
+    }
+    switch (path) {
+      case xma::BoundaryPath::kSplitHeader:
+        Bump(sib_drops_split_);
+        Bump(g_xma_sib.drops_split);
+        break;
+      case xma::BoundaryPath::kFullSkip:
+        Bump(sib_drops_ff_);
+        Bump(g_xma_sib.drops_ff);
+        break;
+      case xma::BoundaryPath::kSpanningFrame:
+        Bump(sib_err4_);
+        Bump(g_xma_sib.err4);
+        break;
+    }
+  }
+  consecutive_stalls_ = 0;
+  return action;
+}
+
+void XmaContext::LogFirstDecode(const XMA_CONTEXT_DATA* data, uint32_t entry_read_offset,
+                                int codec_reinit) {
+  Bump(g_xma_sib.first_decodes);
+  if (!REXCVAR_GET(xma_sibling_trace) || !AllowXmaTraceLine()) {
+    return;
+  }
+  const uint32_t read_offset = data->input_buffer_read_offset;
+  const uint8_t* packet = memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
+                          (read_offset / kBitsPerPacket) * kBytesPerPacket;
+  REXAPU_INFO(
+      "[xma] first-decode: ctx={} rate={} stereo={} entry_read_offset={} read_offset={} "
+      "packet={} first_frame_offset={} start_skip={} sdc={} codec_reinit={} buffer={:08X} "
+      "packets={} current_buffer={} kick_group={} skip_fix={}",
+      id(), GetSampleRate(data->sample_rate), uint32_t(data->is_stereo), entry_read_offset,
+      read_offset, read_offset / kBitsPerPacket, xma::GetPacketFrameOffset(packet),
+      uint32_t(data->output_buffer_padding), uint32_t(data->subframe_decode_count), codec_reinit,
+      data->GetCurrentInputBufferAddress(), data->GetCurrentInputBufferPacketCount(),
+      uint32_t(data->current_buffer), sib_kick_group_.load(std::memory_order_relaxed),
+      int(REXCVAR_GET(xma_honor_start_skip)));
 }
 
 void XmaContext::Disable() {
@@ -605,6 +776,7 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
                    subframes_to_write * kOutputBytesPerBlock);
   if (subframes_to_write > 0) {
     blocks_written_this_work_ += uint32_t(subframes_to_write);
+    Bump(sib_blocks_written_, uint64_t(subframes_to_write));
   }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
@@ -619,12 +791,16 @@ int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
 
   uint32_t channels = is_two_channel ? 2 : 1;
-  if (av_context_->sample_rate != sample_rate ||
+  if (!av_context_ || av_context_->sample_rate != sample_rate ||
       av_context_->channels != static_cast<int>(channels)) {
     REXAPU_NOISY_DEBUG("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}", id(),
                        av_context_->sample_rate, sample_rate, av_context_->channels, channels);
     avcodec_free_context(&av_context_);
     av_context_ = avcodec_alloc_context3(av_codec_);
+    if (!av_context_) {
+      REXAPU_ERROR("XmaContext {}: Couldn't allocate codec context", id());
+      return -1;
+    }
 
     av_context_->sample_rate = sample_rate;
     av_context_->channels = channels;
@@ -731,6 +907,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
+  const uint32_t entry_read_offset = data->input_buffer_read_offset;
   if (data->input_buffer_read_offset < kBitsPerPacketHeader) {
     data->input_buffer_read_offset = kBitsPerPacketHeader;
   }
@@ -762,6 +939,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     uint32_t next_input_offset =
         GetNextPacketReadOffset(current_input_buffer, packet_index + 1, current_input_packet_count);
     if (next_input_offset == kBitsPerPacketHeader) {
+      // KI-071 D2: no later frame start in this buffer and the next buffer
+      // not yet valid: upstream swaps now; the fix waits for the refill.
+      if (!data->IsInputBufferValid(data->current_buffer ^ 1) &&
+          OnBoundary(xma::BoundaryPath::kFullSkip, false) == xma::BoundaryAction::kStall) {
+        return;
+      }
       SwapInputBuffer(data);
     }
     data->input_buffer_read_offset = next_input_offset;
@@ -776,6 +959,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   if (packet_info.current_frame_size_ == 0) {
     const uint8_t* next_packet = GetNextPacket(data, next_packet_index, current_input_packet_count);
     if (!next_packet) {
+      // KI-071 D2: upstream swaps and resumes at packet 0's first frame of the
+      // next buffer, losing this straddling frame; the fix keeps the offset.
+      if (OnBoundary(xma::BoundaryPath::kSplitHeader, false) == xma::BoundaryAction::kStall) {
+        return;
+      }
+      Bump(sib_frames_parsed_);
       SwapInputBuffer(data);
       return;
     }
@@ -788,6 +977,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
     if (frame_size == xma::kMaxFrameLength) {
+      Bump(sib_err4_);
+      Bump(g_xma_sib.err4);
       data->error_status = 4;
       return;
     }
@@ -802,6 +993,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   if (bits_to_copy == 0) {
     REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
+    Bump(g_xma_sib.no_bits);
     SwapInputBuffer(data);
     return;
   }
@@ -811,6 +1003,10 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       const uint8_t* next_packet =
           GetNextPacket(data, next_packet_index, current_input_packet_count);
       if (!next_packet) {
+        // KI-071 D2: the fix stalls without the sticky error_status 4.
+        if (OnBoundary(xma::BoundaryPath::kSpanningFrame, false) == xma::BoundaryAction::kStall) {
+          return;
+        }
         data->error_status = 4;
         return;
       }
@@ -831,9 +1027,26 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   raw_frame_.fill(0);
 
-  PrepareDecoder(data->sample_rate, bool(data->is_stereo));
+  const int codec_reinit = PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+  Bump(sib_frames_parsed_);
+  const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  if (!decoded) {
+    // The read offset still advances below: this frame is lost.
+    Bump(sib_decode_fail_);
+    Bump(g_xma_sib.decode_fail);
+  }
+  if (decoded) {
+    Bump(sib_frames_emitted_);
+    consecutive_stalls_ = 0;
+    // KI-071 D2: error_status 4 is set only by this decoder and upstream
+    // never clears it; with the fix a successful decode clears it.
+    const uint32_t error_after = xma::ErrorStatusAfterDecode(
+        data->error_status, true, REXCVAR_GET(xma_stall_on_invalid_next));
+    if (error_after != data->error_status) {
+      data->error_status = error_after;
+      Bump(g_xma_sib.err4_cleared);
+    }
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
                  raw_frame_.data());
     RecordAudioRouteXmaFrame(raw_frame_.data(), raw_frame_.size());
@@ -853,6 +1066,27 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
       current_frame_remaining_subframes_ -= std::min(skip, current_frame_remaining_subframes_);
       loop_start_skip_pending_ = false;
+    }
+
+    // KI-071 D1: first frame after a Clear. dword1 bits 24-26 are written by
+    // the guest setter sub_823EDC80 with the read offset (0 for a fresh start,
+    // (start_sample >> 7) & 3 for a seek start); the host otherwise uses the
+    // field only as ring headroom (output_buffer_padding).
+    if (start_pending_) {
+      start_pending_ = false;
+      const uint32_t field = data->output_buffer_padding;
+      sib_start_skip_.store(field, std::memory_order_relaxed);
+      LogFirstDecode(data, entry_read_offset, codec_reinit);
+      if (field) {
+        Bump(g_xma_sib.start_skips);
+      }
+      if (field && REXCVAR_GET(xma_honor_start_skip)) {
+        const uint8_t skip =
+            xma::StartSkipBlocks(field, bool(data->is_stereo), current_frame_remaining_subframes_);
+        current_frame_remaining_subframes_ -= skip;
+        Bump(sib_blocks_skipped_, skip);
+        Bump(g_xma_sib.start_skips_applied);
+      }
     }
   }
 
@@ -883,6 +1117,7 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
           start_packet * kBytesPerPacket);
 
       if (next_input_offset > kMaxFrameSizeinBits) {
+        Bump(g_xma_sib.swapbacks);
         SwapInputBuffer(data);
         return;
       }
