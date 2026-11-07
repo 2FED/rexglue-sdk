@@ -13,9 +13,11 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 
+#include <rex/audio/xma/frame_trim.h>
 #include <rex/audio/xma/sibling_trace.h>
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -39,6 +41,8 @@ struct AVFrame;
 struct AVPacket;
 
 namespace rex::audio {
+
+class XmaPcmDump;
 
 // This is stored in guest space in big-endian order.
 // We load and swap the whole thing to splat here so that we can
@@ -238,6 +242,8 @@ class XmaContext {
   xma::SiblingCtxSample SiblingSnapshot() const;
   // Global event totals since the previous call (reset on read).
   static xma::SiblingMinuteTotals TakeSiblingMinuteTotals();
+  // KI-071 step 3: close this context's PCM dump (WAV header fixed up).
+  void FinalizeDump();
 
  private:
   static void SwapInputBuffer(XMA_CONTEXT_DATA* data);
@@ -281,8 +287,14 @@ class XmaContext {
   // taken and counts it. Sets stalled_this_work_ on a stall.
   xma::BoundaryAction OnBoundary(xma::BoundaryPath path, bool next_available);
   // KI-071 first-Decode record (paced INFO, xma_sibling_trace).
-  void LogFirstDecode(const XMA_CONTEXT_DATA* data, uint32_t entry_read_offset, int codec_reinit);
+  void LogFirstDecode(const XMA_CONTEXT_DATA* data, uint32_t entry_read_offset, int codec_reinit,
+                      const xma::FrameTrimInfo& trim);
   void ResetSiblingCounters();
+  // KI-071 step 3: per-frame trim counters and the paced trim line.
+  void OnFrameTrim(const xma::FrameTrimInfo& trim, const XMA_CONTEXT_DATA* data);
+  // KI-071 step 3: append blocks written to the ring to the PCM dump.
+  void DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTEXT_DATA* data);
+  void CloseDumpLocked(const char* reason);
 
   memory::Memory* memory_ = nullptr;
   std::unique_ptr<rex::thread::Event> work_completion_event_;
@@ -342,6 +354,24 @@ class XmaContext {
   std::atomic<uint64_t> sib_decode_fail_ = 0;
   std::atomic<uint32_t> sib_start_skip_ = 0;
   std::atomic<uint32_t> sib_kick_group_ = 0;
+  // KI-071 step 3. Start identity (first decode since Clear) for grouping.
+  std::atomic<uint32_t> sib_start_kick_ = 0;
+  std::atomic<uint32_t> sib_rate_ = 0;
+  std::atomic<bool> sib_stereo_ = false;
+  // Per-frame trim fields since Clear.
+  std::atomic<uint64_t> sib_trim_start_frames_ = 0;
+  std::atomic<uint64_t> sib_trim_start_samples_ = 0;
+  std::atomic<uint64_t> sib_trim_end_frames_ = 0;
+  std::atomic<uint64_t> sib_trim_end_samples_ = 0;
+  std::atomic<uint32_t> sib_trim_first_count_ = 0;
+  std::array<std::atomic<uint32_t>, 4> sib_trim_first_{};
+  std::atomic<uint32_t> sib_trim_epoch_ = 0;  // minute epoch of the last trim (trim_ctxs)
+  uint64_t sib_frame_index_ = 0;              // frames parsed since Clear (lock_)
+  // xma_honor_frame_trim: partial output block and pending start trim (lock_).
+  xma::FrameTrimCarry trim_carry_;
+  // xma_dump_contexts (lock_).
+  std::unique_ptr<XmaPcmDump> dump_;
+  bool dump_blocked_ = false;  // this stream is not (or no longer) dumped
 };
 
 }  // namespace rex::audio

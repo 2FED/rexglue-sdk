@@ -13,6 +13,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include <fmt/format.h>
 
@@ -20,6 +22,7 @@
 #include <rex/audio/audio_route_audit.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/doubling_fixes.h>
+#include <rex/audio/xma/frame_trim.h>
 #include <rex/audio/xma/helpers.h>
 #include <rex/audio/xma/sibling_trace.h>
 #include <rex/cvar.h>
@@ -71,6 +74,20 @@ REXCVAR_DEFINE_BOOL(xma_honor_start_skip, false, "Audio",
 REXCVAR_DEFINE_BOOL(xma_reset_codec_on_clear, false, "Audio",
                     "KI-071: re-create the FFmpeg XMA decoder on context Clear/Release so a "
                     "reused context does not carry the previous wave's overlap tail");
+// KI-071 step 3 (per-frame trim, PCM dump); see rex/audio/xma/frame_trim.h.
+REXCVAR_DEFINE_BOOL(xma_honor_frame_trim, false, "Audio",
+                    "KI-071: drop the XMA frame header start/end skip samples from each decoded "
+                    "frame (FFmpeg parses and ignores them); sample-exact unless "
+                    "xma_frame_trim_block_granular");
+REXCVAR_DEFINE_BOOL(xma_frame_trim_block_granular, false, "Audio",
+                    "KI-071: with xma_honor_frame_trim, drop only whole 256-byte output blocks "
+                    "(trim rounded down) instead of shifting the following samples");
+REXCVAR_DEFINE_STRING(xma_dump_contexts, "", "Audio",
+                      "KI-071: directory for per-context decoded PCM dumps "
+                      "(ctx<id>-<rate>Hz-<mono|stereo>-<n>.wav, as written to the output ring; "
+                      "44.1 kHz only unless xma_dump_all_rates; 60 s per stream, 64 files)");
+REXCVAR_DEFINE_BOOL(xma_dump_all_rates, false, "Audio",
+                    "KI-071: with xma_dump_contexts, dump every sample rate, not only 44.1 kHz");
 
 namespace rex::audio {
 
@@ -109,8 +126,17 @@ struct XmaSiblingCounters {
   std::atomic<uint64_t> start_skips_applied{0};
   std::atomic<uint64_t> codec_resets{0};
   std::atomic<uint64_t> first_decodes{0};
+  std::atomic<uint64_t> trim_frames{0};
+  std::atomic<uint64_t> trim_samples{0};
+  std::atomic<uint64_t> trim_ctxs{0};
+  std::atomic<uint64_t> trim_applied_samples{0};
+  std::atomic<uint64_t> trim_unapplied{0};
+  std::atomic<uint64_t> trim_parse_errors{0};
+  std::atomic<uint64_t> burst_first_decodes{0};
 };
 XmaSiblingCounters g_xma_sib;
+// Minute epoch for trim_ctxs (incremented by TakeSiblingMinuteTotals).
+std::atomic<uint32_t> g_xma_trim_epoch{1};
 
 void Bump(std::atomic<uint64_t>& counter, uint64_t n = 1) {
   counter.fetch_add(n, std::memory_order_relaxed);
@@ -149,6 +175,50 @@ bool AllowXmaTraceLine() {
   g_xma_counters.trace_suppressed.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
+
+// KI-071 step 3: separate budgets (burst, per second) so the shared swap /
+// first-decode bucket, exhausted during gameplay in l74, cannot hide them.
+class XmaLineBudget {
+ public:
+  constexpr XmaLineBudget(uint32_t burst, uint32_t per_second)
+      : burst_(burst), per_second_(per_second) {}
+  bool Allow() {
+    const int64_t now = XmaSteadyNowMs();
+    std::lock_guard<std::mutex> guard(mutex_);
+    const uint32_t burst_milli = burst_ * 1000;
+    if (last_ms_ < 0) {
+      milli_tokens_ = burst_milli;
+    } else if (now > last_ms_) {
+      const uint64_t refill = uint64_t(now - last_ms_) * per_second_;
+      milli_tokens_ = uint32_t(std::min<uint64_t>(burst_milli, milli_tokens_ + refill));
+    }
+    last_ms_ = now;
+    if (milli_tokens_ >= 1000) {
+      milli_tokens_ -= 1000;
+      return true;
+    }
+    g_xma_counters.trace_suppressed.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+ private:
+  uint32_t burst_;
+  uint32_t per_second_;
+  std::mutex mutex_;
+  int64_t last_ms_ = -1;
+  uint32_t milli_tokens_ = 0;
+};
+// First-decode records of a multi-context 44.1 kHz start.
+XmaLineBudget g_xma_burst_budget(128, 32);
+// Per-frame trim lines (first 4 non-zero frames per context).
+XmaLineBudget g_xma_trim_budget(64, 16);
+// First decodes of 44.1 kHz contexts in the last 50 ms.
+std::mutex g_xma_start_window_mutex;
+xma::StartBurstWindow g_xma_start_window;
+
+// Dump files opened this session (cap kDumpMaxFiles).
+std::atomic<uint32_t> g_xma_dump_files{0};
+std::atomic<bool> g_xma_dump_limit_logged{false};
 
 void MaybeEmitXmaMinute() {
   const int64_t now = XmaSteadyNowMs();
@@ -190,6 +260,79 @@ void MaybeEmitXmaMinute() {
 
 }  // namespace
 
+// KI-071 step 3: one 16-bit PCM WAV file per context stream (xma_dump_contexts).
+// Holds the blocks exactly as written to the guest output ring (post-trim),
+// byte-swapped to little-endian. The header is fixed up about once per second
+// of audio and on close, so a killed process still leaves a readable file.
+class XmaPcmDump {
+ public:
+  XmaPcmDump(std::filesystem::path path, uint32_t rate, uint16_t channels)
+      : path_(std::move(path)), rate_(rate), channels_(channels) {
+    max_bytes_ = xma::kDumpMaxSeconds * rate * channels * 2u;
+    fix_every_ = rate * channels * 2u;
+    file_.open(path_, std::ios::binary | std::ios::trunc);
+    if (file_) {
+      const auto header = xma::MakeWavHeader(rate_, channels_, 0);
+      file_.write(reinterpret_cast<const char*>(header.data()), header.size());
+    }
+  }
+  ~XmaPcmDump() { Close(); }
+
+  bool ok() const { return bool(file_); }
+  const std::filesystem::path& path() const { return path_; }
+  uint32_t data_bytes() const { return data_bytes_; }
+  double seconds() const { return double(data_bytes_) / double(rate_ * channels_ * 2u); }
+
+  // Returns false once the 60 s cap is reached.
+  bool Write(const uint8_t* big_endian, size_t bytes) {
+    if (!file_) {
+      return false;
+    }
+    const size_t room = max_bytes_ - data_bytes_;
+    const size_t n = std::min(bytes, room) & ~size_t(1);
+    std::array<uint8_t, 2048> le;
+    for (size_t done = 0; done < n;) {
+      const size_t chunk = std::min(n - done, le.size());
+      xma::SwapPcm16(big_endian + done, le.data(), chunk);
+      file_.write(reinterpret_cast<const char*>(le.data()), std::streamsize(chunk));
+      done += chunk;
+    }
+    data_bytes_ += uint32_t(n);
+    if (data_bytes_ - last_fix_ >= fix_every_) {
+      FixHeader();
+    }
+    return data_bytes_ < max_bytes_;
+  }
+
+  void Close() {
+    if (!file_) {
+      return;
+    }
+    FixHeader();
+    file_.close();
+  }
+
+ private:
+  void FixHeader() {
+    const auto header = xma::MakeWavHeader(rate_, channels_, data_bytes_);
+    const auto end = file_.tellp();
+    file_.seekp(0);
+    file_.write(reinterpret_cast<const char*>(header.data()), header.size());
+    file_.seekp(end);
+    file_.flush();
+    last_fix_ = data_bytes_;
+  }
+
+  std::filesystem::path path_;
+  uint32_t rate_;
+  uint16_t channels_;
+  uint32_t max_bytes_ = 0;
+  uint32_t fix_every_ = 0;
+  uint32_t data_bytes_ = 0;
+  uint32_t last_fix_ = 0;
+  std::ofstream file_;
+};
+
 const uint32_t XmaContext::kBitsPerPacketHeader;
 const uint32_t XmaContext::kOutputMaxSizeBytes;
 
@@ -197,6 +340,7 @@ XmaContext::XmaContext()
     : work_completion_event_(rex::thread::Event::CreateAutoResetEvent(false)) {}
 
 XmaContext::~XmaContext() {
+  // dump_ (if any) fixes its WAV header in its destructor; no logging here.
   if (av_context_) {
     avcodec_free_context(&av_context_);
   }
@@ -406,16 +550,124 @@ void XmaContext::ResetDecoderState() {
   stalled_this_work_ = false;
   consecutive_stalls_ = 0;
   start_pending_ = true;
+  trim_carry_.Reset();
+  sib_frame_index_ = 0;
+  CloseDumpLocked("clear");
+  dump_blocked_ = false;
   ResetSiblingCounters();
 }
 
 void XmaContext::ResetSiblingCounters() {
-  for (auto* counter :
-       {&sib_frames_parsed_, &sib_frames_emitted_, &sib_blocks_written_, &sib_blocks_consumed_,
-        &sib_blocks_skipped_, &sib_drops_split_, &sib_drops_ff_, &sib_err4_, &sib_decode_fail_}) {
+  for (auto* counter : {&sib_frames_parsed_, &sib_frames_emitted_, &sib_blocks_written_,
+                        &sib_blocks_consumed_, &sib_blocks_skipped_, &sib_drops_split_,
+                        &sib_drops_ff_, &sib_err4_, &sib_decode_fail_, &sib_trim_start_frames_,
+                        &sib_trim_start_samples_, &sib_trim_end_frames_, &sib_trim_end_samples_}) {
     counter->store(0, std::memory_order_relaxed);
   }
   sib_start_skip_.store(0, std::memory_order_relaxed);
+  sib_start_kick_.store(0, std::memory_order_relaxed);
+  sib_rate_.store(0, std::memory_order_relaxed);
+  sib_stereo_.store(false, std::memory_order_relaxed);
+  sib_trim_first_count_.store(0, std::memory_order_relaxed);
+  for (auto& pair : sib_trim_first_) {
+    pair.store(0, std::memory_order_relaxed);
+  }
+}
+
+void XmaContext::OnFrameTrim(const xma::FrameTrimInfo& trim, const XMA_CONTEXT_DATA* data) {
+  const uint64_t frame = sib_frame_index_++;
+  if (!trim.ok) {
+    Bump(g_xma_sib.trim_parse_errors);
+    return;
+  }
+  if (trim.start == 0 && trim.end == 0) {
+    return;
+  }
+  if (trim.start) {
+    Bump(sib_trim_start_frames_);
+    Bump(sib_trim_start_samples_, trim.start);
+  }
+  if (trim.end) {
+    Bump(sib_trim_end_frames_);
+    Bump(sib_trim_end_samples_, trim.end);
+  }
+  Bump(g_xma_sib.trim_frames);
+  Bump(g_xma_sib.trim_samples, uint64_t(trim.start) + trim.end);
+  const uint32_t epoch = g_xma_trim_epoch.load(std::memory_order_relaxed);
+  if (sib_trim_epoch_.exchange(epoch, std::memory_order_relaxed) != epoch) {
+    Bump(g_xma_sib.trim_ctxs);
+  }
+  const uint32_t index = sib_trim_first_count_.load(std::memory_order_relaxed);
+  if (index < sib_trim_first_.size()) {
+    sib_trim_first_[index].store((trim.start << 16) | trim.end, std::memory_order_relaxed);
+    sib_trim_first_count_.store(index + 1, std::memory_order_relaxed);
+    if (REXCVAR_GET(xma_sibling_trace) && g_xma_trim_budget.Allow()) {
+      REXAPU_INFO(
+          "[xma] frame-trim: ctx={} rate={} stereo={} frame={} start={} end={} start_flag={} "
+          "end_flag={} header_bits={} read_offset={} kick_group={} trim_fix={}",
+          id(), GetSampleRate(data->sample_rate), uint32_t(data->is_stereo), frame, trim.start,
+          trim.end, int(trim.has_start), int(trim.has_end), trim.header_bits,
+          uint32_t(data->input_buffer_read_offset), sib_kick_group_.load(std::memory_order_relaxed),
+          int(REXCVAR_GET(xma_honor_frame_trim)));
+    }
+  }
+}
+
+void XmaContext::DumpBlocks(const uint8_t* blocks, size_t bytes, const XMA_CONTEXT_DATA* data) {
+  if (dump_blocked_ || !bytes) {
+    return;
+  }
+  if (!dump_) {
+    const uint32_t rate = uint32_t(GetSampleRate(data->sample_rate));
+    if (rate != 44100 && !REXCVAR_GET(xma_dump_all_rates)) {
+      dump_blocked_ = true;
+      return;
+    }
+    const uint32_t n = g_xma_dump_files.fetch_add(1, std::memory_order_relaxed);
+    if (n >= xma::kDumpMaxFiles) {
+      dump_blocked_ = true;
+      if (!g_xma_dump_limit_logged.exchange(true, std::memory_order_relaxed)) {
+        REXAPU_INFO("[xma] dump: file limit {} reached; no further dumps this session",
+                    xma::kDumpMaxFiles);
+      }
+      return;
+    }
+    const std::filesystem::path dir(REXCVAR_GET(xma_dump_contexts));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const bool stereo = bool(data->is_stereo);
+    dump_ = std::make_unique<XmaPcmDump>(dir / xma::DumpFileName(id(), rate, stereo, n), rate,
+                                         uint16_t(stereo ? 2 : 1));
+    if (!dump_->ok()) {
+      REXAPU_WARN("[xma] dump: cannot open {} ({})", dump_->path().string(), ec.message());
+      dump_.reset();
+      dump_blocked_ = true;
+      return;
+    }
+    REXAPU_INFO("[xma] dump: open ctx={} rate={} stereo={} n={} start_kick={} file={}", id(), rate,
+                uint32_t(stereo), n, sib_start_kick_.load(std::memory_order_relaxed),
+                dump_->path().string());
+  }
+  if (!dump_->Write(blocks, bytes)) {
+    CloseDumpLocked("cap");
+    dump_blocked_ = true;
+  }
+}
+
+void XmaContext::CloseDumpLocked(const char* reason) {
+  if (!dump_) {
+    return;
+  }
+  dump_->Close();
+  REXAPU_INFO("[xma] dump: close ctx={} reason={} bytes={} seconds={:.2f} file={}", id(), reason,
+              dump_->data_bytes(), dump_->seconds(), dump_->path().string());
+  dump_.reset();
+}
+
+void XmaContext::FinalizeDump() {
+  std::lock_guard<std::mutex> lock(lock_);
+  CloseDumpLocked("exit");
+  dump_blocked_ = true;
 }
 
 xma::SiblingCtxSample XmaContext::SiblingSnapshot() const {
@@ -432,6 +684,17 @@ xma::SiblingCtxSample XmaContext::SiblingSnapshot() const {
   s.decode_fail = sib_decode_fail_.load(std::memory_order_relaxed);
   s.start_skip = sib_start_skip_.load(std::memory_order_relaxed);
   s.kick_group = sib_kick_group_.load(std::memory_order_relaxed);
+  s.start_kick = sib_start_kick_.load(std::memory_order_relaxed);
+  s.rate = sib_rate_.load(std::memory_order_relaxed);
+  s.stereo = sib_stereo_.load(std::memory_order_relaxed);
+  s.trim_start_frames = sib_trim_start_frames_.load(std::memory_order_relaxed);
+  s.trim_start_samples = sib_trim_start_samples_.load(std::memory_order_relaxed);
+  s.trim_end_frames = sib_trim_end_frames_.load(std::memory_order_relaxed);
+  s.trim_end_samples = sib_trim_end_samples_.load(std::memory_order_relaxed);
+  s.trim_first_count = std::min<uint32_t>(sib_trim_first_count_.load(std::memory_order_relaxed), 4);
+  for (size_t i = 0; i < s.trim_first.size(); ++i) {
+    s.trim_first[i] = sib_trim_first_[i].load(std::memory_order_relaxed);
+  }
   return s;
 }
 
@@ -453,6 +716,14 @@ xma::SiblingMinuteTotals XmaContext::TakeSiblingMinuteTotals() {
   t.start_skips_applied = take(g_xma_sib.start_skips_applied);
   t.codec_resets = take(g_xma_sib.codec_resets);
   t.first_decodes = take(g_xma_sib.first_decodes);
+  t.trim_frames = take(g_xma_sib.trim_frames);
+  t.trim_samples = take(g_xma_sib.trim_samples);
+  t.trim_ctxs = take(g_xma_sib.trim_ctxs);
+  t.trim_applied_samples = take(g_xma_sib.trim_applied_samples);
+  t.trim_unapplied = take(g_xma_sib.trim_unapplied);
+  t.trim_parse_errors = take(g_xma_sib.trim_parse_errors);
+  t.burst_first_decodes = take(g_xma_sib.burst_first_decodes);
+  g_xma_trim_epoch.fetch_add(1, std::memory_order_relaxed);
   return t;
 }
 
@@ -490,24 +761,62 @@ xma::BoundaryAction XmaContext::OnBoundary(xma::BoundaryPath path, bool next_ava
 }
 
 void XmaContext::LogFirstDecode(const XMA_CONTEXT_DATA* data, uint32_t entry_read_offset,
-                                int codec_reinit) {
+                                int codec_reinit, const xma::FrameTrimInfo& trim) {
   Bump(g_xma_sib.first_decodes);
-  if (!REXCVAR_GET(xma_sibling_trace) || !AllowXmaTraceLine()) {
+  if (!REXCVAR_GET(xma_sibling_trace)) {
     return;
   }
+  const int rate = GetSampleRate(data->sample_rate);
   const uint32_t read_offset = data->input_buffer_read_offset;
   const uint8_t* packet = memory()->TranslatePhysical(data->GetCurrentInputBufferAddress()) +
                           (read_offset / kBitsPerPacket) * kBytesPerPacket;
-  REXAPU_INFO(
-      "[xma] first-decode: ctx={} rate={} stereo={} entry_read_offset={} read_offset={} "
+  std::string body = fmt::format(
+      "ctx={} rate={} stereo={} entry_read_offset={} read_offset={} "
       "packet={} first_frame_offset={} start_skip={} sdc={} codec_reinit={} buffer={:08X} "
-      "packets={} current_buffer={} kick_group={} skip_fix={}",
-      id(), GetSampleRate(data->sample_rate), uint32_t(data->is_stereo), entry_read_offset,
-      read_offset, read_offset / kBitsPerPacket, xma::GetPacketFrameOffset(packet),
+      "packets={} current_buffer={} kick_group={} skip_fix={} trim={}:{} trim_ok={}",
+      id(), rate, uint32_t(data->is_stereo), entry_read_offset, read_offset,
+      read_offset / kBitsPerPacket, xma::GetPacketFrameOffset(packet),
       uint32_t(data->output_buffer_padding), uint32_t(data->subframe_decode_count), codec_reinit,
       data->GetCurrentInputBufferAddress(), data->GetCurrentInputBufferPacketCount(),
       uint32_t(data->current_buffer), sib_kick_group_.load(std::memory_order_relaxed),
-      int(REXCVAR_GET(xma_honor_start_skip)));
+      int(REXCVAR_GET(xma_honor_start_skip)), trim.start, trim.end, int(trim.ok));
+  if (rate != 44100) {
+    if (AllowXmaTraceLine()) {
+      REXAPU_INFO("[xma] first-decode: {} budget=shared", body);
+    }
+    return;
+  }
+  // KI-071 step 3: a 44.1 kHz start within 50 ms of 3+ other 44.1 kHz starts
+  // (a multi-context voice) is logged on its own budget, with the records of
+  // the same window that the shared budget suppressed.
+  const int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  std::vector<std::string> flush;
+  bool burst = false;
+  bool logged = false;
+  {
+    std::lock_guard<std::mutex> guard(g_xma_start_window_mutex);
+    burst = g_xma_start_window.IsBurst(now_us, id(), &flush);
+    if (!burst) {
+      logged = AllowXmaTraceLine();
+    }
+    g_xma_start_window.Record(now_us, id(), burst || logged, logged ? std::string() : body);
+  }
+  for (const std::string& line : flush) {
+    if (g_xma_burst_budget.Allow()) {
+      Bump(g_xma_sib.burst_first_decodes);
+      REXAPU_INFO("[xma] first-decode: {} budget=burst-late", line);
+    }
+  }
+  if (burst) {
+    if (g_xma_burst_budget.Allow()) {
+      Bump(g_xma_sib.burst_first_decodes);
+      REXAPU_INFO("[xma] first-decode: {} budget=burst", body);
+    }
+  } else if (logged) {
+    REXAPU_INFO("[xma] first-decode: {} budget=shared", body);
+  }
 }
 
 void XmaContext::Disable() {
@@ -777,6 +1086,11 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
   if (subframes_to_write > 0) {
     blocks_written_this_work_ += uint32_t(subframes_to_write);
     Bump(sib_blocks_written_, uint64_t(subframes_to_write));
+    // KI-071 step 3: the dump holds exactly the bytes the guest ring got.
+    if (!REXCVAR_GET(xma_dump_contexts).empty()) {
+      DumpBlocks(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                 size_t(subframes_to_write) * kOutputBytesPerBlock, data);
+    }
   }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
@@ -1029,6 +1343,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   const int codec_reinit = PrepareDecoder(data->sample_rate, bool(data->is_stereo));
   PreparePacket(packet_info.current_frame_size_, padding_start);
+  // KI-071 step 3: the frame header's start/end skip, read-only from the bits
+  // handed to FFmpeg (which parses and discards them).
+  const uint32_t channels = data->is_stereo ? 2u : 1u;
+  const xma::FrameTrimInfo trim =
+      xma::ParseFrameTrim(xma_frame_.data() + 1, xma_frame_.size() - 1, padding_start,
+                          packet_info.current_frame_size_, channels);
+  OnFrameTrim(trim, data);
   Bump(sib_frames_parsed_);
   const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
   if (!decoded) {
@@ -1051,6 +1372,22 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
                  raw_frame_.data());
     RecordAudioRouteXmaFrame(raw_frame_.data(), raw_frame_.size());
     current_frame_remaining_subframes_ = 4 << data->is_stereo;
+
+    // KI-071 step 3: honour the frame trim. The kept blocks end up at the end
+    // of raw_frame_, which is where Consume reads the remaining blocks from.
+    if (REXCVAR_GET(xma_honor_frame_trim)) {
+      const xma::FrameTrimApplied applied = xma::ApplyFrameTrim(
+          std::span<uint8_t>(raw_frame_.data(), kBytesPerFrameChannel * channels), channels,
+          trim.ok ? trim.start : 0, trim.ok ? trim.end : 0,
+          REXCVAR_GET(xma_frame_trim_block_granular), trim_carry_);
+      current_frame_remaining_subframes_ = uint8_t(applied.blocks);
+      if (applied.dropped_samples) {
+        Bump(g_xma_sib.trim_applied_samples, applied.dropped_samples);
+      }
+      if (applied.unapplied_end + applied.unaligned_samples) {
+        Bump(g_xma_sib.trim_unapplied, uint64_t(applied.unapplied_end) + applied.unaligned_samples);
+      }
+    }
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
     if (is_loop_end_frame) {
@@ -1076,7 +1413,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       start_pending_ = false;
       const uint32_t field = data->output_buffer_padding;
       sib_start_skip_.store(field, std::memory_order_relaxed);
-      LogFirstDecode(data, entry_read_offset, codec_reinit);
+      sib_start_kick_.store(sib_kick_group_.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+      sib_rate_.store(uint32_t(GetSampleRate(data->sample_rate)), std::memory_order_relaxed);
+      sib_stereo_.store(bool(data->is_stereo), std::memory_order_relaxed);
+      LogFirstDecode(data, entry_read_offset, codec_reinit, trim);
       if (field) {
         Bump(g_xma_sib.start_skips);
       }

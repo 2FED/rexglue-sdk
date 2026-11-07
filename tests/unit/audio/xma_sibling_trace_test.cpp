@@ -134,10 +134,20 @@ TEST_CASE("XMA sibling: line formatting", "[audio][xma][ki071]") {
   group[1].start_skip = 2;
   group[1].blocks_skipped = 2;
   group[1].kick_group = 7;
+  group[0].start_kick = 5;
+  group[1].start_kick = 5;
+  group[1].trim_start_frames = 1;
+  group[1].trim_start_samples = 512;
+  group[1].trim_end_frames = 1;
+  group[1].trim_end_samples = 300;
+  group[1].trim_first_count = 2;
+  group[1].trim_first[0] = 512u << 16;
+  group[1].trim_first[1] = 300u;
   CHECK(FormatSiblingGroupLine(67, group) ==
         "[xma] group: id=67 ctxs=[67,70] frames_emitted=[10,10] frames_parsed=[10,11] "
         "consumed_blocks=[36,36] drops=[split=0/1,ff=0/0,err4=0/0,fail=0/0] start_skip=[0,2] "
-        "skipped_blocks=[0,2] kick=[7,7] frame_delta=0 lost_delta=1");
+        "skipped_blocks=[0,2] kick=[7,7] frame_delta=0 lost_delta=1 start_kick=[5,5] "
+        "trim_start=[0:0,1:512] trim_end=[0:0,1:300] trim_first=[-/512:0;0:300]");
 
   SiblingMinuteSummary m;
   m.groups = 3;
@@ -149,9 +159,15 @@ TEST_CASE("XMA sibling: line formatting", "[audio][xma][ki071]") {
   m.totals.decode_fail = 0;
   m.totals.stalls = 5;
   m.stall_fix = true;
+  m.totals.trim_frames = 9;
+  m.totals.trim_samples = 4608;
+  m.totals.trim_ctxs = 7;
+  m.trim_fix = true;
   CHECK(FormatSiblingMinuteLine(m) ==
-        "MCLA_XMA_SIB v=1 kind=minute groups=3 max_frame_delta=2 drops_split=4 drops_ff=1 "
+        "MCLA_XMA_SIB v=2 kind=minute groups=3 max_frame_delta=2 drops_split=4 drops_ff=1 "
         "err4=2 decode_fail=0 max_lost_delta=1 stalls=5 stall_timeouts=0 err4_cleared=0 "
         "swapbacks=0 no_bits=0 start_skips=0 start_skips_applied=0 codec_resets=0 "
-        "first_decodes=0 stall_fix=1 skip_fix=0 reset_fix=0");
+        "first_decodes=0 stall_fix=1 skip_fix=0 reset_fix=0 trim_frames=9 trim_samples=4608 "
+        "trim_ctxs=7 trim_applied_samples=0 trim_unapplied=0 trim_parse_errors=0 "
+        "burst_first_decodes=0 trim_fix=1 trim_block=0");
 }

@@ -194,6 +194,11 @@ void XmaDecoder::Shutdown() {
   }
   worker_thread_.reset();
 
+  // KI-071 step 3: fix up the WAV headers of open PCM dumps.
+  for (XmaContext& context : contexts_) {
+    context.FinalizeDump();
+  }
+
   if (context_data_first_ptr_) {
     memory()->SystemHeapFree(context_data_first_ptr_);
   }
@@ -413,6 +418,7 @@ void XmaDecoder::MaybeEmitSiblingTrace() {
   std::vector<xma::SiblingCtxSample> samples(kContextCount);
   std::vector<bool> active(kContextCount, false);
   std::vector<xma::BufferSlice> slices;
+  std::vector<xma::GroupMember> members_in;
   for (uint32_t i = 0; i < kContextCount; ++i) {
     XmaContext& context = contexts_[i];
     if (!context.is_allocated()) {
@@ -426,13 +432,16 @@ void XmaDecoder::MaybeEmitSiblingTrace() {
     }
     active[i] = samples[i].frames_emitted != sib_last_emitted_[i];
     sib_last_emitted_[i] = samples[i].frames_emitted;
+    members_in.push_back({i, samples[i].start_kick, samples[i].rate, samples[i].stereo});
     const XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
     slices.push_back({i, data.input_buffer_0_ptr, data.input_buffer_0_packet_count});
     slices.push_back({i, data.input_buffer_1_ptr, data.input_buffer_1_packet_count});
   }
 
   uint32_t lines = 0;
-  for (const std::vector<uint32_t>& group : xma::GroupContiguousSlices(std::move(slices))) {
+  for (const xma::SiblingGroup& sibling_group :
+       sib_grouper_.Update(members_in, std::move(slices))) {
+    const std::vector<uint32_t>& group = sibling_group.ctxs;
     bool any_active = false;
     std::vector<xma::SiblingCtxSample> members;
     members.reserve(group.size());
@@ -446,13 +455,13 @@ void XmaDecoder::MaybeEmitSiblingTrace() {
     const xma::SiblingGroupDeltas deltas = xma::ComputeGroupDeltas(members);
     sib_minute_max_frame_delta_ = std::max(sib_minute_max_frame_delta_, deltas.frame_delta);
     sib_minute_max_lost_delta_ = std::max(sib_minute_max_lost_delta_, deltas.lost_delta);
-    sib_minute_groups_.insert(group.front());
+    sib_minute_groups_.insert(sibling_group.id);
     if (lines == kMaxGroupLinesPerSecond) {
       ++sib_suppressed_groups_;
       continue;
     }
     ++lines;
-    REXAPU_INFO("{}", xma::FormatSiblingGroupLine(group.front(), members));
+    REXAPU_INFO("{}", xma::FormatSiblingGroupLine(sibling_group.id, members));
   }
 
   if (now_ms - sib_minute_ms_ >= 60000) {
@@ -464,6 +473,8 @@ void XmaDecoder::MaybeEmitSiblingTrace() {
     summary.stall_fix = REXCVAR_GET(xma_stall_on_invalid_next);
     summary.skip_fix = REXCVAR_GET(xma_honor_start_skip);
     summary.reset_fix = REXCVAR_GET(xma_reset_codec_on_clear);
+    summary.trim_fix = REXCVAR_GET(xma_honor_frame_trim);
+    summary.trim_block = REXCVAR_GET(xma_frame_trim_block_granular);
     REXAPU_INFO("{} suppressed_group_lines={}", xma::FormatSiblingMinuteLine(summary),
                 sib_suppressed_groups_);
     sib_minute_ms_ = now_ms;

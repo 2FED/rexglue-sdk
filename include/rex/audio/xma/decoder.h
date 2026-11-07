@@ -102,6 +102,8 @@ class XmaDecoder {
   int64_t sib_minute_ms_ = -1;
   uint64_t sib_last_emitted_[kContextCount] = {};
   std::set<uint32_t> sib_minute_groups_;
+  // KI-071 step 3: start-burst + contiguous-buffer groups with stable ids.
+  xma::StickySiblingGrouper sib_grouper_;
   uint64_t sib_minute_max_frame_delta_ = 0;
   uint64_t sib_minute_max_lost_delta_ = 0;
   uint64_t sib_suppressed_groups_ = 0;
