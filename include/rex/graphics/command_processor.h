@@ -321,6 +321,23 @@ class CommandProcessor {
   // a read-back ensure request here (ends the open submission).
   virtual void OnIdlePoll() {}
 
+  // M11-007e deferred fence writes (d3d12_fence_write_deferred); see
+  // rex/graphics/util/deferred_fence_writes.h. All on the command processor
+  // thread. The base implementation stores at parse time.
+  // EVENT_WRITE_SHD: true when the backend queued the store (value already
+  // in guest byte order); false = store now.
+  virtual bool DeferGuestFenceWrite(uint32_t /*address*/, uint32_t /*value*/) { return false; }
+  // Called while deferred_memory_writes_pending_: at every packet boundary
+  // (waiting = false) and in every WAIT_REG_MEM poll (waiting = true once
+  // the packet really waits, after its first poll).
+  virtual void PollDeferredMemoryWrites(bool /*waiting*/) {}
+  // Idle loop, after the spin phase, while deferred_memory_writes_pending_:
+  // true when the backend waited itself (bounded, waking on wake too), so
+  // the idle loop skips its own ring-only wait.
+  virtual bool WaitIdleForDeferredMemoryWrites(rex::thread::WaitHandle* /*wake*/) { return false; }
+  // Stores a deferred value (guest byte order) and records it in the trace.
+  void StoreDeferredGuestWrite(uint32_t address, uint32_t value);
+
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
@@ -408,6 +425,9 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // M11-007e: set by the backend while deferred fence writes are queued.
+  bool deferred_memory_writes_pending_ = false;
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

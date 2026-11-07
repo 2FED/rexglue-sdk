@@ -44,6 +44,14 @@ REXCVAR_DEFINE_BOOL(d3d12_streaming_replay, true, "GPU/D3D12",
                     "thread while they are being recorded")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_fence_write_deferred, false, "GPU/D3D12",
+                    "M11-007e: store EVENT_WRITE_SHD fence values into guest memory only when "
+                    "the host GPU has completed the submission holding the work before the "
+                    "event (hardware order), instead of when the command processor parses the "
+                    "packet. The guest's fence waits then wait for real GPU progress. Counters "
+                    "fence_* on the MCLA readback minute line, kind=fence_defer INFO lines")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1056,6 +1064,11 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to create the read-back steady wait event");
     return false;
   }
+  fence_defer_event_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+  if (fence_defer_event_ == nullptr) {
+    REXGPU_ERROR("Failed to create the deferred fence write event");
+    return false;
+  }
   if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&submission_fence_)))) {
     REXGPU_ERROR("Failed to create the submission fence");
     return false;
@@ -1864,6 +1877,11 @@ void D3D12CommandProcessor::ShutdownContext() {
   FreezeWatchdogStop();
   PerfSplitShutdown();
   AwaitAllQueueOperationsCompletion();
+  // M11-007e: the GPU is idle; store whatever is left (also after a failed
+  // wait, so no guest fence is left unwritten).
+  FlushDeferredFenceWrites(UINT64_MAX, false);
+  fence_defer_queue_.Clear();
+  deferred_memory_writes_pending_ = false;
   for (uint32_t slot = 0; slot < kQueueFrames; ++slot) {
     ConsumePerformanceTimestamp(slot);
   }
@@ -2011,6 +2029,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   if (readback_steady_wait_event_) {
     CloseHandle(readback_steady_wait_event_);
     readback_steady_wait_event_ = nullptr;
+  }
+  if (fence_defer_event_) {
+    CloseHandle(fence_defer_event_);
+    fence_defer_event_ = nullptr;
   }
 
   device_removed_ = false;
@@ -3216,6 +3238,151 @@ void D3D12CommandProcessor::HonourReadbackEnsureSubmitRequest() {
 
 void D3D12CommandProcessor::OnIdlePoll() {
   HonourReadbackEnsureSubmitRequest();
+  if (deferred_memory_writes_pending_) {
+    ServiceDeferredFenceWrites(true, true);
+  }
+}
+
+namespace {
+// Waiting with the deferred fence head in the open submission while an
+// occlusion query is active: end the submission anyway after this long
+// (ending it closes the query early; never ending it could deadlock).
+constexpr uint64_t kFenceDeferQueryGraceUs = 2000;
+}  // namespace
+
+bool D3D12CommandProcessor::FenceDeferEnabled() {
+  const bool enabled = REXCVAR_GET(d3d12_fence_write_deferred);
+  if (enabled != fence_defer_was_enabled_) {
+    fence_defer_was_enabled_ = enabled;
+    if (enabled) {
+      fence_defer_queue_.RestartLines();
+    }
+    REXGPU_INFO(
+        "MCLA_READBACK_SYNC v=1 kind=fence_defer phase={} frame={} queue={} submission={} "
+        "open={}",
+        enabled ? "start" : "stop", frame_current_, fence_defer_queue_.size(), submission_current_,
+        int(submission_open_));
+  }
+  return enabled;
+}
+
+bool D3D12CommandProcessor::DeferGuestFenceWrite(uint32_t address, uint32_t value) {
+  const bool enabled = FenceDeferEnabled();
+  if (!ShouldDeferFenceWrite(enabled, fence_defer_queue_.empty()) || !submission_fence_) {
+    return false;
+  }
+  DeferredFenceWrite write;
+  write.address = address;
+  write.value = value;
+  write.submission = DeferredFenceTargetSubmission(submission_open_, submission_current_);
+  write.frame = frame_current_;
+  write.parse_us = LiveryDiag2NowUs();
+  const uint64_t completed = submission_fence_->GetCompletedValue();
+  if (!fence_defer_queue_.Push(write, completed)) {
+    return false;
+  }
+  deferred_memory_writes_pending_ = true;
+  const DeferredFenceWrite& queued = fence_defer_queue_.back();
+  if (queued.seq < kFenceDeferLines) {
+    REXGPU_INFO(
+        "MCLA_READBACK_SYNC v=1 kind=fence_defer phase=parse seq={} frame={} addr={:08X} "
+        "value={:08X} submission={} current={} open={} completed={} queue={}",
+        queued.seq, frame_current_, address, value, queued.submission, submission_current_,
+        int(submission_open_), completed, fence_defer_queue_.size());
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::FlushDeferredFenceWrites(uint64_t completed, bool waiting) {
+  if (fence_defer_queue_.empty()) {
+    deferred_memory_writes_pending_ = false;
+    return;
+  }
+  fence_defer_queue_.Flush(
+      completed, frame_current_, LiveryDiag2NowUs(), waiting,
+      [&](const DeferredFenceWrite& w, uint64_t frames, uint64_t us) {
+        StoreDeferredGuestWrite(w.address, w.value);
+        if (w.seq < kFenceDeferLines) {
+          REXGPU_INFO(
+              "MCLA_READBACK_SYNC v=1 kind=fence_defer phase=write seq={} frame={} "
+              "parse_frame={} frames={} us={} addr={:08X} value={:08X} submission={} "
+              "completed={} waiting={} queue_left={}",
+              w.seq, frame_current_, w.frame, frames, us, w.address, w.value, w.submission,
+              completed, int(waiting), fence_defer_queue_.size() - 1);
+        }
+      });
+  deferred_memory_writes_pending_ = !fence_defer_queue_.empty();
+}
+
+void D3D12CommandProcessor::ServiceDeferredFenceWrites(bool waiting, bool may_submit) {
+  if (!submission_fence_) {
+    return;
+  }
+  const uint64_t completed = submission_fence_->GetCompletedValue();
+  FlushDeferredFenceWrites(completed, waiting);
+  if (fence_defer_queue_.empty()) {
+    fence_defer_query_block_us_ = 0;
+    return;
+  }
+  if (!may_submit || PlanDeferredFenceProgress(fence_defer_queue_.head_submission(),
+                                               submission_open_, submission_current_, completed,
+                                               waiting) != DeferredFenceAction::kEndSubmission) {
+    fence_defer_query_block_us_ = 0;
+    return;
+  }
+  if (!CanEndSubmissionImmediately()) {
+    // Pipeline creation in flight: it finishes on its own threads; retry.
+    return;
+  }
+  if (active_occlusion_query_.valid) {
+    if (!waiting) {
+      return;
+    }
+    const uint64_t now_us = LiveryDiag2NowUs();
+    if (!fence_defer_query_block_us_) {
+      fence_defer_query_block_us_ = now_us;
+      return;
+    }
+    if (now_us - fence_defer_query_block_us_ < kFenceDeferQueryGraceUs) {
+      return;
+    }
+  }
+  fence_defer_query_block_us_ = 0;
+  if (EndSubmission(false)) {
+    fence_defer_queue_.NoteEarlySubmit();
+  }
+  // A fast GPU may already be done; store without waiting.
+  FlushDeferredFenceWrites(submission_fence_->GetCompletedValue(), waiting);
+}
+
+void D3D12CommandProcessor::PollDeferredMemoryWrites(bool waiting) {
+  // Packet boundaries only flush; WAIT_REG_MEM (waiting) may also submit.
+  ServiceDeferredFenceWrites(waiting, waiting);
+}
+
+bool D3D12CommandProcessor::WaitIdleForDeferredMemoryWrites(rex::thread::WaitHandle* wake) {
+  ServiceDeferredFenceWrites(true, true);
+  if (fence_defer_queue_.empty() || !submission_fence_ || !fence_defer_event_) {
+    return false;
+  }
+  const uint64_t head = fence_defer_queue_.head_submission();
+  HANDLE handles[2] = {fence_defer_event_, wake ? HANDLE(wake->native_handle()) : nullptr};
+  if (head < submission_current_) {
+    if (FAILED(submission_fence_->SetEventOnCompletion(head, fence_defer_event_))) {
+      return false;
+    }
+    // Wakes on the fence or on new ring data (also a CallInThread), bounded
+    // like the plain idle wait; alertable like it.
+    WaitForMultipleObjectsEx(handles[1] ? 2 : 1, handles, FALSE, 5, TRUE);
+  } else if (handles[1]) {
+    // Still in the open submission (it could not be ended yet): a short
+    // wait for new ring data, then retry.
+    WaitForSingleObjectEx(handles[1], 1, TRUE);
+  } else {
+    return false;
+  }
+  ServiceDeferredFenceWrites(true, true);
+  return true;
 }
 
 bool D3D12CommandProcessor::ReadbackRangeBridge::QueryRange(uint32_t guest_phys, uint32_t len,
@@ -3880,6 +4047,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // end), so that a forced read-back wait has a short backlog.
   MaybeKickReadbackSyncSubmission();
   HonourReadbackEnsureSubmitRequest();
+  // M11-007e: a draw boundary; end the open submission early when the GPU
+  // has run out of work and a deferred fence waits for it.
+  if (deferred_memory_writes_pending_) {
+    ServiceDeferredFenceWrites(false, true);
+  }
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -5287,6 +5459,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   if (submission_completed_ < await_submission) {
     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
   }
+  // M11-007e: after any (synchronous) fence observation, store the deferred
+  // fence writes that are due.
+  if (deferred_memory_writes_pending_) {
+    FlushDeferredFenceWrites(submission_completed_, false);
+  }
   if (submission_completed_ <= submission_completed_before) {
     // Not updated - no need to reclaim or download things.
     return;
@@ -5753,6 +5930,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         // M10-002 step 0: read-back counters of the minute (always on).
         REXGPU_INFO("{}", ReadbackCountersReport("minute", "minute"));
         readback_counters_ = {};
+        fence_defer_queue_.TakeCounters();
         // M10 watch census (memory_watch_census).
         if (shared_memory_) {
           const std::string watch =
@@ -6081,11 +6259,16 @@ void D3D12CommandProcessor::ShutdownReadbackGpuTimers() {
 }
 
 std::string D3D12CommandProcessor::ReadbackCountersReport(const char* kind, const char* reason) {
-  return ReadbackReport(
-      readback_counters_, kind, reason, frame_current_,
-      LiveryDiagReadbackModeName(GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
-      REXCVAR_GET(d3d12_readback_elide_unread), REXCVAR_GET(d3d12_readback_gpu_timing),
-      readback_timestamp_frequency_);
+  // M11-007e: fence_* fields only while d3d12_fence_write_deferred is on or
+  // something was counted in the window (the line is unchanged otherwise).
+  return ReadbackReport(readback_counters_, kind, reason, frame_current_,
+                        LiveryDiagReadbackModeName(
+                            GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve))),
+                        REXCVAR_GET(d3d12_readback_elide_unread),
+                        REXCVAR_GET(d3d12_readback_gpu_timing), readback_timestamp_frequency_) +
+         FormatDeferredFenceFields(fence_defer_queue_.counters(),
+                                   REXCVAR_GET(d3d12_fence_write_deferred),
+                                   fence_defer_queue_.size());
 }
 
 bool D3D12CommandProcessor::InitializePerformanceTelemetry() {

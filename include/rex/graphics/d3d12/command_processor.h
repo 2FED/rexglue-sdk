@@ -44,6 +44,7 @@
 #include <rex/graphics/util/livery_diag.h>
 #include <rex/graphics/readback_range.h>
 #include <rex/graphics/util/livery_diag2.h>
+#include <rex/graphics/util/deferred_fence_writes.h>
 #include <rex/graphics/util/readback_pending.h>
 #include <rex/graphics/util/readback_slots.h>
 #include <rex/graphics/util/readback_sync.h>
@@ -234,7 +235,12 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   void OnPrimaryBufferEnd() override;
   // M11-007c: honours a read-back ensure request while the ring is empty.
+  // M11-007e: also services the deferred fence writes.
   void OnIdlePoll() override;
+  // M11-007e d3d12_fence_write_deferred (deferred_fence_writes.h).
+  bool DeferGuestFenceWrite(uint32_t address, uint32_t value) override;
+  void PollDeferredMemoryWrites(bool waiting) override;
+  bool WaitIdleForDeferredMemoryWrites(rex::thread::WaitHandle* wake) override;
 
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
@@ -353,6 +359,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // be ended now; else keeps the request for the next opportunity (before a
   // draw, the idle loop; the frame end ends the submission anyway).
   void HonourReadbackEnsureSubmitRequest();
+  // M11-007e: stores the due deferred fence writes (completed = the
+  // submission fence value just observed).
+  void FlushDeferredFenceWrites(uint64_t completed, bool waiting);
+  // M11-007e: polls the fence, flushes, and (may_submit) ends the open
+  // submission when the queue head waits for it and the command processor
+  // is waiting or the GPU has run out of work.
+  void ServiceDeferredFenceWrites(bool waiting, bool may_submit);
+  bool FenceDeferEnabled();
 
   void EmitRenderAuditSummary(const char* phase);
 
@@ -590,6 +604,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // registered and sets its event later; on fence_completion_event_ that
   // late signal would end a later INFINITE wait early.
   HANDLE readback_steady_wait_event_ = nullptr;
+  // M11-007e: auto-reset event for the idle wait on the deferred fence head
+  // (late signals of earlier registrations only cause an extra re-poll).
+  HANDLE fence_defer_event_ = nullptr;
+  DeferredFenceWriteQueue fence_defer_queue_;
+  bool fence_defer_was_enabled_ = false;
+  // Waiting with the head in the open submission while an occlusion query
+  // is active: when the wait began (0 = not blocked). The submission is
+  // ended anyway after kFenceDeferQueryGraceUs.
+  uint64_t fence_defer_query_block_us_ = 0;
 
   bool submission_open_ = false;
   // Values of submission_fence_.

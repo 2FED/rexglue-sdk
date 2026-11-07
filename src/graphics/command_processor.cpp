@@ -379,7 +379,10 @@ void CommandProcessor::WorkerThreadMain() {
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        // M11-007e: with deferred fence writes outstanding the backend waits
+        // for the GPU fence or new ring data instead (never the ring alone).
+        if (loop_count > 500 && !(deferred_memory_writes_pending_ &&
+                                  WaitIdleForDeferredMemoryWrites(write_ptr_index_event_.get()))) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
@@ -867,6 +870,9 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (deferred_memory_writes_pending_) {
+    PollDeferredMemoryWrites(false);
+  }
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -1242,7 +1248,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   // Immediately satisfied packets need no clock reads. A waited packet records
   // one completed episode, not a clock read on each polling iteration.
   std::chrono::steady_clock::time_point wait_begin;
+  // M11-007e: the first poll only flushes due deferred fence writes; once
+  // the packet really waits, the backend may also end the open submission.
+  bool wrm_polled = false;
   const auto poll = [&]() {
+    if (deferred_memory_writes_pending_) {
+      PollDeferredMemoryWrites(wrm_polled);
+    }
+    wrm_polled = true;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -1507,9 +1520,19 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
+  // M11-007e: the hardware stores when the GPU reaches the event; the
+  // backend may queue the store until the host GPU has passed it.
+  if (DeferGuestFenceWrite(address, data_value)) {
+    return true;
+  }
   memory::store(memory_->TranslatePhysical(address), data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
+}
+
+void CommandProcessor::StoreDeferredGuestWrite(uint32_t address, uint32_t value) {
+  memory::store(memory_->TranslatePhysical(address), value);
+  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
 }
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader,
