@@ -7,6 +7,7 @@
 
 #include <rex/audio/xma/frame_walk.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/stream.h>
 
 using rex::audio::xma::AnalyzePacketFrames;
@@ -479,4 +480,17 @@ TEST_CASE("XMA walk: packet analysis equals the upstream GetPacketInfo", "[audio
     }
   }
   CHECK(compared > 1000);
+}
+
+TEST_CASE("XMA walk: the frame-walk fix is on by default", "[audio][xma][walk]") {
+  // KI-071 verified fixed (l76 owner run and offline trace replay): l77 makes
+  // the fix the default; false restores the upstream walk.
+  const rex::cvar::FlagEntry* fix = rex::cvar::GetFlagInfo("xma_frame_walk_fix");
+  const rex::cvar::FlagEntry* trace = rex::cvar::GetFlagInfo("xma_frame_walk_trace");
+  REQUIRE(fix);
+  REQUIRE(trace);
+  CHECK(fix->default_value == "true");
+  CHECK(trace->default_value == "false");
+  rex::cvar::ResetToDefault("xma_frame_walk_fix");
+  CHECK(REXCVAR_GET(xma_frame_walk_fix));
 }

@@ -98,11 +98,15 @@ REXCVAR_DEFINE_BOOL(xma_frame_walk_trace, false, "Audio",
                     "KI-071: log the first 8 XMA frame-walk anomalies per context (a frame "
                     "starting before the previous frame's end or after a skipped frame start); "
                     "the counters in MCLA_XMA_SIB always run");
-REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, false, "Audio",
-                    "KI-071: count an XMA frame whose 15-bit header straddles the packet end "
-                    "from the previous frame's trailer bit (upstream relies on the packet "
-                    "header frame count and skips the frame), and never re-decode bits before "
-                    "the previous frame's end within a packet");
+REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, true, "Audio",
+                    "KI-071 (on by default since l77, verified fixed): count an XMA frame whose "
+                    "15-bit header straddles the packet end from the previous frame's trailer "
+                    "bit (upstream relies on the packet header frame count and skips the "
+                    "frame), and never re-decode bits before the previous frame's end within a "
+                    "packet; false restores the upstream walk. In MCLA_XMA_SIB, "
+                    "walk_split_lost counts unclaimed split tails (unconfirmed: real or "
+                    "padding); the real loss is walk_split_real - walk_split_claimed - "
+                    "walk_split_counted");
 REXCVAR_DEFINE_BOOL(xma_dump_input, false, "Audio",
                     "KI-071: with xma_dump_contexts, also write each dumped context's input "
                     "buffers (<wav>-input.bin, 2 KiB packets in decode order, index "

@@ -42,6 +42,7 @@
 REXCVAR_DECLARE(bool, xma_frame_walk_trace);
 // Count a frame whose header straddles the packet end from the trailer bit
 // (ClaimSplitTail) and never re-decode bits before the previous frame's end.
+// Default true (KI-071 verified fixed); false restores the upstream walk.
 REXCVAR_DECLARE(bool, xma_frame_walk_fix);
 // With xma_dump_contexts: also write each dumped context's input buffers and
 // a per-frame walk record.
@@ -467,7 +468,8 @@ struct WalkMinuteTotals {
   uint64_t boundary = 0;       // frames spanning a packet boundary (incl. split header)
   uint64_t split_tail = 0;     // frames ending with 1-14 bits left and trailer 1
   uint64_t split_counted = 0;  // ... whose next frame upstream counts (header count)
-  uint64_t split_lost = 0;     // ... whose next frame upstream skips (fix off)
+  uint64_t split_lost = 0;     // ... not counted and not claimed: unconfirmed tails
+                               // (real or padding); real loss = split_real - claimed - counted
   uint64_t split_real = 0;     // ... confirmed by the next packet's continuation
   uint64_t split_claimed = 0;  // split tails claimed by xma_frame_walk_fix
   uint64_t split_padding = 0;  // claimed tails found to be padding later (fix)
