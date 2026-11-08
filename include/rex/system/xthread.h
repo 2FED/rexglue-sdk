@@ -27,6 +27,7 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xtimer.h>
 #include <rex/system/xtypes.h>
+#include <rex/system/zero_delay.h>
 #include <rex/thread.h>
 #include <rex/thread/mutex.h>
 
@@ -396,6 +397,10 @@ class XThread : public XObject {
   X_STATUS DelayNative(uint32_t alertable, int64_t timeout_ticks);
   // l80: a kernel or user APC is queued on this guest thread.
   bool HasPendingApc();
+  // l81 (KI-060, ke_delay_zero_mode): the guest call site of the current
+  // KeDelayExecutionThread (rex/system/zero_delay.h GuestCallerSite), 0 if
+  // unknown.
+  uint32_t GuestDelayCallSite();
 
   rex::thread::Thread* thread() { return thread_.get(); }
   runtime::ThreadState* thread_state() { return thread_state_.get(); }
@@ -442,6 +447,8 @@ class XThread : public XObject {
   std::unique_ptr<runtime::ThreadState> thread_state_;
 
   int32_t priority_ = 0;
+  // l81 (KI-060): zero-delay streak of this thread (touched only by itself).
+  ZeroDelayStreak zero_delay_streak_;
 
 #if REX_PLATFORM_LINUX
   std::mutex suspend_mutex_;

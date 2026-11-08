@@ -39,6 +39,7 @@
 #include <rex/system/xevent.h>
 #include <rex/system/xmutant.h>
 #include <rex/system/xthread.h>
+#include <rex/system/zero_delay.h>
 #include <rex/thread.h>
 #include <rex/vec128.h>
 
@@ -59,6 +60,39 @@ REXCVAR_DEFINE_STRING(ke_delay_short_sleep_mode,
                       "no timer: native). Default hires_timer under Wine/Proton, native on "
                       "Windows. Counters: MCLA_SLEEP kind=minute")
     .allowed({"native", "yield", "hires_timer"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(ke_delay_zero_mode, rex::CurrentPlatformDefaults().ke_delay_zero_mode,
+                      "Kernel",
+                      "l81 (KI-060): repeated zero guest delays (KeDelayExecutionThread(0), "
+                      "Sleep(0)). native: each one is a host yield, as before; backoff: after "
+                      "ke_delay_zero_backoff_after zero delays in a row (each starting less than "
+                      "ke_delay_zero_gap_us after the previous delay of the same thread ended), "
+                      "sleep on the thread's high-resolution timer instead, from 50 us doubling "
+                      "up to ke_delay_zero_backoff_max_us. Alertable zero delays and delays with "
+                      "a pending APC stay native; any non-zero delay or gap ends the streak. "
+                      "Default backoff under Wine/Proton (each yield is a syscall), native on "
+                      "Windows. Counters: MCLA_SLEEP zero_backoffs/zero_streak_max/top_site")
+    .allowed({"native", "backoff"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(ke_delay_zero_backoff_after, 32, "Kernel",
+                     "l81 (KI-060, ke_delay_zero_mode=backoff): zero delays of a streak that "
+                     "stay native before the backoff starts (1..1048576)")
+    .range(1, 1 << 20)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(ke_delay_zero_backoff_max_us, 500, "Kernel",
+                     "l81 (KI-060, ke_delay_zero_mode=backoff): longest backoff sleep in "
+                     "microseconds (50..2000)")
+    .range(50, 2000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(ke_delay_zero_gap_us, 200, "Kernel",
+                     "l81 (KI-060, ke_delay_zero_mode=backoff): a zero delay continues the "
+                     "streak only if the previous delay of the same thread ended less than this "
+                     "many microseconds before (1..100000)")
+    .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::system {
@@ -151,6 +185,36 @@ ShortSleepMode CurrentShortSleepMode() {
   return mode;
 }
 
+// l81 (KI-060): ke_delay_zero_mode and its limits, latched at the first delay.
+const ZeroDelayConfig& CurrentZeroDelayConfig() {
+  static const ZeroDelayConfig config = MakeZeroDelayConfig(
+      REXCVAR_GET(ke_delay_zero_backoff_after), REXCVAR_GET(ke_delay_zero_backoff_max_us),
+      REXCVAR_GET(ke_delay_zero_gap_us));
+  return config;
+}
+
+ZeroDelayMode CurrentZeroDelayMode() {
+  static const ZeroDelayMode mode = [] {
+    const std::string& text = REXCVAR_GET(ke_delay_zero_mode);
+    const std::optional<ZeroDelayMode> parsed = ParseZeroDelayMode(text);
+    if (!parsed) {
+      REXSYS_WARN("KI-060: ke_delay_zero_mode '{}' unknown, using native", text);
+    }
+    const ZeroDelayMode result = parsed.value_or(ZeroDelayMode::kNative);
+    const ZeroDelayConfig& c = CurrentZeroDelayConfig();
+    REXSYS_INFO(
+        "KI-060: repeated zero guest delays mode={} after={} max_us={} gap_us={} "
+        "(ke_delay_zero_mode)",
+        ZeroDelayModeName(result), c.after, c.max_us, c.gap_us);
+    return result;
+  }();
+  return mode;
+}
+
+int64_t SteadyMicros(std::chrono::steady_clock::time_point t) {
+  return std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count();
+}
+
 // Per-minute MCLA_SLEEP counters, shared by all guest threads (relaxed
 // atomics; a minute's numbers may be off by the calls racing the emit).
 struct ShortSleepCounters {
@@ -166,16 +230,59 @@ struct ShortSleepCounters {
   std::atomic<uint64_t> slept_us{0};
   std::atomic<uint64_t> slept_us_max{0};
   std::atomic<int64_t> next_emit_ms{0};
+  // l81 (ke_delay_zero_mode)
+  std::atomic<uint64_t> zero_backoffs{0};
+  std::atomic<uint64_t> zero_backoff_us{0};
+  std::atomic<uint64_t> zero_streak_max{0};
   struct Slot {
     std::atomic<uint32_t> thread_id{0};
     std::atomic<uint64_t> count{0};
   };
   std::array<Slot, 32> slots;
+  // l81: zero delays per guest call site (thread_id holds the site address).
+  std::array<Slot, 32> site_slots;
 };
 
 ShortSleepCounters& GetShortSleepCounters() {
   static ShortSleepCounters counters;
   return counters;
+}
+
+ShortSleepCounters::Slot* FindSiteSlot(uint32_t site) {
+  for (ShortSleepCounters::Slot& slot : GetShortSleepCounters().site_slots) {
+    uint32_t current = slot.thread_id.load(std::memory_order_relaxed);
+    if (current == 0 &&
+        slot.thread_id.compare_exchange_strong(current, site, std::memory_order_relaxed)) {
+      current = site;
+    }
+    if (current == site) {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
+
+// l81: counts a zero delay at a guest call site (0 = unknown, not counted).
+void NoteZeroDelaySite(uint32_t site) {
+  if (!site) {
+    return;
+  }
+  thread_local ShortSleepCounters::Slot* cached = nullptr;
+  thread_local uint32_t cached_site = 0;
+  if (!cached || cached_site != site) {
+    cached = FindSiteSlot(site);
+    cached_site = cached ? site : 0;
+  }
+  if (cached) {
+    cached->count.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void NoteZeroStreak(uint32_t streak) {
+  std::atomic<uint64_t>& max_streak = GetShortSleepCounters().zero_streak_max;
+  uint64_t max = max_streak.load(std::memory_order_relaxed);
+  while (streak > max &&
+         !max_streak.compare_exchange_weak(max, streak, std::memory_order_relaxed)) {}
 }
 
 ShortSleepCounters::Slot* FindShortSleepSlot(uint32_t thread_id) {
@@ -232,7 +339,17 @@ void MaybeEmitShortSleepMinute() {
       s.top_thread_id = slot.thread_id.load(std::memory_order_relaxed);
     }
   }
-  REXSYS_INFO("{}", FormatShortSleepMinute(s, CurrentShortSleepMode()));
+  s.zero_backoffs = c.zero_backoffs.exchange(0, std::memory_order_relaxed);
+  s.zero_backoff_us = c.zero_backoff_us.exchange(0, std::memory_order_relaxed);
+  s.zero_streak_max = c.zero_streak_max.exchange(0, std::memory_order_relaxed);
+  for (ShortSleepCounters::Slot& slot : c.site_slots) {
+    const uint64_t count = slot.count.exchange(0, std::memory_order_relaxed);
+    if (count > s.top_site_zero) {
+      s.top_site_zero = count;
+      s.top_site = slot.thread_id.load(std::memory_order_relaxed);
+    }
+  }
+  REXSYS_INFO("{}", FormatShortSleepMinute(s, CurrentShortSleepMode(), CurrentZeroDelayMode()));
 }
 
 void NoteShortSleep(uint32_t thread_id, bool alertable, bool alerted, int64_t scaled_ticks,
@@ -252,6 +369,9 @@ void NoteShortSleep(uint32_t thread_id, bool alertable, bool alerted, int64_t sc
     c.yields.fetch_add(1, std::memory_order_relaxed);
   } else if (done == ShortSleepAction::kHiresTimer) {
     c.timers.fetch_add(1, std::memory_order_relaxed);
+  } else if (done == ShortSleepAction::kZeroBackoff) {
+    c.zero_backoffs.fetch_add(1, std::memory_order_relaxed);
+    c.zero_backoff_us.fetch_add(slept_us, std::memory_order_relaxed);
   }
   c.requested_us.fetch_add(uint64_t(scaled_ticks / 10), std::memory_order_relaxed);
   c.slept_us.fetch_add(slept_us, std::memory_order_relaxed);
@@ -1169,13 +1289,44 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   if (scaled_ticks > 0 && !REXCVAR_GET(clock_no_scaling)) {
     scaled_ticks = int64_t(double(scaled_ticks) * chrono::Clock::guest_time_scalar());
   }
+  const auto start = std::chrono::steady_clock::now();
+
+  // l81 (KI-060): repeated zero delays (ke_delay_zero_mode). Every delay
+  // updates the thread's streak; a non-zero, absolute or alertable delay
+  // ends it.
+  uint32_t zero_backoff_us = 0;
+  bool zero_tracked = false;
+  if (scaled_ticks == 0) {
+    NoteZeroDelaySite(GuestDelayCallSite());
+  }
+  if (CurrentZeroDelayMode() == ZeroDelayMode::kBackoff) {
+    zero_tracked = scaled_ticks == 0 && !alertable && !HasPendingApc();
+    zero_backoff_us = PlanZeroDelay(zero_delay_streak_, CurrentZeroDelayConfig(), zero_tracked,
+                                    SteadyMicros(start));
+    if (zero_tracked) {
+      NoteZeroStreak(zero_delay_streak_.streak);
+    }
+  }
+
   if (!IsShortSleep(scaled_ticks)) {
     return DelayNative(alertable, timeout_ticks);
   }
-  const auto start = std::chrono::steady_clock::now();
   ShortSleepAction done = ShortSleepAction::kNative;
   X_STATUS result = X_STATUS_SUCCESS;
-  switch (PlanShortSleep(CurrentShortSleepMode(), scaled_ticks)) {
+  if (zero_backoff_us) {
+    CheckTitleTermination();
+    rex::thread::SleepResult sleep_result = rex::thread::SleepResult::kSuccess;
+    if (rex::thread::HighResolutionSleep(std::chrono::microseconds(zero_backoff_us), false,
+                                         &sleep_result)) {
+      CheckTitleTermination();
+      done = ShortSleepAction::kZeroBackoff;
+    } else {
+      counters.fallbacks.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  switch (done == ShortSleepAction::kZeroBackoff
+              ? ShortSleepAction::kZeroBackoff
+              : PlanShortSleep(CurrentShortSleepMode(), scaled_ticks)) {
     case ShortSleepAction::kHiresTimer: {
       CheckTitleTermination();
       rex::thread::SleepResult sleep_result = rex::thread::SleepResult::kSuccess;
@@ -1199,6 +1350,7 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
         done = ShortSleepAction::kYield;
       }
       break;
+    case ShortSleepAction::kZeroBackoff:
     case ShortSleepAction::kNative:
     default:
       break;
@@ -1206,11 +1358,27 @@ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t in
   if (done == ShortSleepAction::kNative) {
     result = DelayNative(alertable, timeout_ticks);
   }
-  NoteShortSleep(handle(), alertable != 0, result == X_STATUS_USER_APC, scaled_ticks, done,
-                 uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now() - start)
-                              .count()));
+  const auto end = std::chrono::steady_clock::now();
+  if (zero_tracked) {
+    NoteZeroDelayEnd(zero_delay_streak_, SteadyMicros(end));
+  }
+  NoteShortSleep(
+      handle(), alertable != 0, result == X_STATUS_USER_APC, scaled_ticks, done,
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()));
   return result;
+}
+
+uint32_t XThread::GuestDelayCallSite() {
+  if (!thread_state_ || !thread_state_->context() || stack_limit_ >= stack_base_) {
+    return 0;
+  }
+  // The guest stack is one contiguous range of one heap: translate once.
+  const uint8_t* stack_host = memory()->TranslateVirtual<const uint8_t*>(stack_limit_);
+  const uint32_t limit = stack_limit_;
+  return GuestCallerSite(thread_state_->context()->r1.u32, stack_limit_, stack_base_,
+                         [stack_host, limit](uint32_t address) {
+                           return memory::load_and_swap<uint32_t>(stack_host + (address - limit));
+                         });
 }
 
 X_STATUS XThread::DelayNative(uint32_t alertable, int64_t timeout_ticks) {

@@ -68,6 +68,7 @@ add_executable(unit_tests
     system/thread_start_test.cpp
     system/crash_report_test.cpp
     system/short_sleep_test.cpp
+    system/zero_delay_test.cpp
     codegen/manifest_test.cpp
     rexglue/migration_scan_test.cpp
     rexglue/ui_test.cpp

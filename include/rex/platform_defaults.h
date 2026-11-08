@@ -33,6 +33,8 @@ struct PlatformDefaults {
   // audio/audio_system.cpp, audio/xma_decoder.cpp: "normal", "above_normal"
   // or "highest"
   const char* apu_worker_priority = "normal";
+  // l81 system/xthread.cpp (KI-060): "native" or "backoff"
+  const char* ke_delay_zero_mode = "native";
 };
 
 constexpr PlatformDefaults SelectPlatformDefaults(bool is_wine) {
@@ -43,6 +45,7 @@ constexpr PlatformDefaults SelectPlatformDefaults(bool is_wine) {
   d.d3d12_texture_placed_heaps = !is_wine;
   d.ke_delay_short_sleep_mode = is_wine ? "hires_timer" : "native";
   d.apu_worker_priority = is_wine ? "above_normal" : "normal";
+  d.ke_delay_zero_mode = is_wine ? "backoff" : "native";
   return d;
 }
 

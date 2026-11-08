@@ -34,6 +34,8 @@
 
 #include <fmt/format.h>
 
+#include <rex/system/zero_delay.h>
+
 namespace rex::system {
 
 enum class ShortSleepMode : uint8_t { kNative, kYield, kHiresTimer };
@@ -78,7 +80,9 @@ constexpr bool IsShortSleep(int64_t scaled_ticks) {
   return scaled_ticks >= 0 && scaled_ticks < kShortSleepLimitTicks;
 }
 
-enum class ShortSleepAction : uint8_t { kNative, kYield, kHiresTimer };
+// kZeroBackoff (l81): a zero delay carried out as a backoff sleep
+// (ke_delay_zero_mode=backoff); never returned by PlanShortSleep.
+enum class ShortSleepAction : uint8_t { kNative, kYield, kHiresTimer, kZeroBackoff };
 
 constexpr ShortSleepAction PlanShortSleep(ShortSleepMode mode, int64_t scaled_ticks) {
   if (!IsShortSleep(scaled_ticks) || mode == ShortSleepMode::kNative) {
@@ -134,18 +138,27 @@ struct ShortSleepMinuteStats {
   uint64_t slept_us_max = 0;
   uint32_t top_thread_id = 0;  // handle of the guest thread with the most short sleeps
   uint64_t top_thread_short = 0;
+  // l81 (ke_delay_zero_mode, rex/system/zero_delay.h)
+  uint64_t zero_backoffs = 0;    // zero delays carried out as a backoff sleep
+  uint64_t zero_backoff_us = 0;  // measured wall time of those sleeps
+  uint64_t zero_streak_max = 0;  // longest zero-delay streak of any thread
+  uint32_t top_site = 0;         // guest call site with the most zero delays
+  uint64_t top_site_zero = 0;
 };
 
-inline std::string FormatShortSleepMinute(const ShortSleepMinuteStats& s, ShortSleepMode mode) {
+inline std::string FormatShortSleepMinute(const ShortSleepMinuteStats& s, ShortSleepMode mode,
+                                          ZeroDelayMode zero_mode = ZeroDelayMode::kNative) {
   const uint64_t avg_us = s.short_sleeps ? s.slept_us_total / s.short_sleeps : 0;
   const uint64_t req_avg_us = s.short_sleeps ? s.requested_us_total / s.short_sleeps : 0;
   return fmt::format(
       "MCLA_SLEEP v=1 kind=minute short_sleeps={} mode={} avg_us={} max_us={} req_avg_us={} "
       "zero={} alertable={} alerted={} yields={} timers={} fallbacks={} delays={} "
-      "top_thread={:08X} top_short={}",
+      "top_thread={:08X} top_short={} zero_mode={} zero_backoffs={} zero_backoff_us={} "
+      "zero_streak_max={} top_site={:08X} top_site_zero={}",
       s.short_sleeps, ShortSleepModeName(mode), avg_us, s.slept_us_max, req_avg_us, s.zero,
       s.alertable, s.alerted, s.yields, s.timers, s.fallbacks, s.delays, s.top_thread_id,
-      s.top_thread_short);
+      s.top_thread_short, ZeroDelayModeName(zero_mode), s.zero_backoffs, s.zero_backoff_us,
+      s.zero_streak_max, s.top_site, s.top_site_zero);
 }
 
 }  // namespace rex::system

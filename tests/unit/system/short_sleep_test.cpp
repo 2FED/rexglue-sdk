@@ -74,7 +74,8 @@ TEST_CASE("Short sleep: MCLA_SLEEP minute line", "[system][short_sleep]") {
   CHECK(FormatShortSleepMinute(s, ShortSleepMode::kNative) ==
         "MCLA_SLEEP v=1 kind=minute short_sleeps=0 mode=native avg_us=0 max_us=0 req_avg_us=0 "
         "zero=0 alertable=0 alerted=0 yields=0 timers=0 fallbacks=0 delays=0 "
-        "top_thread=00000000 top_short=0");
+        "top_thread=00000000 top_short=0 zero_mode=native zero_backoffs=0 zero_backoff_us=0 "
+        "zero_streak_max=0 top_site=00000000 top_site_zero=0");
   s.delays = 12;
   s.short_sleeps = 4;
   s.zero = 1;
@@ -89,7 +90,20 @@ TEST_CASE("Short sleep: MCLA_SLEEP minute line", "[system][short_sleep]") {
   CHECK(FormatShortSleepMinute(s, ShortSleepMode::kHiresTimer) ==
         "MCLA_SLEEP v=1 kind=minute short_sleeps=4 mode=hires_timer avg_us=1100 max_us=1500 "
         "req_avg_us=750 zero=1 alertable=3 alerted=1 yields=0 timers=3 fallbacks=0 delays=12 "
-        "top_thread=F800068C top_short=4");
+        "top_thread=F800068C top_short=4 zero_mode=native zero_backoffs=0 zero_backoff_us=0 "
+        "zero_streak_max=0 top_site=00000000 top_site_zero=0");
+  // l81: ke_delay_zero_mode counters are appended.
+  s.zero_backoffs = 2000;
+  s.zero_backoff_us = 1000000;
+  s.zero_streak_max = 4096;
+  s.top_site = 0x821449D0;
+  s.top_site_zero = 2100;
+  CHECK(FormatShortSleepMinute(s, ShortSleepMode::kHiresTimer,
+                               rex::system::ZeroDelayMode::kBackoff) ==
+        "MCLA_SLEEP v=1 kind=minute short_sleeps=4 mode=hires_timer avg_us=1100 max_us=1500 "
+        "req_avg_us=750 zero=1 alertable=3 alerted=1 yields=0 timers=3 fallbacks=0 delays=12 "
+        "top_thread=F800068C top_short=4 zero_mode=backoff zero_backoffs=2000 "
+        "zero_backoff_us=1000000 zero_streak_max=4096 top_site=821449D0 top_site_zero=2100");
 }
 
 TEST_CASE("Short sleep: high-resolution sleep is never early", "[system][short_sleep]") {
