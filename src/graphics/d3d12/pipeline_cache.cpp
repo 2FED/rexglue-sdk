@@ -67,11 +67,13 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
-REXCVAR_DEFINE_BOOL(d3d12_blend_minmax_fix, false, "GPU/D3D12",
+REXCVAR_DEFINE_BOOL(d3d12_blend_minmax_fix, true, "GPU/D3D12",
                     "l80 (KI-013): with host render targets, apply the source blend factor "
                     "(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ZERO) of MIN/MAX blending in the pixel "
                     "shader when the destination factor is ONE - the Xbox 360 GPU applies the "
-                    "factors in MIN/MAX, Direct3D 12 ignores them");
+                    "factors in MIN/MAX, Direct3D 12 ignores them. Default on since l81 (owner "
+                    "PASS on l80: traffic-light reflections on cars fixed, no HUD or glow "
+                    "regression); false restores the pre-l80 output");
 
 namespace rex::graphics::d3d12 {
 

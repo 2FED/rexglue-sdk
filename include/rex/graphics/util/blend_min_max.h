@@ -22,7 +22,8 @@
  * depending on the destination or the blend constant, SRC_COLOR for RGB) are
  * left unchanged (MinMaxSourceScale::kNone), keeping the old behavior.
  *
- * Gated by the d3d12_blend_minmax_fix cvar (default off for the owner A/B).
+ * Gated by the d3d12_blend_minmax_fix cvar (default on since l81, after the
+ * owner PASS on l80).
  * Own design from the problem description (no third-party code). Header-only,
  * unit-tested (tests/unit/graphics/blend_min_max_test.cpp).
  */
