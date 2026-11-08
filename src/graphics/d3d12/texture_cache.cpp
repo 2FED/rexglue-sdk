@@ -26,6 +26,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/platform_defaults.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -33,8 +34,10 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
-REXCVAR_DEFINE_BOOL(d3d12_texture_placed_heaps, false, "GPU",
-                    "l79: create D3D12 guest textures as placed resources inside shared "
+REXCVAR_DEFINE_BOOL(d3d12_texture_placed_heaps,
+                    rex::CurrentPlatformDefaults().d3d12_texture_placed_heaps, "GPU",
+                    "l79 (l80 default: on under Windows, off under Wine/Proton, where "
+                    "vkd3d-proton committed creation is already fast): create D3D12 guest textures as placed resources inside shared "
                     "d3d12_texture_heap_block_mb heaps (first fit, 4 KB small-resource "
                     "alignment where allowed) instead of one committed resource (one kernel "
                     "allocation) each; resources above half a block and failures fall back to "

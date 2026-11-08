@@ -17,6 +17,7 @@ add_library(rexcore OBJECT
     mutex.cpp
     perf/frame_audit.cpp
     perf/perf_split.cpp
+    platform_defaults.cpp
     readback_range.cpp
     ring_buffer.cpp
     sha256.cpp

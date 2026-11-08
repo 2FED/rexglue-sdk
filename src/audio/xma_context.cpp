@@ -32,6 +32,7 @@
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/platform.h>
+#include <rex/platform_defaults.h>
 #include <rex/stream.h>
 
 extern "C" {
@@ -109,8 +110,9 @@ REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, true, "Audio",
                     "padding); the real loss is walk_split_real - walk_split_claimed - "
                     "walk_split_counted");
 // Xenia Canary XMA fixes (BSD-3), see rex/audio/xma/canary_fixes.h.
-REXCVAR_DEFINE_BOOL(xma_canary_fixes, false, "Audio",
-                    "l79: XMA decoder fixes ported from Xenia Canary (BSD-3): drain a partly "
+REXCVAR_DEFINE_BOOL(xma_canary_fixes, rex::CurrentPlatformDefaults().xma_canary_fixes,
+                    "Audio",
+                    "l79 (default on since l80): XMA decoder fixes ported from Xenia Canary (BSD-3): drain a partly "
                     "delivered frame before Work ends (6bef1fbed), follow a frameless packet's "
                     "skip count to the next packet of the same sub-stream (7015473a7), move a "
                     "loop_start that is not a frame boundary to the next frame start "

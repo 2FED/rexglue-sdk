@@ -24,6 +24,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/platform_defaults.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
 #include <rex/thread/timer_queue_wait.h>
@@ -40,17 +41,19 @@
 #define REX_TIMER_QUEUE_X86 1
 #endif
 
-REXCVAR_DEFINE_BOOL(timer_queue_blocking_wait, false, "Kernel",
-                    "l79: the host timer queue thread (KeTimeStampBundle 1 ms tick on Windows; "
+REXCVAR_DEFINE_BOOL(timer_queue_blocking_wait,
+                    rex::CurrentPlatformDefaults().timer_queue_blocking_wait, "Kernel",
+                    "l79 (default on since l80, all platforms): the host timer queue thread (KeTimeStampBundle 1 ms tick on Windows; "
                     "all guest timers on Linux) blocks on a high-resolution waitable timer and a "
                     "wake event until timer_queue_spin_tail_us before the next deadline and "
                     "spins only that tail, instead of spinning/yielding the whole time. Needs "
                     "CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); otherwise the "
                     "spin path stays. Dispatch lateness: MCLA_TIMERQ kind=minute");
-REXCVAR_DEFINE_INT32(timer_queue_spin_tail_us, 200, "Kernel",
+REXCVAR_DEFINE_INT32(timer_queue_spin_tail_us,
+                     rex::CurrentPlatformDefaults().timer_queue_spin_tail_us, "Kernel",
                      "l79: with timer_queue_blocking_wait, wake this many microseconds before "
                      "the next timer deadline and spin the rest (0 = no spin tail; clamped to "
-                     "0..5000)");
+                     "0..5000). l80 default: 200 on Windows, 50 under Wine/Proton");
 
 namespace dp = disruptorplus;
 
