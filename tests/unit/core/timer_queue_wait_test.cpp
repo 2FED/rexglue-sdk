@@ -37,19 +37,15 @@ TEST_CASE("Timer queue wait: no timer blocks until a queue wake", "[core][timer_
 TEST_CASE("Timer queue wait: due or overdue timer runs at once", "[core][timer_queue]") {
   const auto now = clock_t_::now();
   CHECK(PlanTimerWait<clock_t_>(now, true, now, kTail, kMin).kind == TimerWaitKind::kRunDue);
-  CHECK(PlanTimerWait<clock_t_>(now, true, now - 3ms, kTail, kMin).kind ==
-        TimerWaitKind::kRunDue);
+  CHECK(PlanTimerWait<clock_t_>(now, true, now - 3ms, kTail, kMin).kind == TimerWaitKind::kRunDue);
 }
 
 TEST_CASE("Timer queue wait: inside the spin tail spins", "[core][timer_queue]") {
   const auto now = clock_t_::now();
-  CHECK(PlanTimerWait<clock_t_>(now, true, now + 100us, kTail, kMin).kind ==
-        TimerWaitKind::kSpin);
-  CHECK(PlanTimerWait<clock_t_>(now, true, now + 500us, kTail, kMin).kind ==
-        TimerWaitKind::kSpin);
+  CHECK(PlanTimerWait<clock_t_>(now, true, now + 100us, kTail, kMin).kind == TimerWaitKind::kSpin);
+  CHECK(PlanTimerWait<clock_t_>(now, true, now + 500us, kTail, kMin).kind == TimerWaitKind::kSpin);
   // Remaining block shorter than min_block (500 + 30 us): spin as well.
-  CHECK(PlanTimerWait<clock_t_>(now, true, now + 530us, kTail, kMin).kind ==
-        TimerWaitKind::kSpin);
+  CHECK(PlanTimerWait<clock_t_>(now, true, now + 530us, kTail, kMin).kind == TimerWaitKind::kSpin);
 }
 
 TEST_CASE("Timer queue wait: blocks until the spin tail before the deadline",

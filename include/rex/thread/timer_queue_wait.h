@@ -51,8 +51,9 @@ TimerWaitPlan<Clock> PlanTimerWait(typename Clock::time_point now, bool has_due,
     plan.kind = TimerWaitKind::kRunDue;
     return plan;
   }
-  if (spin_tail < typename Clock::duration::zero()) {
-    spin_tail = typename Clock::duration::zero();
+  using Duration = typename Clock::duration;
+  if (spin_tail < Duration::zero()) {
+    spin_tail = Duration::zero();
   }
   const auto remaining = due - now;
   if (remaining <= spin_tail || remaining - spin_tail < min_block) {

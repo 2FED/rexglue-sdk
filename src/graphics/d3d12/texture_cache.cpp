@@ -1483,8 +1483,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> D3D12TextureCache::CreateTextureResource(
     ID3D12Device* device = provider.GetDevice();
     if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
                                                provider.GetHeapFlagCreateNotZeroed(), &desc,
-                                               initial_state, nullptr,
-                                               IID_PPV_ARGS(&resource)))) {
+                                               initial_state, nullptr, IID_PPV_ARGS(&resource)))) {
       resource.Reset();
     }
   }
@@ -1537,11 +1536,11 @@ Microsoft::WRL::ComPtr<ID3D12Resource> D3D12TextureCache::CreatePlacedTextureRes
       desc.Alignment = 0;
       return nullptr;
     }
-    texture_heap_minute_.heap_create_us_max = std::max<uint64_t>(
-        texture_heap_minute_.heap_create_us_max,
-        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now() - heap_start)
-                     .count()));
+    texture_heap_minute_.heap_create_us_max =
+        std::max<uint64_t>(texture_heap_minute_.heap_create_us_max,
+                           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - heap_start)
+                                        .count()));
     const uint32_t block = placed_heap_allocator_->AddBlock();
     if (block >= placed_heaps_.size()) {
       placed_heaps_.resize(size_t(block) + 1);
@@ -1583,11 +1582,11 @@ void D3D12TextureCache::ReleasePlacement(const PlacedHeapAllocation& placement) 
 
 std::string D3D12TextureCache::TakeTextureHeapMinuteReport() {
   const bool allocator = placed_heap_allocator_ != nullptr;
-  std::string report = FormatTextureHeapMinuteFields(
-      texture_heap_minute_, placed_heaps_enabled_,
-      allocator ? placed_heap_allocator_->live_blocks() : 0,
-      allocator ? placed_heap_allocator_->used_bytes() : 0,
-      allocator ? placed_heap_allocator_->reserved_bytes() : 0);
+  std::string report =
+      FormatTextureHeapMinuteFields(texture_heap_minute_, placed_heaps_enabled_,
+                                    allocator ? placed_heap_allocator_->live_blocks() : 0,
+                                    allocator ? placed_heap_allocator_->used_bytes() : 0,
+                                    allocator ? placed_heap_allocator_->reserved_bytes() : 0);
   texture_heap_minute_ = {};
   return report;
 }

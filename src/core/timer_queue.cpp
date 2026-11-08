@@ -47,7 +47,7 @@ REXCVAR_DEFINE_BOOL(timer_queue_blocking_wait, false, "Kernel",
                     "spins only that tail, instead of spinning/yielding the whole time. Needs "
                     "CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); otherwise the "
                     "spin path stays. Dispatch lateness: MCLA_TIMERQ kind=minute");
-REXCVAR_DEFINE_INT32(timer_queue_spin_tail_us, 500, "Kernel",
+REXCVAR_DEFINE_INT32(timer_queue_spin_tail_us, 200, "Kernel",
                      "l79: with timer_queue_blocking_wait, wake this many microseconds before "
                      "the next timer deadline and spin the rest (0 = no spin tail; clamped to "
                      "0..5000)");
@@ -153,8 +153,8 @@ class TimerQueueSleeper {
 // Per-minute dispatch statistics (MCLA_TIMERQ kind=minute), dispatch thread only.
 struct TimerQueueMinuteStats {
   uint64_t dispatches = 0;
-  uint64_t late_250us = 0;   // dispatched 250 us or more after the deadline
-  uint64_t late_1ms = 0;     // ... 1 ms or more
+  uint64_t late_250us = 0;  // dispatched 250 us or more after the deadline
+  uint64_t late_1ms = 0;    // ... 1 ms or more
   int64_t max_late_us = 0;
   uint64_t blocks = 0;       // blocking waits entered
   uint64_t queue_wakes = 0;  // blocking waits ended by QueueTimer
@@ -218,11 +218,11 @@ class TimerQueue {
       {
         // Consume new wait items and add them to sorted wait queue
         dp::sequence_t available =
-            blocking ? claim_strategy_.last_published_after(next_sequence - 1)
-                     : claim_strategy_.wait_until_published(
-                           next_sequence, next_sequence - 1,
-                           wait_queue_.empty() ? clock::time_point::max()
-                                               : wait_queue_.front()->due_);
+            blocking
+                ? claim_strategy_.last_published_after(next_sequence - 1)
+                : claim_strategy_.wait_until_published(
+                      next_sequence, next_sequence - 1,
+                      wait_queue_.empty() ? clock::time_point::max() : wait_queue_.front()->due_);
 
         // Check for timeout
         if (available != next_sequence - 1) {
@@ -313,9 +313,9 @@ class TimerQueue {
   // ring and the due timers.
   void WaitBlocking(dp::sequence_t next_sequence) {
     const bool has_due = !wait_queue_.empty();
-    const auto plan = PlanTimerWait<clock>(clock::now(), has_due,
-                                           has_due ? wait_queue_.front()->due_ : clock::time_point{},
-                                           SpinTail(), kMinBlock);
+    const auto plan = PlanTimerWait<clock>(
+        clock::now(), has_due, has_due ? wait_queue_.front()->due_ : clock::time_point{},
+        SpinTail(), kMinBlock);
     switch (plan.kind) {
       case TimerWaitKind::kRunDue:
         return;

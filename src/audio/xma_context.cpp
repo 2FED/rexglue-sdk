@@ -559,9 +559,9 @@ bool XmaContext::Work() {
     }
     // Canary ade7e610b (xma_canary_fixes): a pass that moved nothing ends the
     // loop (Decode returned early without a frame).
-    if (canary && xma::IsNoProgressPass(pre_decode_offset, pre_remaining_subframes,
-                                        data.input_buffer_read_offset,
-                                        current_frame_remaining_subframes_)) {
+    if (canary &&
+        xma::IsNoProgressPass(pre_decode_offset, pre_remaining_subframes,
+                              data.input_buffer_read_offset, current_frame_remaining_subframes_)) {
       Bump(g_xma_canary.no_progress);
       break;
     }
@@ -1566,8 +1566,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   // Canary 5dd1cdbbf (xma_canary_fixes): a loop_start one bit short of a frame
   // boundary would be read as a split frame header with a garbage size.
   if (REXCVAR_GET(xma_canary_fixes)) {
-    const uint32_t resolved = xma::ResolveLoopStartOffset(loop_start_skip_pending_,
-                                                          relative_offset, frames.next_frame_start);
+    const uint32_t resolved = xma::ResolveLoopStartOffset(loop_start_skip_pending_, relative_offset,
+                                                          frames.next_frame_start);
     if (resolved != relative_offset) {
       Bump(g_xma_canary.loop_resolved);
       if (AllowXmaTraceLine()) {

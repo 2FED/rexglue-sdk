@@ -503,9 +503,9 @@ class D3D12TextureCache final : public TextureCache {
   // l79 d3d12_texture_placed_heaps. Creates a texture resource (desc may get
   // a small-resource alignment), placed in a shared heap when enabled and the
   // size fits, else committed; placement_out is invalid for committed.
-  Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureResource(
-      D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
-      PlacedHeapAllocation& placement_out);
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureResource(D3D12_RESOURCE_DESC& desc,
+                                                               D3D12_RESOURCE_STATES initial_state,
+                                                               PlacedHeapAllocation& placement_out);
   Microsoft::WRL::ComPtr<ID3D12Resource> CreatePlacedTextureResource(
       D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
       PlacedHeapAllocation& placement_out);

@@ -203,10 +203,10 @@ class PlacedHeapAllocator {
 
 // Per-minute counters of the placed texture heaps (MCLA_TEXHEAP kind=minute).
 struct TextureHeapMinuteStats {
-  uint64_t creates = 0;        // texture resources created (placed + committed)
-  uint64_t placements = 0;     // ... placed in a heap
-  uint64_t fallbacks = 0;      // ... committed while placed heaps were on
-  uint64_t oversized = 0;      // ... of the fallbacks: larger than half a block
+  uint64_t creates = 0;     // texture resources created (placed + committed)
+  uint64_t placements = 0;  // ... placed in a heap
+  uint64_t fallbacks = 0;   // ... committed while placed heaps were on
+  uint64_t oversized = 0;   // ... of the fallbacks: larger than half a block
   uint64_t heaps_created = 0;
   uint64_t heaps_released = 0;
   uint64_t heap_failures = 0;  // CreateHeap or CreatePlacedResource failed

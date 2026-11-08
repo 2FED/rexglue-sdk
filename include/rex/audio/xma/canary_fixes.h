@@ -70,10 +70,10 @@ inline uint32_t ResolveLoopStartOffset(bool loop_start_pending, uint32_t relativ
 
 // Per-minute counters (appended to MCLA_XMA kind=minute).
 struct CanaryMinuteTotals {
-  uint64_t drain_passes = 0;    // 6bef1fbed: passes kept to drain a partly delivered frame
-  uint64_t skip_follows = 0;    // 7015473a7: next-packet searches that followed a skip chain
-  uint64_t loop_resolved = 0;   // 5dd1cdbbf: loop starts moved to a frame boundary
-  uint64_t no_progress = 0;     // ade7e610b: Work loops ended by a no-progress pass
+  uint64_t drain_passes = 0;   // 6bef1fbed: passes kept to drain a partly delivered frame
+  uint64_t skip_follows = 0;   // 7015473a7: next-packet searches that followed a skip chain
+  uint64_t loop_resolved = 0;  // 5dd1cdbbf: loop starts moved to a frame boundary
+  uint64_t no_progress = 0;    // ade7e610b: Work loops ended by a no-progress pass
 };
 
 inline std::string FormatCanaryMinuteFields(const CanaryMinuteTotals& c, bool fix) {
