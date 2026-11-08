@@ -41,6 +41,7 @@
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/util/blend_min_max.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/util/storage_creation_threads.h>
 #include <rex/graphics/xenos.h>
@@ -65,6 +66,12 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
+
+REXCVAR_DEFINE_BOOL(d3d12_blend_minmax_fix, false, "GPU/D3D12",
+                    "l80 (KI-013): with host render targets, apply the source blend factor "
+                    "(SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ZERO) of MIN/MAX blending in the pixel "
+                    "shader when the destination factor is ONE - the Xbox 360 GPU applies the "
+                    "factors in MIN/MAX, Direct3D 12 ignores them");
 
 namespace rex::graphics::d3d12 {
 
@@ -957,6 +964,19 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
+      }
+    }
+    if (REXCVAR_GET(d3d12_blend_minmax_fix)) {
+      uint32_t normalized_color_mask =
+          draw_util::GetNormalizedColorMask(regs, shader.writes_color_targets());
+      if (normalized_color_mask) {
+        uint32_t blendcontrol[4];
+        for (uint32_t i = 0; i < 4; ++i) {
+          blendcontrol[i] =
+              regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]).value;
+        }
+        modification.pixel.min_max_source_scale =
+            GetMinMaxSourceScaleAllTargets(blendcontrol, normalized_color_mask);
       }
     }
   }

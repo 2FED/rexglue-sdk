@@ -16,6 +16,7 @@
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/util/blend_min_max.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
 
@@ -1548,6 +1549,51 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
                                 dxbc::Src::kXXXX));
+    // l80 (KI-013): apply the source blend factor of MIN/MAX blending, which
+    // the host ignores, but the Xbox 360 GPU doesn't (with the destination
+    // factor being ONE). The RGB scale uses the unmodified (biased) source
+    // alpha, so it's done before the alpha scale.
+    uint32_t min_max_source_scale = (GetDxbcShaderModification().pixel.min_max_source_scale >>
+                                     (i * kMinMaxSourceScaleBitsPerRenderTarget)) &
+                                    ((uint32_t(1) << kMinMaxSourceScaleBitsPerRenderTarget) - 1);
+    switch (UnpackMinMaxColorScale(min_max_source_scale)) {
+      case MinMaxSourceScale::kSrcAlpha:
+        a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                 dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+        break;
+      case MinMaxSourceScale::kInvSrcAlpha:
+        // gamma_temp.x = 1 - alpha (gamma_temp is free until the gamma
+        // conversion).
+        a_.OpAdd(dxbc::Dest::R(gamma_temp, 0b0001), dxbc::Src::LF(1.0f),
+                 -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+        a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+                 dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
+        break;
+      case MinMaxSourceScale::kZero:
+        a_.OpMov(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::LF(0.0f));
+        break;
+      default:
+        break;
+    }
+    switch (UnpackMinMaxAlphaScale(min_max_source_scale)) {
+      case MinMaxSourceScale::kSrcAlpha:
+        a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+                 dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                 dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+        break;
+      case MinMaxSourceScale::kInvSrcAlpha:
+        // alpha * (1 - alpha) = alpha - alpha * alpha.
+        a_.OpMAd(dxbc::Dest::R(system_temp_color, 0b1000),
+                 -dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                 dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+                 dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW));
+        break;
+      case MinMaxSourceScale::kZero:
+        a_.OpMov(dxbc::Dest::R(system_temp_color, 0b1000), dxbc::Src::LF(0.0f));
+        break;
+      default:
+        break;
+    }
     if (gamma_render_target_as_unorm8_) {
       // Convert to gamma space - this is incorrect, since it must be done after
       // blending on the Xbox 360, but this is just one of many blending issues

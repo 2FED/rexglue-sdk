@@ -176,6 +176,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // Non-ROV - l80 (KI-013, d3d12_blend_minmax_fix): source blend factor
+      // scales for MIN/MAX blending, which the host ignores, 4 bits per render
+      // target (rex::graphics::GetMinMaxSourceScale). Zero (the default and
+      // the previous layout) keeps the old translation, so the version isn't
+      // bumped.
+      uint32_t min_max_source_scale : 16;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
