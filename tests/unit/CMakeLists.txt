@@ -50,6 +50,7 @@ add_executable(unit_tests
     graphics/submission_stats_test.cpp
     graphics/cp_freeze_watchdog_test.cpp
     graphics/fetch_identity_test.cpp
+    graphics/placed_heap_allocator_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp

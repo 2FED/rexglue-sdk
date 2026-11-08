@@ -14,6 +14,7 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -24,6 +25,7 @@
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/util/placed_heap_allocator.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -162,6 +164,10 @@ class D3D12TextureCache final : public TextureCache {
                                      uint32_t* width_unscaled_out = nullptr,
                                      uint32_t* height_unscaled_out = nullptr);
 
+  // l79 d3d12_texture_placed_heaps: MCLA_TEXHEAP minute fields (placed and
+  // committed texture creation in both modes); resets the minute counters.
+  std::string TakeTextureHeapMinuteReport();
+
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
@@ -268,7 +274,11 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    // l79: the heap range of a placed resource (returned on destruction).
+    void SetPlacement(const PlacedHeapAllocation& placement) { placement_ = placement; }
+
    private:
+    PlacedHeapAllocation placement_;
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
@@ -489,6 +499,24 @@ class D3D12TextureCache final : public TextureCache {
     kUnsupportedSnormBit = kUnsupportedUnormBit << 1,
   };
   uint8_t unsupported_format_features_used_[64];
+
+  // l79 d3d12_texture_placed_heaps. Creates a texture resource (desc may get
+  // a small-resource alignment), placed in a shared heap when enabled and the
+  // size fits, else committed; placement_out is invalid for committed.
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreateTextureResource(
+      D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
+      PlacedHeapAllocation& placement_out);
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreatePlacedTextureResource(
+      D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES initial_state,
+      PlacedHeapAllocation& placement_out);
+  // Called by ~D3D12Texture after its resource is released.
+  void ReleasePlacement(const PlacedHeapAllocation& placement);
+  // Latched from the cvars at Initialize (restart to change).
+  bool placed_heaps_enabled_ = false;
+  std::unique_ptr<PlacedHeapAllocator> placed_heap_allocator_;
+  // Index = allocator block index; null for released slots.
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> placed_heaps_;
+  TextureHeapMinuteStats texture_heap_minute_;
 
   // The tiled buffer for resolved data with resolution scaling.
   // Because on Direct3D 12 (at least on Windows 10 2004) typed SRV or UAV

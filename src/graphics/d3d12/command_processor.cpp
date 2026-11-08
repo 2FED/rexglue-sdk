@@ -5969,6 +5969,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         // M10-002 step 0: read-back counters of the minute (always on).
         REXGPU_INFO("{}", ReadbackCountersReport("minute", "minute"));
         readback_counters_ = {};
+        // l79: texture resource creation (placed heaps or committed), always on.
+        if (texture_cache_) {
+          REXGPU_INFO("MCLA_TEXHEAP v=1 kind=minute {}",
+                      texture_cache_->TakeTextureHeapMinuteReport());
+        }
         fence_defer_queue_.TakeCounters();
         submission_stats_ = {};
         // M10 watch census (memory_watch_census).
