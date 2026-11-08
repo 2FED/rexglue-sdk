@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/audio/xma/canary_fixes.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/audio_route_audit.h>
 #include <rex/audio/xma/decoder.h>
@@ -107,6 +108,14 @@ REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, true, "Audio",
                     "walk_split_lost counts unclaimed split tails (unconfirmed: real or "
                     "padding); the real loss is walk_split_real - walk_split_claimed - "
                     "walk_split_counted");
+// Xenia Canary XMA fixes (BSD-3), see rex/audio/xma/canary_fixes.h.
+REXCVAR_DEFINE_BOOL(xma_canary_fixes, false, "Audio",
+                    "l79: XMA decoder fixes ported from Xenia Canary (BSD-3): drain a partly "
+                    "delivered frame before Work ends (6bef1fbed), follow a frameless packet's "
+                    "skip count to the next packet of the same sub-stream (7015473a7), move a "
+                    "loop_start that is not a frame boundary to the next frame start "
+                    "(5dd1cdbbf), end the Work loop after a pass that moves nothing "
+                    "(ade7e610b). Counters: canary_* in MCLA_XMA kind=minute");
 REXCVAR_DEFINE_BOOL(xma_dump_input, false, "Audio",
                     "KI-071: with xma_dump_contexts, also write each dumped context's input "
                     "buffers (<wav>-input.bin, 2 KiB packets in decode order, index "
@@ -133,6 +142,15 @@ struct XmaDoublingCounters {
   std::atomic<uint64_t> trace_suppressed{0};
 };
 XmaDoublingCounters g_xma_counters;
+
+// xma_canary_fixes counters (MCLA_XMA kind=minute, canary_*).
+struct XmaCanaryCounters {
+  std::atomic<uint64_t> drain_passes{0};
+  std::atomic<uint64_t> skip_follows{0};
+  std::atomic<uint64_t> loop_resolved{0};
+  std::atomic<uint64_t> no_progress{0};
+};
+XmaCanaryCounters g_xma_canary;
 
 // KI-071 step 2 event totals (MCLA_XMA_SIB kind=minute), all contexts.
 struct XmaSiblingCounters {
@@ -304,19 +322,27 @@ void MaybeEmitXmaMinute() {
   const uint64_t lock_races = take(g_xma_counters.lock_races);
   const uint64_t read_offset_reverts = take(g_xma_counters.read_offset_reverts);
   const uint64_t trace_suppressed = take(g_xma_counters.trace_suppressed);
+  xma::CanaryMinuteTotals canary;
+  canary.drain_passes = take(g_xma_canary.drain_passes);
+  canary.skip_follows = take(g_xma_canary.skip_follows);
+  canary.loop_resolved = take(g_xma_canary.loop_resolved);
+  canary.no_progress = take(g_xma_canary.no_progress);
+  const bool any_canary =
+      canary.drain_passes || canary.skip_follows || canary.loop_resolved || canary.no_progress;
   const bool any = swaps || carry_nonzero || carry_fallbacks || stale_ring_replays || lock_races ||
-                   read_offset_reverts || trace_suppressed;
+                   read_offset_reverts || trace_suppressed || any_canary;
   if (!any && !REXCVAR_GET(xma_swap_trace)) {
     return;
   }
   REXAPU_INFO(
       "MCLA_XMA v=1 kind=minute swaps={} carry_nonzero={} stale_ring_replays={} lock_races={} "
       "swaps_44k={} carry_nonzero_44k={} carry_fallbacks={} read_offset_reverts={} "
-      "trace_suppressed={} carry_fix={} valid_fix={} lock_fix={}",
+      "trace_suppressed={} carry_fix={} valid_fix={} lock_fix={} {}",
       swaps, carry_nonzero, stale_ring_replays, lock_races, swaps_44k, carry_nonzero_44k,
       carry_fallbacks, read_offset_reverts, trace_suppressed,
       int(REXCVAR_GET(xma_swap_carry_packet)), int(REXCVAR_GET(xma_valid_only_when_written)),
-      int(REXCVAR_GET(xma_work_lock_recheck)));
+      int(REXCVAR_GET(xma_work_lock_recheck)),
+      xma::FormatCanaryMinuteFields(canary, REXCVAR_GET(xma_canary_fixes)));
 }
 
 }  // namespace
@@ -511,14 +537,32 @@ bool XmaContext::Work() {
     return true;
   }
 
+  const bool canary = REXCVAR_GET(xma_canary_fixes);
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    const uint32_t pre_decode_offset = data.input_buffer_read_offset;
+    const uint32_t pre_remaining_subframes = current_frame_remaining_subframes_;
     Decode(&data);
     // KI-071 step 4: where this Decode left the walk (guest seek detection).
     walk_left_read_offset_ = data.input_buffer_read_offset;
     walk_left_buffer_ = data.current_buffer;
     Consume(&output_rb, &data);
 
-    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+    // Canary 6bef1fbed (xma_canary_fixes): keep draining a partly delivered
+    // frame after the input ran out.
+    if (xma::ShouldEndWorkLoop(data.IsAnyInputBufferValid(), data.error_status,
+                               current_frame_remaining_subframes_, canary)) {
+      break;
+    }
+    if (canary && (!data.IsAnyInputBufferValid() || data.error_status == 4)) {
+      Bump(g_xma_canary.drain_passes);
+      continue;
+    }
+    // Canary ade7e610b (xma_canary_fixes): a pass that moved nothing ends the
+    // loop (Decode returned early without a frame).
+    if (canary && xma::IsNoProgressPass(pre_decode_offset, pre_remaining_subframes,
+                                        data.input_buffer_read_offset,
+                                        current_frame_remaining_subframes_)) {
+      Bump(g_xma_canary.no_progress);
       break;
     }
     // KI-071 D2: stalled at a boundary until the guest validates the next buffer.
@@ -1183,7 +1227,18 @@ const uint8_t* XmaContext::GetNextPacket(XMA_CONTEXT_DATA* data, uint32_t next_p
 uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_packet_index,
                                              uint32_t current_input_packet_count) {
   // KI-071 step 4: the same loop, shared with the frame-walk tests.
-  return xma::FindNextPacketReadOffset(buffer, next_packet_index, current_input_packet_count);
+  const uint32_t sequential =
+      xma::FindNextPacketReadOffset(buffer, next_packet_index, current_input_packet_count);
+  if (!REXCVAR_GET(xma_canary_fixes)) {
+    return sequential;
+  }
+  // Canary 7015473a7: follow a frameless packet's skip chain.
+  const uint32_t chained =
+      xma::FindNextPacketReadOffset(buffer, next_packet_index, current_input_packet_count, true);
+  if (chained != sequential) {
+    Bump(g_xma_canary.skip_follows);
+  }
+  return chained;
 }
 
 uint32_t XmaContext::NextPacketGuestAddress(const XMA_CONTEXT_DATA* data,
@@ -1508,6 +1563,22 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t next_packet_index = packet_index + packet_to_skip;
   // Upstream GetPacketInfo plus the split-tail record (frame_walk.h).
   xma::PacketFrames frames = xma::AnalyzePacketFrames(packet, relative_offset);
+  // Canary 5dd1cdbbf (xma_canary_fixes): a loop_start one bit short of a frame
+  // boundary would be read as a split frame header with a garbage size.
+  if (REXCVAR_GET(xma_canary_fixes)) {
+    const uint32_t resolved = xma::ResolveLoopStartOffset(loop_start_skip_pending_,
+                                                          relative_offset, frames.next_frame_start);
+    if (resolved != relative_offset) {
+      Bump(g_xma_canary.loop_resolved);
+      if (AllowXmaTraceLine()) {
+        REXAPU_INFO("[xma] ctx={} loop_start {} is not a frame boundary in packet {}; using {}",
+                    id(), relative_offset, packet_index, resolved);
+      }
+      relative_offset = resolved;
+      data->input_buffer_read_offset = uint32_t(packet_index) * kBitsPerPacket + relative_offset;
+      frames = xma::AnalyzePacketFrames(packet, relative_offset);
+    }
+  }
   // A frame header straddling the packet end that upstream does not count:
   // check the next packet's continuation (stats always, claim with the fix).
   xma::SplitTailCheck split_check = xma::SplitTailCheck::kNotReal;

@@ -108,6 +108,11 @@ struct PacketFrames {
   // walked count, or it is the packet's only frame).
   bool split_tail_counted = false;
   bool split_tail_claimed = false;  // ClaimSplitTail applied
+  // First frame start (walked, or the split tail) at or after frame_offset;
+  // frame_offset itself when the offset lies before the first-frame offset or
+  // no later frame start was found. Used by xma_canary_fixes (Xenia Canary
+  // 5dd1cdbbf: a loop_start one bit short of a frame boundary).
+  uint32_t next_frame_start = 0;
 
   bool IsLast() const { return frame_count == 0 || current_frame == frame_count - 1; }
 };
@@ -117,12 +122,21 @@ struct PacketFrames {
 inline PacketFrames AnalyzePacketFrames(const uint8_t* packet, uint32_t frame_offset) {
   PacketFrames r;
   r.first_frame_offset = WalkFirstFrameOffset(packet);
+  r.next_frame_start = frame_offset;
+  bool start_resolved = false;
+  auto consider_start = [&](size_t start) {
+    if (!start_resolved && start >= frame_offset) {
+      start_resolved = true;
+      r.next_frame_start = uint32_t(start);
+    }
+  };
   // BitStream::SetOffset clamps to the packet size.
   size_t pos = std::min<size_t>(r.first_frame_offset, kWalkBitsPerPacket);
 
   if (frame_offset < r.first_frame_offset) {
     r.current_frame = 0;
     r.current_frame_size = r.first_frame_offset - frame_offset;
+    start_resolved = true;
   }
 
   bool ended_short = false;
@@ -136,6 +150,7 @@ inline PacketFrames AnalyzePacketFrames(const uint8_t* packet, uint32_t frame_of
     if (frame_size == 0 || frame_size == kWalkMaxFrameLength) {
       break;
     }
+    consider_start(pos);
     if (pos == frame_offset) {
       r.current_frame = r.walked;
       r.current_frame_size = frame_size;
@@ -156,6 +171,7 @@ inline PacketFrames AnalyzePacketFrames(const uint8_t* packet, uint32_t frame_of
   if (ended_short && pos < kWalkBitsPerPacket) {
     r.split_tail_pos = uint32_t(pos);
     r.split_tail_bits = uint32_t(kWalkBitsPerPacket - pos);
+    consider_start(pos);
   }
 
   r.frame_count = r.walked;
@@ -245,15 +261,31 @@ inline uint32_t NextReadOffsetInPacket(uint32_t read_offset, uint32_t bits_to_co
 
 // XmaContext::GetNextPacketReadOffset: first frame start at or after packet
 // next_packet_index of the buffer; kWalkPacketHeaderBits = none (swap).
+//
+// follow_skip (xma_canary_fixes; Xenia Canary 7015473a7, BSD-3, "Follow the
+// sub-stream skip chain past frameless packets"): a packet in which no frame
+// starts is the continuation of a frame of the same sub-stream, so the search
+// continues at that packet's own skip count + 1 instead of the next sequential
+// packet (which may belong to another interleaved sub-stream); a frameless
+// packet with skip count 0xFF ends the search. Without follow_skip: the
+// sequential upstream scan.
 inline uint32_t FindNextPacketReadOffset(const uint8_t* buffer, uint32_t next_packet_index,
-                                         uint32_t packet_count) {
+                                         uint32_t packet_count, bool follow_skip = false) {
   while (next_packet_index < packet_count) {
     const uint8_t* next_packet = buffer + size_t(next_packet_index) * kWalkBytesPerPacket;
     const uint32_t offset = WalkFirstFrameOffset(next_packet);
     if (offset <= kWalkMaxFirstFrameOffset) {
       return next_packet_index * kWalkBitsPerPacket + offset;
     }
-    ++next_packet_index;
+    if (!follow_skip) {
+      ++next_packet_index;
+      continue;
+    }
+    const uint32_t next_skip = WalkSkipCount(next_packet);
+    if (next_skip == 0xFF) {
+      break;
+    }
+    next_packet_index += next_skip + 1;
   }
   return kWalkPacketHeaderBits;
 }

@@ -8,6 +8,7 @@ add_executable(unit_tests
     audio/xma_sibling_trace_test.cpp
     audio/xma_frame_trim_test.cpp
     audio/xma_frame_walk_test.cpp
+    audio/xma_canary_fixes_test.cpp
     memory/access_diagnostics_test.cpp
     memory/watch_census_test.cpp
     memory/physical_mapping_test.cpp
