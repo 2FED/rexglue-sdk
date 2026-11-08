@@ -257,8 +257,7 @@ void NoteShortSleep(uint32_t thread_id, bool alertable, bool alerted, int64_t sc
   c.slept_us.fetch_add(slept_us, std::memory_order_relaxed);
   uint64_t max = c.slept_us_max.load(std::memory_order_relaxed);
   while (slept_us > max &&
-         !c.slept_us_max.compare_exchange_weak(max, slept_us, std::memory_order_relaxed)) {
-  }
+         !c.slept_us_max.compare_exchange_weak(max, slept_us, std::memory_order_relaxed)) {}
   if (ShortSleepCounters::Slot* slot = FindShortSleepSlot(thread_id)) {
     slot->count.fetch_add(1, std::memory_order_relaxed);
   }

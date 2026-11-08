@@ -37,11 +37,12 @@
 REXCVAR_DEFINE_BOOL(d3d12_texture_placed_heaps,
                     rex::CurrentPlatformDefaults().d3d12_texture_placed_heaps, "GPU",
                     "l79 (l80 default: on under Windows, off under Wine/Proton, where "
-                    "vkd3d-proton committed creation is already fast): create D3D12 guest textures as placed resources inside shared "
-                    "d3d12_texture_heap_block_mb heaps (first fit, 4 KB small-resource "
-                    "alignment where allowed) instead of one committed resource (one kernel "
-                    "allocation) each; resources above half a block and failures fall back to "
-                    "committed. Counters: MCLA_TEXHEAP kind=minute (both modes)")
+                    "vkd3d-proton committed creation is already fast): create D3D12 guest "
+                    "textures as placed resources inside shared d3d12_texture_heap_block_mb "
+                    "heaps (first fit, 4 KB small-resource alignment where allowed) instead of "
+                    "one committed resource (one kernel allocation) each; resources above half "
+                    "a block and failures fall back to committed. Counters: MCLA_TEXHEAP "
+                    "kind=minute (both modes)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(d3d12_texture_heap_block_mb, 256, "GPU",
                      "l79: size of one placed texture heap (MB) for d3d12_texture_placed_heaps; "
@@ -1646,11 +1647,11 @@ Microsoft::WRL::ComPtr<ID3D12Heap> D3D12TextureCache::AcquireTextureHeap() {
     const auto wait_start = std::chrono::steady_clock::now();
     HarvestTextureHeapRefill(true);
     ++texture_heap_minute_.heap_refill_waits;
-    texture_heap_minute_.heap_refill_wait_us_max = std::max<uint64_t>(
-        texture_heap_minute_.heap_refill_wait_us_max,
-        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now() - wait_start)
-                     .count()));
+    texture_heap_minute_.heap_refill_wait_us_max =
+        std::max<uint64_t>(texture_heap_minute_.heap_refill_wait_us_max,
+                           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - wait_start)
+                                        .count()));
   }
   Microsoft::WRL::ComPtr<ID3D12Heap> heap;
   if (!ready_texture_heaps_.empty()) {
@@ -1662,11 +1663,11 @@ Microsoft::WRL::ComPtr<ID3D12Heap> D3D12TextureCache::AcquireTextureHeap() {
     heap = CreateTextureHeap();
     if (heap) {
       ++texture_heap_minute_.heaps_sync;
-      texture_heap_minute_.heap_create_us_max = std::max<uint64_t>(
-          texture_heap_minute_.heap_create_us_max,
-          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                       std::chrono::steady_clock::now() - heap_start)
-                       .count()));
+      texture_heap_minute_.heap_create_us_max =
+          std::max<uint64_t>(texture_heap_minute_.heap_create_us_max,
+                             uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - heap_start)
+                                          .count()));
     }
   }
   MaybeStartTextureHeapRefill();
@@ -1694,7 +1695,7 @@ std::string D3D12TextureCache::TakeTextureHeapMinuteReport() {
                                     allocator ? placed_heap_allocator_->live_blocks() : 0,
                                     allocator ? placed_heap_allocator_->used_bytes() : 0,
                                     allocator ? placed_heap_allocator_->reserved_bytes() : 0,
-      uint32_t(ready_texture_heaps_.size()));
+                                    uint32_t(ready_texture_heaps_.size()));
   texture_heap_minute_ = {};
   return report;
 }

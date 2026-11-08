@@ -43,10 +43,11 @@
 
 REXCVAR_DEFINE_BOOL(timer_queue_blocking_wait,
                     rex::CurrentPlatformDefaults().timer_queue_blocking_wait, "Kernel",
-                    "l79 (default on since l80, all platforms): the host timer queue thread (KeTimeStampBundle 1 ms tick on Windows; "
-                    "all guest timers on Linux) blocks on a high-resolution waitable timer and a "
-                    "wake event until timer_queue_spin_tail_us before the next deadline and "
-                    "spins only that tail, instead of spinning/yielding the whole time. Needs "
+                    "l79 (default on since l80, all platforms): the host timer queue thread "
+                    "(KeTimeStampBundle 1 ms tick on Windows; all guest timers on Linux) "
+                    "blocks on a high-resolution waitable timer and a wake event until "
+                    "timer_queue_spin_tail_us before the next deadline and spins only that "
+                    "tail, instead of spinning/yielding the whole time. Needs "
                     "CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803+); otherwise the "
                     "spin path stays. Dispatch lateness: MCLA_TIMERQ kind=minute");
 REXCVAR_DEFINE_INT32(timer_queue_spin_tail_us,

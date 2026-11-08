@@ -261,8 +261,7 @@ inline uint32_t ClampTextureHeapPrecreate(int32_t value) {
 // Whether to start a background heap creation: with pre-creation on, keep one
 // heap ready ahead of demand once the ready pool is empty and no refill is in
 // flight, so later heap needs (mid-race) do not create on the CP thread.
-inline bool ShouldRefillTextureHeap(uint32_t precreate, size_t ready_heaps,
-                                    bool refill_in_flight) {
+inline bool ShouldRefillTextureHeap(uint32_t precreate, size_t ready_heaps, bool refill_in_flight) {
   return precreate != 0 && ready_heaps == 0 && !refill_in_flight;
 }
 

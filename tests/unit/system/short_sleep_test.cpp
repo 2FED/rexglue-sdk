@@ -27,8 +27,7 @@ TEST_CASE("Short sleep: mode names", "[system][short_sleep]") {
   CHECK(ParseShortSleepMode("hires_timer") == ShortSleepMode::kHiresTimer);
   CHECK_FALSE(ParseShortSleepMode("hires").has_value());
   CHECK_FALSE(ParseShortSleepMode("").has_value());
-  CHECK(std::string(rex::system::ShortSleepModeName(ShortSleepMode::kHiresTimer)) ==
-        "hires_timer");
+  CHECK(std::string(rex::system::ShortSleepModeName(ShortSleepMode::kHiresTimer)) == "hires_timer");
 }
 
 TEST_CASE("Short sleep: relative ticks and the 2 ms limit", "[system][short_sleep]") {
@@ -47,16 +46,14 @@ TEST_CASE("Short sleep: plan per mode", "[system][short_sleep]") {
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kNative, 5000) == ShortSleepAction::kNative);
   // Long or absolute delays: native in every mode.
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kYield, 20000) == ShortSleepAction::kNative);
-  STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 20000) ==
-                 ShortSleepAction::kNative);
+  STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 20000) == ShortSleepAction::kNative);
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, -1) == ShortSleepAction::kNative);
   // yield: every short delay, including zero.
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kYield, 0) == ShortSleepAction::kYield);
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kYield, 15000) == ShortSleepAction::kYield);
   // hires_timer: zero stays native, 1 tick .. 2 ms on the timer.
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 0) == ShortSleepAction::kNative);
-  STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 1) ==
-                 ShortSleepAction::kHiresTimer);
+  STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 1) == ShortSleepAction::kHiresTimer);
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 10000) ==
                  ShortSleepAction::kHiresTimer);
   STATIC_REQUIRE(PlanShortSleep(ShortSleepMode::kHiresTimer, 19999) ==

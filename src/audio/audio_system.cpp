@@ -58,8 +58,7 @@ void ApplyApuWorkerPriority(rex::thread::Thread* thread, std::string_view thread
   const std::string& text = REXCVAR_GET(apu_worker_priority);
   const std::optional<system::ApuWorkerPriority> parsed = system::ParseApuWorkerPriority(text);
   if (!parsed) {
-    REXAPU_WARN("KI-060: apu_worker_priority '{}' unknown, {} left at normal", text,
-                thread_name);
+    REXAPU_WARN("KI-060: apu_worker_priority '{}' unknown, {} left at normal", text, thread_name);
     return;
   }
   if (!thread || *parsed == system::ApuWorkerPriority::kNormal) {

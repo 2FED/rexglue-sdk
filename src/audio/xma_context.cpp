@@ -110,14 +110,13 @@ REXCVAR_DEFINE_BOOL(xma_frame_walk_fix, true, "Audio",
                     "padding); the real loss is walk_split_real - walk_split_claimed - "
                     "walk_split_counted");
 // Xenia Canary XMA fixes (BSD-3), see rex/audio/xma/canary_fixes.h.
-REXCVAR_DEFINE_BOOL(xma_canary_fixes, rex::CurrentPlatformDefaults().xma_canary_fixes,
-                    "Audio",
-                    "l79 (default on since l80): XMA decoder fixes ported from Xenia Canary (BSD-3): drain a partly "
-                    "delivered frame before Work ends (6bef1fbed), follow a frameless packet's "
-                    "skip count to the next packet of the same sub-stream (7015473a7), move a "
-                    "loop_start that is not a frame boundary to the next frame start "
-                    "(5dd1cdbbf), end the Work loop after a pass that moves nothing "
-                    "(ade7e610b). Counters: canary_* in MCLA_XMA kind=minute");
+REXCVAR_DEFINE_BOOL(xma_canary_fixes, rex::CurrentPlatformDefaults().xma_canary_fixes, "Audio",
+                    "l79 (default on since l80): XMA decoder fixes ported from Xenia Canary "
+                    "(BSD-3): drain a partly delivered frame before Work ends (6bef1fbed), "
+                    "follow a frameless packet's skip count to the next packet of the same "
+                    "sub-stream (7015473a7), move a loop_start that is not a frame boundary to "
+                    "the next frame start (5dd1cdbbf), end the Work loop after a pass that "
+                    "moves nothing (ade7e610b). Counters: canary_* in MCLA_XMA kind=minute");
 REXCVAR_DEFINE_BOOL(xma_dump_input, false, "Audio",
                     "KI-071: with xma_dump_contexts, also write each dumped context's input "
                     "buffers (<wav>-input.bin, 2 KiB packets in decode order, index "
