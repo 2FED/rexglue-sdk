@@ -243,15 +243,13 @@ const GuestThreadBoost& CurrentGuestThreadBoost() {
     const std::string& priority_text = REXCVAR_GET(guest_audio_thread_priority);
     const std::optional<ApuWorkerPriority> priority = ParseApuWorkerPriority(priority_text);
     if (!priority) {
-      REXSYS_WARN("KI-060: guest_audio_thread_priority '{}' unknown, using normal",
-                  priority_text);
+      REXSYS_WARN("KI-060: guest_audio_thread_priority '{}' unknown, using normal", priority_text);
     }
     b.priority = priority.value_or(ApuWorkerPriority::kNormal);
     const std::string& list_text = REXCVAR_GET(guest_thread_priority_boost_start);
     const std::optional<std::vector<uint32_t>> starts = ParseGuestThreadStartList(list_text);
     if (!starts) {
-      REXSYS_WARN("KI-060: guest_thread_priority_boost_start '{}' malformed, no boost",
-                  list_text);
+      REXSYS_WARN("KI-060: guest_thread_priority_boost_start '{}' malformed, no boost", list_text);
     } else {
       b.starts = *starts;
     }

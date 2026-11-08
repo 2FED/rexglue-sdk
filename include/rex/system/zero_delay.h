@@ -81,8 +81,8 @@ constexpr uint32_t PlanZeroDelay(ZeroDelayStreak& s, const ZeroDelayConfig& c, b
     s.has_last_end = false;
     return 0;
   }
-  const bool continues = s.has_last_end && now_us >= s.last_end_us &&
-                         now_us - s.last_end_us < int64_t(c.gap_us);
+  const bool continues =
+      s.has_last_end && now_us >= s.last_end_us && now_us - s.last_end_us < int64_t(c.gap_us);
   if (continues) {
     if (s.streak < UINT32_MAX) {
       ++s.streak;
@@ -94,7 +94,8 @@ constexpr uint32_t PlanZeroDelay(ZeroDelayStreak& s, const ZeroDelayConfig& c, b
   if (s.streak <= c.after) {
     return 0;
   }
-  s.backoff_us = s.backoff_us == 0 ? kZeroDelayBackoffStartUs : std::min(s.backoff_us * 2, c.max_us);
+  s.backoff_us =
+      s.backoff_us == 0 ? kZeroDelayBackoffStartUs : std::min(s.backoff_us * 2, c.max_us);
   s.backoff_us = std::min(s.backoff_us, c.max_us);
   return s.backoff_us;
 }

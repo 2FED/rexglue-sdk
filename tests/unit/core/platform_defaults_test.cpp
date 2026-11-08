@@ -66,7 +66,6 @@ TEST_CASE("Platform defaults: current process", "[core][platform_defaults]") {
   CHECK(RegisteredDefault("ke_delay_short_sleep_mode") == expected.ke_delay_short_sleep_mode);
   CHECK(RegisteredDefault("apu_worker_priority") == expected.apu_worker_priority);
   CHECK(RegisteredDefault("ke_delay_zero_mode") == expected.ke_delay_zero_mode);
-  CHECK(RegisteredDefault("guest_audio_thread_priority") ==
-        expected.guest_audio_thread_priority);
+  CHECK(RegisteredDefault("guest_audio_thread_priority") == expected.guest_audio_thread_priority);
   CHECK(RegisteredDefault("guest_thread_priority_boost_start") == "823EC8C8,823EC990");
 }
