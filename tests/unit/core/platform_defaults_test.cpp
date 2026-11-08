@@ -35,6 +35,7 @@ TEST_CASE("Platform defaults: Windows", "[core][platform_defaults]") {
   CHECK(std::string_view(d.ke_delay_short_sleep_mode) == "native");
   CHECK(std::string_view(d.apu_worker_priority) == "normal");
   CHECK(std::string_view(d.ke_delay_zero_mode) == "native");
+  CHECK(std::string_view(d.guest_audio_thread_priority) == "normal");
 }
 
 TEST_CASE("Platform defaults: Wine/Proton", "[core][platform_defaults]") {
@@ -46,6 +47,7 @@ TEST_CASE("Platform defaults: Wine/Proton", "[core][platform_defaults]") {
   CHECK(std::string_view(d.ke_delay_short_sleep_mode) == "hires_timer");
   CHECK(std::string_view(d.apu_worker_priority) == "above_normal");
   CHECK(std::string_view(d.ke_delay_zero_mode) == "backoff");
+  CHECK(std::string_view(d.guest_audio_thread_priority) == "above_normal");
 }
 
 TEST_CASE("Platform defaults: current process", "[core][platform_defaults]") {
@@ -64,4 +66,7 @@ TEST_CASE("Platform defaults: current process", "[core][platform_defaults]") {
   CHECK(RegisteredDefault("ke_delay_short_sleep_mode") == expected.ke_delay_short_sleep_mode);
   CHECK(RegisteredDefault("apu_worker_priority") == expected.apu_worker_priority);
   CHECK(RegisteredDefault("ke_delay_zero_mode") == expected.ke_delay_zero_mode);
+  CHECK(RegisteredDefault("guest_audio_thread_priority") ==
+        expected.guest_audio_thread_priority);
+  CHECK(RegisteredDefault("guest_thread_priority_boost_start") == "823EC8C8,823EC990");
 }

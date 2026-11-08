@@ -32,6 +32,7 @@
 #include <rex/stream.h>
 #include <rex/system/crash_report.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/guest_thread_priority.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/short_sleep.h>
 #include <rex/system/thread_state.h>
@@ -86,6 +87,24 @@ REXCVAR_DEFINE_INT32(ke_delay_zero_backoff_max_us, 500, "Kernel",
                      "l81 (KI-060, ke_delay_zero_mode=backoff): longest backoff sleep in "
                      "microseconds (50..2000)")
     .range(50, 2000)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(guest_audio_thread_priority,
+                      rex::CurrentPlatformDefaults().guest_audio_thread_priority, "Kernel",
+                      "l81 (KI-060): host thread priority of the guest threads whose start "
+                      "address is in guest_thread_priority_boost_start (the title's audio "
+                      "engine threads): normal (untouched), above_normal or highest. Applied at "
+                      "thread creation; guest priorities stay ignored "
+                      "(ignore_thread_priorities). Default above_normal under Wine/Proton, "
+                      "normal on Windows")
+    .allowed({"normal", "above_normal", "highest"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(guest_thread_priority_boost_start, "823EC8C8,823EC990", "Kernel",
+                      "l81 (KI-060): comma-separated hexadecimal guest thread start addresses "
+                      "that get guest_audio_thread_priority. Default: the two XAudio engine "
+                      "thread entries of Midnight Club: Los Angeles (created by sub_823ECC60, "
+                      "which raises them to guest base priority 15); empty = none")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(ke_delay_zero_gap_us, 200, "Kernel",
@@ -209,6 +228,40 @@ ZeroDelayMode CurrentZeroDelayMode() {
     return result;
   }();
   return mode;
+}
+
+// l81 (KI-060): guest_audio_thread_priority for the start addresses in
+// guest_thread_priority_boost_start, latched at the first thread creation.
+struct GuestThreadBoost {
+  std::vector<uint32_t> starts;
+  ApuWorkerPriority priority = ApuWorkerPriority::kNormal;
+};
+
+const GuestThreadBoost& CurrentGuestThreadBoost() {
+  static const GuestThreadBoost boost = [] {
+    GuestThreadBoost b;
+    const std::string& priority_text = REXCVAR_GET(guest_audio_thread_priority);
+    const std::optional<ApuWorkerPriority> priority = ParseApuWorkerPriority(priority_text);
+    if (!priority) {
+      REXSYS_WARN("KI-060: guest_audio_thread_priority '{}' unknown, using normal",
+                  priority_text);
+    }
+    b.priority = priority.value_or(ApuWorkerPriority::kNormal);
+    const std::string& list_text = REXCVAR_GET(guest_thread_priority_boost_start);
+    const std::optional<std::vector<uint32_t>> starts = ParseGuestThreadStartList(list_text);
+    if (!starts) {
+      REXSYS_WARN("KI-060: guest_thread_priority_boost_start '{}' malformed, no boost",
+                  list_text);
+    } else {
+      b.starts = *starts;
+    }
+    REXSYS_INFO(
+        "KI-060: guest thread priority boost {} for start addresses [{}] "
+        "(guest_audio_thread_priority, guest_thread_priority_boost_start)",
+        ApuWorkerPriorityName(b.priority), list_text);
+    return b;
+  }();
+  return boost;
 }
 
 int64_t SteadyMicros(std::chrono::steady_clock::time_point t) {
@@ -751,6 +804,22 @@ X_STATUS XThread::Create() {
 
   if (creation_params_.creation_flags & 0x60) {
     thread_->set_priority(creation_params_.creation_flags & 0x20 ? 1 : 0);
+  }
+
+  // l81 (KI-060): host priority boost by guest start address.
+  if (guest_thread_) {
+    const GuestThreadBoost& boost = CurrentGuestThreadBoost();
+    if (boost.priority != ApuWorkerPriority::kNormal &&
+        GuestThreadStartMatches(boost.starts, creation_params_.start_address)) {
+      thread_->set_priority(boost.priority == ApuWorkerPriority::kHighest
+                                ? rex::thread::ThreadPriority::kHighest
+                                : rex::thread::ThreadPriority::kAboveNormal);
+      REXSYS_INFO(
+          "KI-060: guest thread {:08X} ('{}', start {:08X}) host priority {} "
+          "(guest_audio_thread_priority)",
+          handle(), thread_name_, creation_params_.start_address,
+          ApuWorkerPriorityName(boost.priority));
+    }
   }
 
   // Assign the newly created thread to the logical processor, and also set up

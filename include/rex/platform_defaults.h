@@ -35,6 +35,8 @@ struct PlatformDefaults {
   const char* apu_worker_priority = "normal";
   // l81 system/xthread.cpp (KI-060): "native" or "backoff"
   const char* ke_delay_zero_mode = "native";
+  // l81 system/xthread.cpp (KI-060): "normal", "above_normal" or "highest"
+  const char* guest_audio_thread_priority = "normal";
 };
 
 constexpr PlatformDefaults SelectPlatformDefaults(bool is_wine) {
@@ -46,6 +48,7 @@ constexpr PlatformDefaults SelectPlatformDefaults(bool is_wine) {
   d.ke_delay_short_sleep_mode = is_wine ? "hires_timer" : "native";
   d.apu_worker_priority = is_wine ? "above_normal" : "normal";
   d.ke_delay_zero_mode = is_wine ? "backoff" : "native";
+  d.guest_audio_thread_priority = is_wine ? "above_normal" : "normal";
   return d;
 }
 
