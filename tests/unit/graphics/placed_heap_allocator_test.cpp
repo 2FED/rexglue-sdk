@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <rex/graphics/util/placed_heap_allocator.h>
@@ -203,5 +204,37 @@ TEST_CASE("Placed heaps: minute fields", "[graphics][placed_heaps]") {
   CHECK(FormatTextureHeapMinuteFields(s, true, 1, 3 * kMB + 1, 256 * kMB) ==
         "placed=1 heaps=1 used_mb=4 reserved_mb=256 creates=2 placements=2 fallbacks=0 "
         "oversized=0 heaps_created=1 heaps_released=0 heap_failures=0 create_us_avg=20 "
-        "create_us_max=30 heap_create_us_max=0");
+        "create_us_max=30 heap_create_us_max=0 ready_heaps=0 heaps_from_ready=0 heaps_sync=0 "
+        "heaps_refilled=0 heap_refill_waits=0 heap_refill_wait_us_max=0");
+}
+
+TEST_CASE("Placed heaps: l80 ready pool fields", "[graphics][placed_heaps]") {
+  TextureHeapMinuteStats s;
+  s.heaps_created = 3;
+  s.heaps_from_ready = 2;
+  s.heaps_sync = 1;
+  s.heaps_refilled = 1;
+  s.heap_refill_waits = 1;
+  s.heap_refill_wait_us_max = 4500;
+  const std::string text = FormatTextureHeapMinuteFields(s, true, 3, 0, 768 * kMB, 1);
+  CHECK(text.find(" ready_heaps=1 heaps_from_ready=2 heaps_sync=1 heaps_refilled=1 "
+                  "heap_refill_waits=1 heap_refill_wait_us_max=4500") != std::string::npos);
+}
+
+TEST_CASE("Placed heaps: l80 pre-creation policy", "[graphics][placed_heaps]") {
+  using rex::graphics::ClampTextureHeapPrecreate;
+  using rex::graphics::ShouldRefillTextureHeap;
+  CHECK(ClampTextureHeapPrecreate(-1) == 0);
+  CHECK(ClampTextureHeapPrecreate(0) == 0);
+  CHECK(ClampTextureHeapPrecreate(2) == 2);
+  CHECK(ClampTextureHeapPrecreate(8) == 8);
+  CHECK(ClampTextureHeapPrecreate(100) == 8);
+  // Pre-creation off: never refill (l79 behaviour).
+  CHECK_FALSE(ShouldRefillTextureHeap(0, 0, false));
+  // Ready heaps left, or a refill already running: wait.
+  CHECK_FALSE(ShouldRefillTextureHeap(2, 1, false));
+  CHECK_FALSE(ShouldRefillTextureHeap(2, 0, true));
+  // Pool empty, nothing in flight: refill one.
+  CHECK(ShouldRefillTextureHeap(2, 0, false));
+  CHECK(ShouldRefillTextureHeap(1, 0, false));
 }

@@ -213,6 +213,15 @@ struct TextureHeapMinuteStats {
   uint64_t create_us_total = 0;
   uint64_t create_us_max = 0;
   uint64_t heap_create_us_max = 0;
+  // l80 d3d12_texture_heap_precreate: where the heaps added to the allocator
+  // came from (ready pool: pre-created at initialisation or by the background
+  // refill; sync: created on the CP thread at the moment of need), refills
+  // finished in the background, and needs that had to wait for a refill.
+  uint64_t heaps_from_ready = 0;
+  uint64_t heaps_sync = 0;
+  uint64_t heaps_refilled = 0;
+  uint64_t heap_refill_waits = 0;
+  uint64_t heap_refill_wait_us_max = 0;
 
   void NoteCreate(uint64_t us) {
     ++creates;
@@ -225,18 +234,36 @@ struct TextureHeapMinuteStats {
 };
 
 // enabled: d3d12_texture_placed_heaps in effect; heaps/used/reserved: the
-// allocator state at the report.
+// allocator state at the report; ready_heaps: heaps waiting in the l80 ready
+// pool (not yet in the allocator, not counted in reserved_mb).
 inline std::string FormatTextureHeapMinuteFields(const TextureHeapMinuteStats& s, bool enabled,
                                                  uint32_t heaps, uint64_t used_bytes,
-                                                 uint64_t reserved_bytes) {
+                                                 uint64_t reserved_bytes,
+                                                 uint32_t ready_heaps = 0) {
   return fmt::format(
       "placed={} heaps={} used_mb={} reserved_mb={} creates={} placements={} fallbacks={} "
       "oversized={} heaps_created={} heaps_released={} heap_failures={} create_us_avg={} "
-      "create_us_max={} heap_create_us_max={}",
+      "create_us_max={} heap_create_us_max={} ready_heaps={} heaps_from_ready={} heaps_sync={} "
+      "heaps_refilled={} heap_refill_waits={} heap_refill_wait_us_max={}",
       int(enabled), heaps, (used_bytes + (1u << 20) - 1) >> 20,
       (reserved_bytes + (1u << 20) - 1) >> 20, s.creates, s.placements, s.fallbacks, s.oversized,
       s.heaps_created, s.heaps_released, s.heap_failures, s.create_us_avg(), s.create_us_max,
-      s.heap_create_us_max);
+      s.heap_create_us_max, ready_heaps, s.heaps_from_ready, s.heaps_sync, s.heaps_refilled,
+      s.heap_refill_waits, s.heap_refill_wait_us_max);
+}
+
+// l80 d3d12_texture_heap_precreate: number of heaps created at texture cache
+// initialisation (clamped to 0..8; 0 = l79 behaviour, every heap on demand).
+inline uint32_t ClampTextureHeapPrecreate(int32_t value) {
+  return value <= 0 ? 0u : (value >= 8 ? 8u : uint32_t(value));
+}
+
+// Whether to start a background heap creation: with pre-creation on, keep one
+// heap ready ahead of demand once the ready pool is empty and no refill is in
+// flight, so later heap needs (mid-race) do not create on the CP thread.
+inline bool ShouldRefillTextureHeap(uint32_t precreate, size_t ready_heaps,
+                                    bool refill_in_flight) {
+  return precreate != 0 && ready_heaps == 0 && !refill_in_flight;
 }
 
 }  // namespace rex::graphics

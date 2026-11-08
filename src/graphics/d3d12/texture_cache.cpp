@@ -48,6 +48,15 @@ REXCVAR_DEFINE_INT32(d3d12_texture_heap_block_mb, 256, "GPU",
                      "one empty heap is kept as a spare, further empty heaps are released")
     .range(16, 1024)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(d3d12_texture_heap_precreate, 2, "GPU",
+                     "l80: with d3d12_texture_placed_heaps, create this many heaps when the "
+                     "texture cache initialises (boot) instead of on first demand, and once "
+                     "they are used keep one more heap ready ahead, created on a background "
+                     "thread, so a new heap (6-16 ms) is not created on the CP thread mid-race; "
+                     "0 = every heap on demand (l79). Counters: ready_heaps, heaps_from_ready, "
+                     "heaps_sync in MCLA_TEXHEAP kind=minute")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
 
@@ -395,6 +404,13 @@ D3D12TextureCache::~D3D12TextureCache() {
   // ~D3D12Texture), destroy all textures. Also returns the placed heap ranges
   // (l79) while the allocator and the heaps still exist.
   DestroyAllTextures(true);
+  // l80: let an in-flight background heap creation finish before the device
+  // can go away.
+  if (texture_heap_refill_.valid()) {
+    texture_heap_refill_.wait();
+    texture_heap_refill_ = {};
+  }
+  ready_texture_heaps_.clear();
   placed_heaps_.clear();
   placed_heap_allocator_.reset();
 
@@ -432,6 +448,27 @@ bool D3D12TextureCache::Initialize() {
         uint64_t(std::clamp<int32_t>(REXCVAR_GET(d3d12_texture_heap_block_mb), 16, 1024));
     placed_heap_allocator_ = std::make_unique<PlacedHeapAllocator>(block_mb << 20);
     REXGPU_INFO("D3D12TextureCache: placed texture heaps on, {} MB per heap", block_mb);
+    // l80 d3d12_texture_heap_precreate: create the first heaps now (boot)
+    // rather than on first demand.
+    texture_heap_precreate_ = ClampTextureHeapPrecreate(REXCVAR_GET(d3d12_texture_heap_precreate));
+    if (texture_heap_precreate_) {
+      const auto precreate_start = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < texture_heap_precreate_; ++i) {
+        Microsoft::WRL::ComPtr<ID3D12Heap> heap = CreateTextureHeap();
+        if (!heap) {
+          ++texture_heap_minute_.heap_failures;
+          break;
+        }
+        ready_texture_heaps_.push_back(std::move(heap));
+      }
+      const double precreate_ms = double(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - precreate_start)
+                                             .count()) /
+                                  1000.0;
+      REXGPU_INFO(
+          "D3D12TextureCache: pre-created {} of {} placed texture heaps ({} MB each) in {:.1f} ms",
+          ready_texture_heaps_.size(), texture_heap_precreate_, block_mb, precreate_ms);
+    }
   }
 
   // Create the loading root signature.
@@ -1525,25 +1562,12 @@ Microsoft::WRL::ComPtr<ID3D12Resource> D3D12TextureCache::CreatePlacedTextureRes
   PlacedHeapAllocation placement =
       placed_heap_allocator_->Allocate(info.SizeInBytes, info.Alignment);
   if (!placement.valid()) {
-    D3D12_HEAP_DESC heap_desc = {};
-    heap_desc.SizeInBytes = placed_heap_allocator_->block_size();
-    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    // Valid on resource heap tier 1 and 2 (guest textures are never RT/DS).
-    heap_desc.Flags =
-        D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | provider.GetHeapFlagCreateNotZeroed();
-    const auto heap_start = std::chrono::steady_clock::now();
-    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
-    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
+    Microsoft::WRL::ComPtr<ID3D12Heap> heap = AcquireTextureHeap();
+    if (!heap) {
       ++texture_heap_minute_.heap_failures;
       desc.Alignment = 0;
       return nullptr;
     }
-    texture_heap_minute_.heap_create_us_max =
-        std::max<uint64_t>(texture_heap_minute_.heap_create_us_max,
-                           uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - heap_start)
-                                        .count()));
     const uint32_t block = placed_heap_allocator_->AddBlock();
     if (block >= placed_heaps_.size()) {
       placed_heaps_.resize(size_t(block) + 1);
@@ -1569,6 +1593,86 @@ Microsoft::WRL::ComPtr<ID3D12Resource> D3D12TextureCache::CreatePlacedTextureRes
   return resource;
 }
 
+Microsoft::WRL::ComPtr<ID3D12Heap> D3D12TextureCache::CreateTextureHeap() const {
+  if (!placed_heap_allocator_) {
+    return nullptr;
+  }
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  D3D12_HEAP_DESC heap_desc = {};
+  heap_desc.SizeInBytes = placed_heap_allocator_->block_size();
+  heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+  // Valid on resource heap tier 1 and 2 (guest textures are never RT/DS).
+  heap_desc.Flags =
+      D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | provider.GetHeapFlagCreateNotZeroed();
+  Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+  if (FAILED(provider.GetDevice()->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap)))) {
+    return nullptr;
+  }
+  return heap;
+}
+
+void D3D12TextureCache::HarvestTextureHeapRefill(bool wait) {
+  if (!texture_heap_refill_.valid()) {
+    return;
+  }
+  if (!wait &&
+      texture_heap_refill_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    return;
+  }
+  Microsoft::WRL::ComPtr<ID3D12Heap> heap = texture_heap_refill_.get();
+  texture_heap_refill_ = {};
+  if (heap) {
+    ++texture_heap_minute_.heaps_refilled;
+    ready_texture_heaps_.push_back(std::move(heap));
+  } else {
+    ++texture_heap_minute_.heap_failures;
+  }
+}
+
+void D3D12TextureCache::MaybeStartTextureHeapRefill() {
+  if (!ShouldRefillTextureHeap(texture_heap_precreate_, ready_texture_heaps_.size(),
+                               texture_heap_refill_.valid())) {
+    return;
+  }
+  texture_heap_refill_ = std::async(std::launch::async, [this]() { return CreateTextureHeap(); });
+}
+
+Microsoft::WRL::ComPtr<ID3D12Heap> D3D12TextureCache::AcquireTextureHeap() {
+  HarvestTextureHeapRefill(false);
+  if (ready_texture_heaps_.empty() && texture_heap_refill_.valid()) {
+    // A refill is already running: waiting for it is never longer than a new
+    // creation here.
+    const auto wait_start = std::chrono::steady_clock::now();
+    HarvestTextureHeapRefill(true);
+    ++texture_heap_minute_.heap_refill_waits;
+    texture_heap_minute_.heap_refill_wait_us_max = std::max<uint64_t>(
+        texture_heap_minute_.heap_refill_wait_us_max,
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - wait_start)
+                     .count()));
+  }
+  Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+  if (!ready_texture_heaps_.empty()) {
+    heap = std::move(ready_texture_heaps_.back());
+    ready_texture_heaps_.pop_back();
+    ++texture_heap_minute_.heaps_from_ready;
+  } else {
+    const auto heap_start = std::chrono::steady_clock::now();
+    heap = CreateTextureHeap();
+    if (heap) {
+      ++texture_heap_minute_.heaps_sync;
+      texture_heap_minute_.heap_create_us_max = std::max<uint64_t>(
+          texture_heap_minute_.heap_create_us_max,
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - heap_start)
+                       .count()));
+    }
+  }
+  MaybeStartTextureHeapRefill();
+  return heap;
+}
+
 void D3D12TextureCache::ReleasePlacement(const PlacedHeapAllocation& placement) {
   if (!placed_heap_allocator_ || !placement.valid()) {
     return;
@@ -1589,7 +1693,8 @@ std::string D3D12TextureCache::TakeTextureHeapMinuteReport() {
       FormatTextureHeapMinuteFields(texture_heap_minute_, placed_heaps_enabled_,
                                     allocator ? placed_heap_allocator_->live_blocks() : 0,
                                     allocator ? placed_heap_allocator_->used_bytes() : 0,
-                                    allocator ? placed_heap_allocator_->reserved_bytes() : 0);
+                                    allocator ? placed_heap_allocator_->reserved_bytes() : 0,
+      uint32_t(ready_texture_heaps_.size()));
   texture_heap_minute_ = {};
   return report;
 }

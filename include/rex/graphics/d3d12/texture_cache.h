@@ -13,6 +13,7 @@
 
 #include <array>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -511,12 +512,26 @@ class D3D12TextureCache final : public TextureCache {
       PlacedHeapAllocation& placement_out);
   // Called by ~D3D12Texture after its resource is released.
   void ReleasePlacement(const PlacedHeapAllocation& placement);
+  // l80: one D3D12 heap of the allocator's block size (null on failure).
+  // Device-only, so it may run on the background refill thread too.
+  Microsoft::WRL::ComPtr<ID3D12Heap> CreateTextureHeap() const;
+  // l80: a heap for a new allocator block: from the ready pool, else the
+  // in-flight refill, else created now; restarts the refill when the pool
+  // runs empty (d3d12_texture_heap_precreate > 0).
+  Microsoft::WRL::ComPtr<ID3D12Heap> AcquireTextureHeap();
+  void HarvestTextureHeapRefill(bool wait);
+  void MaybeStartTextureHeapRefill();
   // Latched from the cvars at Initialize (restart to change).
   bool placed_heaps_enabled_ = false;
   std::unique_ptr<PlacedHeapAllocator> placed_heap_allocator_;
   // Index = allocator block index; null for released slots.
   std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> placed_heaps_;
   TextureHeapMinuteStats texture_heap_minute_;
+  // l80 d3d12_texture_heap_precreate (latched at Initialize). Ready heaps are
+  // not in the allocator yet; the refill creates one on a background thread.
+  uint32_t texture_heap_precreate_ = 0;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Heap>> ready_texture_heaps_;
+  std::future<Microsoft::WRL::ComPtr<ID3D12Heap>> texture_heap_refill_;
 
   // The tiled buffer for resolved data with resolution scaling.
   // Because on Direct3D 12 (at least on Windows 10 2004) typed SRV or UAV
