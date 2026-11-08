@@ -14,13 +14,16 @@
 #include <rex/audio/audio_route_audit.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/worker_priority.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/platform_defaults.h>
 #include <rex/stream.h>
 #include <rex/string/buffer.h>
+#include <rex/system/short_sleep.h>
 #include <rex/system/thread_state.h>
 #include <rex/thread.h>
 #include <rex/cvar.h>
@@ -28,6 +31,14 @@
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+REXCVAR_DEFINE_STRING(apu_worker_priority, rex::CurrentPlatformDefaults().apu_worker_priority,
+                      "Audio",
+                      "l80 (KI-060): host thread priority of the Audio Worker (guest audio "
+                      "client callbacks) and XMA Decoder threads: normal (untouched), "
+                      "above_normal or highest. Default above_normal under Wine/Proton, where "
+                      "the l79 Deck underruns followed CPU contention, normal on Windows")
+    .allowed({"normal", "above_normal", "highest"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -42,6 +53,24 @@ REXCVAR_DEFINE_INT32(
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
 namespace rex::audio {
+
+void ApplyApuWorkerPriority(rex::thread::Thread* thread, std::string_view thread_name) {
+  const std::string& text = REXCVAR_GET(apu_worker_priority);
+  const std::optional<system::ApuWorkerPriority> parsed = system::ParseApuWorkerPriority(text);
+  if (!parsed) {
+    REXAPU_WARN("KI-060: apu_worker_priority '{}' unknown, {} left at normal", text,
+                thread_name);
+    return;
+  }
+  if (!thread || *parsed == system::ApuWorkerPriority::kNormal) {
+    return;
+  }
+  thread->set_priority(*parsed == system::ApuWorkerPriority::kHighest
+                           ? rex::thread::ThreadPriority::kHighest
+                           : rex::thread::ThreadPriority::kAboveNormal);
+  REXAPU_INFO("KI-060: {} host priority {} (apu_worker_priority)", thread_name,
+              system::ApuWorkerPriorityName(*parsed));
+}
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -89,6 +118,7 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
 
   worker_thread_->set_name("Audio Worker");
   worker_thread_->Create();
+  ApplyApuWorkerPriority(worker_thread_->thread(), "Audio Worker");
 
   return X_STATUS_SUCCESS;
 }

@@ -32,6 +32,8 @@ TEST_CASE("Platform defaults: Windows", "[core][platform_defaults]") {
   STATIC_REQUIRE(d.timer_queue_spin_tail_us == 200);
   STATIC_REQUIRE(d.xma_canary_fixes);
   STATIC_REQUIRE(d.d3d12_texture_placed_heaps);
+  CHECK(std::string_view(d.ke_delay_short_sleep_mode) == "native");
+  CHECK(std::string_view(d.apu_worker_priority) == "normal");
 }
 
 TEST_CASE("Platform defaults: Wine/Proton", "[core][platform_defaults]") {
@@ -40,6 +42,8 @@ TEST_CASE("Platform defaults: Wine/Proton", "[core][platform_defaults]") {
   STATIC_REQUIRE(d.timer_queue_spin_tail_us == 50);
   STATIC_REQUIRE(d.xma_canary_fixes);
   STATIC_REQUIRE_FALSE(d.d3d12_texture_placed_heaps);
+  CHECK(std::string_view(d.ke_delay_short_sleep_mode) == "hires_timer");
+  CHECK(std::string_view(d.apu_worker_priority) == "above_normal");
 }
 
 TEST_CASE("Platform defaults: current process", "[core][platform_defaults]") {
@@ -55,4 +59,6 @@ TEST_CASE("Platform defaults: current process", "[core][platform_defaults]") {
   CHECK(RegisteredDefault("timer_queue_spin_tail_us") ==
         std::to_string(expected.timer_queue_spin_tail_us));
   CHECK(RegisteredDefault("xma_canary_fixes") == (expected.xma_canary_fixes ? "true" : "false"));
+  CHECK(RegisteredDefault("ke_delay_short_sleep_mode") == expected.ke_delay_short_sleep_mode);
+  CHECK(RegisteredDefault("apu_worker_priority") == expected.apu_worker_priority);
 }

@@ -18,3 +18,4 @@ REXCVAR_DECLARE(std::string, audio_device);
 REXCVAR_DECLARE(double, audio_volume);
 REXCVAR_DECLARE(bool, audio_downmix_itu);
 REXCVAR_DECLARE(bool, ffmpeg_verbose);
+REXCVAR_DECLARE(std::string, apu_worker_priority);

@@ -392,6 +392,10 @@ class XThread : public XObject {
   uint32_t SelfSuspend();
 #endif
   X_STATUS Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval);
+  // l80 (KI-060): the pre-l80 Delay body (millisecond truncation).
+  X_STATUS DelayNative(uint32_t alertable, int64_t timeout_ticks);
+  // l80: a kernel or user APC is queued on this guest thread.
+  bool HasPendingApc();
 
   rex::thread::Thread* thread() { return thread_.get(); }
   runtime::ThreadState* thread_state() { return thread_state_.get(); }

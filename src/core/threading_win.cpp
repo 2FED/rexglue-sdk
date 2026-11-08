@@ -108,6 +108,58 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
   return SleepResult::kSuccess;
 }
 
+namespace {
+// l80: one high-resolution waitable timer per thread, created on first use.
+struct ThreadHighResolutionTimer {
+  HANDLE handle = nullptr;
+  bool tried = false;
+  ~ThreadHighResolutionTimer() {
+    if (handle) {
+      CloseHandle(handle);
+    }
+  }
+};
+thread_local ThreadHighResolutionTimer thread_high_resolution_timer_;
+}  // namespace
+
+bool HighResolutionSleep(std::chrono::nanoseconds duration, bool alertable,
+                         SleepResult* result_out) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+  ThreadHighResolutionTimer& timer = thread_high_resolution_timer_;
+  if (!timer.handle) {
+    if (timer.tried) {
+      return false;
+    }
+    timer.tried = true;
+    timer.handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    if (!timer.handle) {
+      return false;
+    }
+  }
+  // Relative due time: negative, in 100 ns units, at least one unit.
+  const long long ticks = duration.count() / 100;
+  LARGE_INTEGER due;
+  due.QuadPart = ticks > 0 ? -ticks : -1;
+  if (!SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0)) {
+    return false;
+  }
+  const DWORD wait = WaitForSingleObjectEx(timer.handle, INFINITE, alertable ? TRUE : FALSE);
+  if (wait == WAIT_IO_COMPLETION) {
+    // Woken by an APC: the timer may still fire later; a signalled
+    // synchronization timer is reset by the next SetWaitableTimerEx.
+    *result_out = SleepResult::kAlerted;
+    return true;
+  }
+  if (wait != WAIT_OBJECT_0) {
+    return false;
+  }
+  *result_out = SleepResult::kSuccess;
+  return true;
+}
+
 TlsHandle AllocateTlsHandle() {
   return TlsAlloc();
 }

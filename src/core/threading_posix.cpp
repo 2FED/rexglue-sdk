@@ -192,6 +192,23 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
   }
 }
 
+bool HighResolutionSleep(std::chrono::nanoseconds duration, bool alertable,
+                         SleepResult* result_out) {
+  if (alertable) {
+    *result_out = AlertableSleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
+    return true;
+  }
+  timespec request;
+  request.tv_sec = time_t(duration.count() / 1000000000);
+  request.tv_nsec = long(duration.count() % 1000000000);
+  timespec remaining;
+  while (nanosleep(&request, &remaining) == -1 && errno == EINTR) {
+    request = remaining;
+  }
+  *result_out = SleepResult::kSuccess;
+  return true;
+}
+
 TlsHandle AllocateTlsHandle() {
   auto key = static_cast<pthread_key_t>(-1);
   auto res = pthread_key_create(&key, nullptr);

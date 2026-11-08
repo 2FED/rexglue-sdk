@@ -132,6 +132,13 @@ SleepResult AlertableSleep(std::chrono::duration<Rep, Period> duration) {
   return AlertableSleep(std::chrono::duration_cast<std::chrono::microseconds>(duration));
 }
 
+// l80 (ke_delay_short_sleep_mode=hires_timer): sleeps for `duration` (100 ns
+// resolution) on a per-thread high-resolution waitable timer (Windows 10
+// 1803+, also Wine/Proton); alertable as AlertableSleep. Returns false, and
+// does not sleep, when no such timer is available or the wait failed.
+bool HighResolutionSleep(std::chrono::nanoseconds duration, bool alertable,
+                         SleepResult* result_out);
+
 typedef uint32_t TlsHandle;
 constexpr TlsHandle kInvalidTlsHandle = UINT_MAX;
 

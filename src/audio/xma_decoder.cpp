@@ -12,6 +12,7 @@
 #include <chrono>
 #include <vector>
 
+#include <rex/audio/worker_priority.h>
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/sibling_trace.h>
@@ -139,6 +140,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   worker_thread_->set_name("XMA Decoder");
 
   worker_thread_->Create();
+  ApplyApuWorkerPriority(worker_thread_->thread(), "XMA Decoder");
 
   return X_STATUS_SUCCESS;
 }

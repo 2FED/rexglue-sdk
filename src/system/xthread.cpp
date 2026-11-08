@@ -10,7 +10,9 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 
 #include <fmt/format.h>
@@ -23,6 +25,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/perf/counter.h>
+#include <rex/platform_defaults.h>
 #include <rex/platform/exceptions.h>
 #include <rex/ppc/context.h>
 #include <rex/runtime.h>
@@ -30,6 +33,7 @@
 #include <rex/system/crash_report.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/short_sleep.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xevent.h>
@@ -43,6 +47,19 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
+
+REXCVAR_DEFINE_STRING(ke_delay_short_sleep_mode,
+                      rex::CurrentPlatformDefaults().ke_delay_short_sleep_mode, "Kernel",
+                      "l80 (KI-060): how guest KeDelayExecutionThread relative delays shorter "
+                      "than 2 ms are carried out. native: as before (truncated to whole ms: "
+                      "below 1 ms a yield or SleepEx(0, alertable), else Sleep(1)); yield: "
+                      "SwitchToThread (a pending guest APC still takes the native alertable "
+                      "path); hires_timer: the exact delay on a per-thread high-resolution "
+                      "waitable timer (alertable stays alertable; a zero delay stays native; "
+                      "no timer: native). Default hires_timer under Wine/Proton, native on "
+                      "Windows. Counters: MCLA_SLEEP kind=minute")
+    .allowed({"native", "yield", "hires_timer"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::system {
 
@@ -116,6 +133,135 @@ namespace {
 
 XThread* GetBoundCurrentXThread() {
   return current_xthread_tls_;
+}
+
+// l80 (KI-060): ke_delay_short_sleep_mode, latched at the first delay.
+ShortSleepMode CurrentShortSleepMode() {
+  static const ShortSleepMode mode = [] {
+    const std::string& text = REXCVAR_GET(ke_delay_short_sleep_mode);
+    const std::optional<ShortSleepMode> parsed = ParseShortSleepMode(text);
+    if (!parsed) {
+      REXSYS_WARN("KI-060: ke_delay_short_sleep_mode '{}' unknown, using native", text);
+    }
+    const ShortSleepMode result = parsed.value_or(ShortSleepMode::kNative);
+    REXSYS_INFO("KI-060: short guest delays (< 2 ms) mode={} (ke_delay_short_sleep_mode)",
+                ShortSleepModeName(result));
+    return result;
+  }();
+  return mode;
+}
+
+// Per-minute MCLA_SLEEP counters, shared by all guest threads (relaxed
+// atomics; a minute's numbers may be off by the calls racing the emit).
+struct ShortSleepCounters {
+  std::atomic<uint64_t> delays{0};
+  std::atomic<uint64_t> short_sleeps{0};
+  std::atomic<uint64_t> zero{0};
+  std::atomic<uint64_t> alertable{0};
+  std::atomic<uint64_t> alerted{0};
+  std::atomic<uint64_t> yields{0};
+  std::atomic<uint64_t> timers{0};
+  std::atomic<uint64_t> fallbacks{0};
+  std::atomic<uint64_t> requested_us{0};
+  std::atomic<uint64_t> slept_us{0};
+  std::atomic<uint64_t> slept_us_max{0};
+  std::atomic<int64_t> next_emit_ms{0};
+  struct Slot {
+    std::atomic<uint32_t> thread_id{0};
+    std::atomic<uint64_t> count{0};
+  };
+  std::array<Slot, 32> slots;
+};
+
+ShortSleepCounters& GetShortSleepCounters() {
+  static ShortSleepCounters counters;
+  return counters;
+}
+
+ShortSleepCounters::Slot* FindShortSleepSlot(uint32_t thread_id) {
+  thread_local ShortSleepCounters::Slot* cached = nullptr;
+  thread_local uint32_t cached_id = 0;
+  if (cached && cached_id == thread_id) {
+    return cached;
+  }
+  for (ShortSleepCounters::Slot& slot : GetShortSleepCounters().slots) {
+    uint32_t current = slot.thread_id.load(std::memory_order_relaxed);
+    if (current == 0 &&
+        slot.thread_id.compare_exchange_strong(current, thread_id, std::memory_order_relaxed)) {
+      current = thread_id;
+    }
+    if (current == thread_id) {
+      cached = &slot;
+      cached_id = thread_id;
+      return cached;
+    }
+  }
+  return nullptr;
+}
+
+void MaybeEmitShortSleepMinute() {
+  ShortSleepCounters& c = GetShortSleepCounters();
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  int64_t next = c.next_emit_ms.load(std::memory_order_relaxed);
+  if (next == 0) {
+    c.next_emit_ms.compare_exchange_strong(next, now_ms + 60000, std::memory_order_relaxed);
+    return;
+  }
+  if (now_ms < next ||
+      !c.next_emit_ms.compare_exchange_strong(next, now_ms + 60000, std::memory_order_relaxed)) {
+    return;
+  }
+  ShortSleepMinuteStats s;
+  s.delays = c.delays.exchange(0, std::memory_order_relaxed);
+  s.short_sleeps = c.short_sleeps.exchange(0, std::memory_order_relaxed);
+  s.zero = c.zero.exchange(0, std::memory_order_relaxed);
+  s.alertable = c.alertable.exchange(0, std::memory_order_relaxed);
+  s.alerted = c.alerted.exchange(0, std::memory_order_relaxed);
+  s.yields = c.yields.exchange(0, std::memory_order_relaxed);
+  s.timers = c.timers.exchange(0, std::memory_order_relaxed);
+  s.fallbacks = c.fallbacks.exchange(0, std::memory_order_relaxed);
+  s.requested_us_total = c.requested_us.exchange(0, std::memory_order_relaxed);
+  s.slept_us_total = c.slept_us.exchange(0, std::memory_order_relaxed);
+  s.slept_us_max = c.slept_us_max.exchange(0, std::memory_order_relaxed);
+  for (ShortSleepCounters::Slot& slot : c.slots) {
+    const uint64_t count = slot.count.exchange(0, std::memory_order_relaxed);
+    if (count > s.top_thread_short) {
+      s.top_thread_short = count;
+      s.top_thread_id = slot.thread_id.load(std::memory_order_relaxed);
+    }
+  }
+  REXSYS_INFO("{}", FormatShortSleepMinute(s, CurrentShortSleepMode()));
+}
+
+void NoteShortSleep(uint32_t thread_id, bool alertable, bool alerted, int64_t scaled_ticks,
+                    ShortSleepAction done, uint64_t slept_us) {
+  ShortSleepCounters& c = GetShortSleepCounters();
+  c.short_sleeps.fetch_add(1, std::memory_order_relaxed);
+  if (scaled_ticks == 0) {
+    c.zero.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (alertable) {
+    c.alertable.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (alerted) {
+    c.alerted.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (done == ShortSleepAction::kYield) {
+    c.yields.fetch_add(1, std::memory_order_relaxed);
+  } else if (done == ShortSleepAction::kHiresTimer) {
+    c.timers.fetch_add(1, std::memory_order_relaxed);
+  }
+  c.requested_us.fetch_add(uint64_t(scaled_ticks / 10), std::memory_order_relaxed);
+  c.slept_us.fetch_add(slept_us, std::memory_order_relaxed);
+  uint64_t max = c.slept_us_max.load(std::memory_order_relaxed);
+  while (slept_us > max &&
+         !c.slept_us_max.compare_exchange_weak(max, slept_us, std::memory_order_relaxed)) {
+  }
+  if (ShortSleepCounters::Slot* slot = FindShortSleepSlot(thread_id)) {
+    slot->count.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 }  // namespace
@@ -1006,8 +1152,69 @@ uint32_t XThread::SelfSuspend() {
 }
 #endif
 
+bool XThread::HasPendingApc() {
+  auto kthread = guest_object<X_KTHREAD>();
+  auto mem = memory();
+  return !kthread->apc_lists[0].empty(mem) || !kthread->apc_lists[1].empty(mem);
+}
+
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
-  int64_t timeout_ticks = interval;
+  (void)processor_mode;
+  const int64_t timeout_ticks = int64_t(interval);
+  ShortSleepCounters& counters = GetShortSleepCounters();
+  counters.delays.fetch_add(1, std::memory_order_relaxed);
+  MaybeEmitShortSleepMinute();
+
+  // l80 (KI-060): relative delays shorter than 2 ms (ke_delay_short_sleep_mode).
+  int64_t scaled_ticks = RelativeDelayTicks(timeout_ticks);
+  if (scaled_ticks > 0 && !REXCVAR_GET(clock_no_scaling)) {
+    scaled_ticks = int64_t(double(scaled_ticks) * chrono::Clock::guest_time_scalar());
+  }
+  if (!IsShortSleep(scaled_ticks)) {
+    return DelayNative(alertable, timeout_ticks);
+  }
+  const auto start = std::chrono::steady_clock::now();
+  ShortSleepAction done = ShortSleepAction::kNative;
+  X_STATUS result = X_STATUS_SUCCESS;
+  switch (PlanShortSleep(CurrentShortSleepMode(), scaled_ticks)) {
+    case ShortSleepAction::kHiresTimer: {
+      CheckTitleTermination();
+      rex::thread::SleepResult sleep_result = rex::thread::SleepResult::kSuccess;
+      if (rex::thread::HighResolutionSleep(std::chrono::nanoseconds(scaled_ticks * 100),
+                                           alertable != 0, &sleep_result)) {
+        CheckTitleTermination();
+        result = sleep_result == rex::thread::SleepResult::kAlerted ? X_STATUS_USER_APC
+                                                                    : X_STATUS_SUCCESS;
+        done = ShortSleepAction::kHiresTimer;
+      } else {
+        counters.fallbacks.fetch_add(1, std::memory_order_relaxed);
+      }
+      break;
+    }
+    case ShortSleepAction::kYield:
+      // A queued APC must still be delivered by an alertable wait.
+      if (!alertable || !HasPendingApc()) {
+        CheckTitleTermination();
+        rex::thread::MaybeYield();
+        CheckTitleTermination();
+        done = ShortSleepAction::kYield;
+      }
+      break;
+    case ShortSleepAction::kNative:
+    default:
+      break;
+  }
+  if (done == ShortSleepAction::kNative) {
+    result = DelayNative(alertable, timeout_ticks);
+  }
+  NoteShortSleep(handle(), alertable != 0, result == X_STATUS_USER_APC, scaled_ticks, done,
+                 uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count()));
+  return result;
+}
+
+X_STATUS XThread::DelayNative(uint32_t alertable, int64_t timeout_ticks) {
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
     // Absolute time, based on January 1, 1601.
